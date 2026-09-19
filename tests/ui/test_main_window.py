@@ -503,3 +503,75 @@ def test_run_current_still_prefers_a_selection(harness: Harness) -> None:
     window.run_current()
     harness.drain()
     assert harness.conn.executed[-1] == "select * from orders"
+
+
+# -- object browser context menu (M5: B3, B4) -------------------------------
+
+
+def browse_to_orders(harness: Harness) -> None:
+    """Populate the tree down to a table, through the controller's cache."""
+    from snowdesk.db import browser as browse
+    from snowdesk.model import ObjectNode
+
+    controller = harness.window.browser
+    controller._on_nodes((), [ObjectNode("RAW", browse.DATABASE, path=("RAW",))])
+    controller._on_nodes(("RAW",), [ObjectNode("PUBLIC", browse.SCHEMA, path=("RAW", "PUBLIC"))])
+    controller._on_nodes(
+        ("RAW", "PUBLIC"),
+        [ObjectNode("ORDERS", browse.TABLE, "Table", ("RAW", "PUBLIC", "ORDERS"))],
+    )
+
+
+def test_preview_runs_in_a_result_tab(harness: Harness) -> None:
+    """M5 exit criterion: Preview opens a result tab without touching the editor."""
+    connect(harness)
+    harness.conn.plan["LIMIT 100"] = FakeStatement(columns=COLS, rows=[(1,), (2,)])
+    browse_to_orders(harness)
+    window = harness.window
+    window.editor.setPlainText("-- my work in progress")
+
+    window.object_tree._preview(("RAW", "PUBLIC", "ORDERS"))
+    harness.drain()
+
+    assert harness.conn.executed[-1] == "SELECT * FROM RAW.PUBLIC.ORDERS LIMIT 100"
+    view = window.result_tabs.currentWidget()
+    assert isinstance(view, ResultView)
+    assert view.model.rowCount() == 2
+    # The editor is untouched by a browser action.
+    assert window.editor.toPlainText() == "-- my work in progress"
+
+
+def test_show_ddl_runs_in_a_result_tab(harness: Harness) -> None:
+    connect(harness)
+    browse_to_orders(harness)
+    from snowdesk.db import browser as browse
+
+    harness.window.object_tree._show_ddl(("RAW", "PUBLIC", "ORDERS"), browse.TABLE)
+    harness.drain()
+    assert harness.conn.executed[-1] == "SELECT GET_DDL('TABLE', 'RAW.PUBLIC.ORDERS')"
+
+
+def test_generate_select_lands_in_the_focused_tab(harness: Harness) -> None:
+    browse_to_orders(harness)
+    window = harness.window
+    window.editors.new_tab()
+
+    window.object_tree._generate_select(("RAW", "PUBLIC", "ORDERS"))
+    assert window.editor.toPlainText() == "SELECT *\nFROM RAW.PUBLIC.ORDERS"
+    assert window.editors.currentIndex() == 1
+
+
+def test_double_click_inserts_into_the_editor(harness: Harness) -> None:
+    browse_to_orders(harness)
+    window = harness.window
+    item = window.object_tree._item_for_path(("RAW", "PUBLIC", "ORDERS"))
+    window.object_tree._on_double_clicked(item, 0)
+    assert window.editor.toPlainText() == "RAW.PUBLIC.ORDERS"
+
+
+def test_copy_name_reports_in_the_status_bar(harness: Harness) -> None:
+    from snowdesk.db import browser as browse
+
+    browse_to_orders(harness)
+    harness.window.object_tree._copy_name(("RAW", "PUBLIC", "ORDERS"), browse.TABLE)
+    assert "RAW.PUBLIC.ORDERS" in harness.window.statusBar().currentMessage()

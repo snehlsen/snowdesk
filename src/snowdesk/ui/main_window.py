@@ -260,7 +260,9 @@ class MainWindow(QMainWindow):
         self.query.run_finished.connect(self._on_run_finished)
         self.query.rejected.connect(lambda msg: self.statusBar().showMessage(msg, 4000))
 
-        self.object_tree.insert_requested.connect(self.editor.insert_identifier)
+        self.object_tree.insert_requested.connect(self._insert_into_editor)
+        self.object_tree.run_requested.connect(self._run_browser_sql)
+        self.object_tree.status_message.connect(lambda msg: self.statusBar().showMessage(msg, 3000))
 
     # -- connections -------------------------------------------------------
 
@@ -498,6 +500,14 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Copied with headers", 2000)
 
     # -- misc --------------------------------------------------------------
+
+    def _insert_into_editor(self, text: str) -> None:
+        """Drop a name or generated statement into the focused tab (B3, B4)."""
+        self.editor.insert_identifier(text)
+
+    def _run_browser_sql(self, sql: str) -> None:
+        """Run a statement the browser built, without disturbing the editor (B4)."""
+        self.query.run_text(sql)
 
     def _close_current_tab(self) -> None:
         self.editors.close_tab(self.editors.currentIndex())

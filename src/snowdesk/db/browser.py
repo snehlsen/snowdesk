@@ -6,9 +6,10 @@ enumerated eagerly.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
-from snowdesk.db.identifiers import qualify
+from snowdesk.db.identifiers import qualify, quote_ident, quote_literal
 from snowdesk.db.session import Connection
 from snowdesk.model import ObjectNode
 
@@ -125,6 +126,44 @@ def _column_type(row: dict[str, Any]) -> str:
     return base
 
 
+# --------------------------------------------------------------------------
+# Statements the context menu builds (B4)
+# --------------------------------------------------------------------------
+
+
 def preview_sql(database: str, schema: str, table: str, limit: int = 100) -> str:
-    """``SELECT`` statement for the preview action (B4)."""
+    """``SELECT`` for the preview action."""
     return f"SELECT * FROM {qualify(database, schema, table)} LIMIT {int(limit)}"
+
+
+def select_sql(
+    database: str,
+    schema: str,
+    table: str,
+    columns: Sequence[str] | None = None,
+) -> str:
+    """A ``SELECT`` to drop into the editor.
+
+    Column names are listed when the browser has already loaded them, which
+    saves retyping them; otherwise this falls back to ``*``.
+    """
+    fqn = qualify(database, schema, table)
+    if not columns:
+        return f"SELECT *\nFROM {fqn}"
+    projected = ",\n       ".join(quote_ident(c) for c in columns)
+    return f"SELECT {projected}\nFROM {fqn}"
+
+
+#: ``GET_DDL`` needs the object's type as a string; views and tables differ.
+_DDL_KINDS = {TABLE: "TABLE", VIEW: "VIEW", SCHEMA: "SCHEMA", DATABASE: "DATABASE"}
+
+
+def get_ddl_sql(kind: str, *parts: str) -> str:
+    """``GET_DDL`` for a database, schema, table or view.
+
+    The object name is passed as a *string literal*, not an identifier, so it
+    is quoted as one -- and it must carry its own identifier quoting inside
+    that literal for mixed-case names to resolve.
+    """
+    object_type = _DDL_KINDS.get(kind, "TABLE")
+    return f"SELECT GET_DDL({quote_literal(object_type)}, {quote_literal(qualify(*parts))})"

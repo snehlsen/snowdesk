@@ -28,14 +28,14 @@ does not ask again, and is never written to disk.
 
 ## Status
 
-All **P0** requirements from the spec are implemented, plus milestones M0-M4.
+All **P0** requirements from the spec are implemented, plus milestones M0-M5.
 
 | Area | Done | Not yet |
 |------|------|---------|
 | Connections | C1-C6 | C7 role/warehouse override, C8 edit connections |
 | Query execution | Q1-Q6, Q7 (`QUERY_TAG`), Q8 (tab per result) | Q9 Snowsight link |
 | Results | R1-R5 | R6 CSV export UI\*, R7 sort/filter, R8 detail panel, R9 Parquet/XLSX |
-| Object browser | B1, B2, B3, B5 (filter, refresh) | B4 context menu (preview, GET_DDL) |
+| Object browser | B1-B5 | — |
 | Editor | E1, E2, E3 | E4 autocompletion |
 | History | H1, H2 | — |
 | Preferences | — | S1 preferences dialog |
@@ -54,6 +54,11 @@ yet (⌘E); it belongs with R6 in M6.
 | ⌘T / ⌘W | new editor tab / close tab |
 | ⌘O / ⌘S / ⌘⇧S | open a `.sql` file / save / save as |
 | ⌘⇧C | copy selected cells with headers |
+
+Right-click a node in the object browser to preview 100 rows, generate a
+`SELECT` (with the column list, once columns have been loaded), copy or insert
+the qualified name, show `GET_DDL`, or refresh that node. Preview and DDL open
+a result tab and leave the editor alone.
 
 Editor tabs are autosaved every few seconds to
 `~/Library/Application Support/SnowDesk/session.json`, so unsaved work survives

@@ -1,10 +1,16 @@
-"""Lazy database → schema → table/view tree (B1)."""
+"""Database → schema → table/view tree, with its context menu (B1-B5)."""
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor, QFont
-from PySide6.QtWidgets import QHeaderView, QTreeWidget, QTreeWidgetItem, QWidget
+from PySide6.QtCore import QPoint, Qt, Signal
+from PySide6.QtGui import QColor, QFont, QGuiApplication
+from PySide6.QtWidgets import (
+    QHeaderView,
+    QMenu,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QWidget,
+)
 
 from snowdesk.controllers.browser import BrowserController
 from snowdesk.db import browser as browse
@@ -16,26 +22,36 @@ KIND_ROLE = Qt.ItemDataRole.UserRole + 2
 LOADED_ROLE = Qt.ItemDataRole.UserRole + 3
 
 _EXPANDABLE = {browse.DATABASE, browse.SCHEMA, browse.TABLE, browse.VIEW}
+#: Kinds GET_DDL understands; a column has no DDL of its own.
+_DDL_KINDS = {browse.DATABASE, browse.SCHEMA, browse.TABLE, browse.VIEW}
 
 
 class ObjectTree(QTreeWidget):
     """Each level is fetched with a single ``SHOW`` on first expand."""
 
-    insert_requested = Signal(str)  # fully qualified, quoted name
+    insert_requested = Signal(str)  # text to drop into the editor
+    run_requested = Signal(str)  # SQL to run in a result tab
+    status_message = Signal(str)
 
     def __init__(self, controller: BrowserController, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.controller = controller
         self.setHeaderLabels(["Object", "Type"])
         header = self.header()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        # Size to the names rather than to the pane: a stretched first column
+        # elides deeply nested names in a narrow sidebar.  The tree scrolls
+        # horizontally instead.
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setStretchLastSection(False)
         self.setUniformRowHeights(True)
         self.setAlternatingRowColors(False)
         self.setExpandsOnDoubleClick(False)
 
         self.itemExpanded.connect(self._on_expanded)
         self.itemDoubleClicked.connect(self._on_double_clicked)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._show_context_menu)
         controller.nodes_ready.connect(self._on_nodes_ready)
         controller.failed.connect(self._on_failed)
 
@@ -157,6 +173,64 @@ class ObjectTree(QTreeWidget):
     def selected_path(self) -> tuple[str, ...]:
         item = self.currentItem()
         return self._path_of(item) if item else ()
+
+    # -- context menu (B4) -------------------------------------------------
+
+    def _show_context_menu(self, position: QPoint) -> None:
+        item = self.itemAt(position)
+        menu = self.build_context_menu(item)
+        if menu is not None:
+            menu.exec(self.viewport().mapToGlobal(position))
+
+    def build_context_menu(self, item: QTreeWidgetItem | None) -> QMenu | None:
+        """The menu for ``item``, or ``None`` when there is nothing to offer.
+
+        Kept separate from showing it so the entries can be inspected without
+        opening a modal menu.
+        """
+        if item is None:
+            return None
+        path = self._path_of(item)
+        kind = item.data(0, KIND_ROLE)
+        if not path or not kind:
+            return None
+        self.setCurrentItem(item)
+
+        menu = QMenu(self)
+        if kind in (browse.TABLE, browse.VIEW):
+            menu.addAction("Preview 100 Rows", lambda: self._preview(path))
+            menu.addAction("Generate SELECT", lambda: self._generate_select(path))
+            menu.addSeparator()
+        if kind == browse.COLUMN:
+            menu.addAction("Insert Name", lambda: self.insert_requested.emit(qualify(path[-1])))
+        else:
+            menu.addAction("Insert Name", lambda: self.insert_requested.emit(qualify(*path)))
+        menu.addAction("Copy Name", lambda: self._copy_name(path, kind))
+        if kind in _DDL_KINDS:
+            menu.addAction("Show DDL", lambda: self._show_ddl(path, kind))
+        if kind in _EXPANDABLE:
+            menu.addSeparator()
+            menu.addAction("Refresh", lambda: self.refresh(item))
+        return menu
+
+    def _preview(self, path: tuple[str, ...]) -> None:
+        database, schema, table = path[0], path[1], path[2]
+        self.run_requested.emit(browse.preview_sql(database, schema, table))
+
+    def _generate_select(self, path: tuple[str, ...]) -> None:
+        """Insert a SELECT, naming the columns if they have been loaded (B2)."""
+        cached = self.controller.cached(path)
+        columns = [node.name for node in cached] if cached else None
+        database, schema, table = path[0], path[1], path[2]
+        self.insert_requested.emit(browse.select_sql(database, schema, table, columns))
+
+    def _show_ddl(self, path: tuple[str, ...], kind: str) -> None:
+        self.run_requested.emit(browse.get_ddl_sql(kind, *path))
+
+    def _copy_name(self, path: tuple[str, ...], kind: str) -> None:
+        name = qualify(path[-1]) if kind == browse.COLUMN else qualify(*path)
+        QGuiApplication.clipboard().setText(name)
+        self.status_message.emit(f"Copied {name}")
 
     def filter_tree(self, term: str) -> None:
         """Hide nodes whose name does not contain ``term`` (B5)."""
