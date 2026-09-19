@@ -55,6 +55,10 @@ yet (⌘E); it belongs with R6 in M6.
 | ⌘O / ⌘S / ⌘⇧S | open a `.sql` file / save / save as |
 | ⌘⇧C | copy selected cells with headers |
 
+If the session expires or the network drops, SnowDesk marks the connection
+dead and shows a strip offering one-click Reconnect. Editor tabs, their
+contents and the messages log are left alone — only the connection is gone.
+
 Right-click a node in the object browser to preview 100 rows, generate a
 `SELECT` (with the column list, once columns have been loaded), copy or insert
 the qualified name, show `GET_DDL`, or refresh that node. Preview and DDL open

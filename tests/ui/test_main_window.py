@@ -575,3 +575,68 @@ def test_copy_name_reports_in_the_status_bar(harness: Harness) -> None:
     browse_to_orders(harness)
     harness.window.object_tree._copy_name(("RAW", "PUBLIC", "ORDERS"), browse.TABLE)
     assert "RAW.PUBLIC.ORDERS" in harness.window.statusBar().currentMessage()
+
+
+# -- losing the connection (M7, spec 9) -------------------------------------
+
+
+class _Dropped(Exception):
+    """Stands in for the connector's transport error."""
+
+
+def test_losing_the_session_shows_a_reconnect_banner(harness: Harness) -> None:
+    connect(harness)
+    window = harness.window
+    window.editor.setPlainText("select 'my work'")
+    assert not window.banner_bar.isVisibleTo(window)
+
+    harness.conn.plan["select"] = FakeStatement(error=_Dropped("Connection reset by peer"))
+    window.run_all()
+    harness.drain()
+
+    assert window.banner_bar.isVisibleTo(window)
+    assert "lost" in window.banner_label.text().lower()
+    assert window.reconnect_button.isVisibleTo(window.banner)
+    # An unexpected drop is the `error` state from C6, not a plain disconnect.
+    assert "Error" in window.state_label.text()
+    assert not window.run_button.isEnabled()
+    # Editor contents survive a lost connection.
+    assert window.editor.toPlainText() == "select 'my work'"
+
+
+def test_the_banner_reconnects_in_one_click(harness: Harness) -> None:
+    connect(harness)
+    window = harness.window
+    harness.conn.plan["select"] = FakeStatement(error=_Dropped("Connection aborted"))
+    window.editor.setPlainText("select 1")
+    window.run_all()
+    harness.drain()
+    assert not harness.worker.session.is_connected
+
+    del harness.conn.plan["select"]
+    window.reconnect_button.click()
+    harness.drain()
+
+    assert harness.worker.session.is_connected
+    assert not window.banner_bar.isVisibleTo(window)
+    assert "Connected" in window.state_label.text()
+
+
+def test_an_ordinary_sql_error_shows_no_banner(harness: Harness) -> None:
+    connect(harness)
+    window = harness.window
+    window.editor.setPlainText("select boom")
+    window.run_all()
+    harness.drain()
+
+    assert not window.banner_bar.isVisibleTo(window)
+    assert harness.worker.session.is_connected
+    assert "ERROR" in window.messages.toPlainText()
+
+
+def test_the_banner_can_be_dismissed(harness: Harness) -> None:
+    window = harness.window
+    window.show_banner("something went wrong")
+    assert window.banner_bar.isVisibleTo(window)
+    window.dismiss_button.click()
+    assert not window.banner_bar.isVisibleTo(window)

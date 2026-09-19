@@ -24,7 +24,15 @@ _HIDDEN_SCHEMAS = frozenset({"INFORMATION_SCHEMA"})
 
 
 def _rows_as_dicts(cursor: Any) -> list[dict[str, Any]]:
-    names = [str(c[0] if isinstance(c, tuple) else c.name).lower() for c in cursor.description]
+    """Name the columns of a ``SHOW`` result.
+
+    A cursor with no description produced no result set; that is an empty
+    listing, not a crash whose Python traceback ends up in the sidebar.
+    """
+    description = getattr(cursor, "description", None)
+    if not description:
+        return []
+    names = [str(c[0] if isinstance(c, tuple) else c.name).lower() for c in description]
     return [dict(zip(names, row, strict=False)) for row in cursor.fetchall()]
 
 

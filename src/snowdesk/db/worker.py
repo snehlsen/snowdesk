@@ -23,6 +23,7 @@ from snowdesk.config import DEFAULT_PAGE_SIZE
 from snowdesk.db import browser as browse
 from snowdesk.db.errors import (
     is_bad_private_key_passphrase,
+    is_session_lost,
     needs_private_key_passphrase,
     to_query_error,
 )
@@ -47,6 +48,11 @@ class ConnectJob:
 @dataclass(slots=True)
 class DisconnectJob:
     pass
+
+
+@dataclass(slots=True)
+class ReconnectJob:
+    """Re-open the last connection, reusing whatever it was opened with."""
 
 
 @dataclass(slots=True)
@@ -81,6 +87,7 @@ class ShutdownJob:
 Job = (
     ConnectJob
     | DisconnectJob
+    | ReconnectJob
     | RunScriptJob
     | FetchMoreJob
     | CloseResultJob
@@ -104,6 +111,8 @@ class SnowflakeWorker(QObject):
     #: The connection uses an encrypted private key and needs a passphrase:
     #: connection name, and whether a previous attempt was rejected.
     passphrase_required = Signal(str, bool)
+    #: The session died mid-flight: connection name and what went wrong.
+    connection_lost = Signal(str, str)
     sso_hint = Signal()
 
     script_started = Signal(int)  # statement count
@@ -133,6 +142,8 @@ class SnowflakeWorker(QObject):
         # by Connect does not ask again.  In memory only, never persisted, and
         # dropped as soon as one is rejected.
         self._passphrases: dict[str, str] = {}
+        # Survives a lost session, which clears the session's own copy.
+        self._last_name: str | None = None
 
     # -- public API (called from the UI thread) ---------------------------
 
@@ -192,6 +203,8 @@ class SnowflakeWorker(QObject):
     def _dispatch(self, job: Job) -> None:
         if isinstance(job, ConnectJob):
             self._connect(job)
+        elif isinstance(job, ReconnectJob):
+            self._reconnect()
         elif isinstance(job, DisconnectJob):
             self._disconnect()
         elif isinstance(job, RunScriptJob):
@@ -212,6 +225,7 @@ class SnowflakeWorker(QObject):
             remembered = self._passphrases.get(params.name)
             if remembered is not None:
                 params = replace(params, private_key_passphrase=remembered)
+        self._last_name = params.name
         self.state_changed.emit(ConnectionState.CONNECTING.value, params.name)
         try:
             ctx = self.session.connect(params)
@@ -246,11 +260,38 @@ class SnowflakeWorker(QObject):
         self.state_changed.emit(ConnectionState.ERROR.value, error.message)
         self.connect_failed.emit(error)
 
+    def _reconnect(self) -> None:
+        """Re-open the last connection after a loss or a disconnect (C6)."""
+        name = self._last_name
+        if not name:
+            self.worker_error.emit("No connection to reconnect to.")
+            return
+        self._connect(ConnectJob(params=ConnectParams(name=name)))
+
     def _disconnect(self) -> None:
         self.results.close_all()
         self.session.close()
         self.state_changed.emit(ConnectionState.DISCONNECTED.value, "")
         self.context_changed.emit(SessionContext())
+
+    def _note_failure(self, exc: BaseException) -> bool:
+        """Mark the session dead if ``exc`` says the connection is gone (spec 9).
+
+        Returns whether it did.  Closing the session here is what makes the
+        toolbar stop claiming to be connected and the Reconnect path available;
+        the editor and its tabs are untouched.
+        """
+        if not is_session_lost(exc):
+            return False
+        name = self.session.connection_name or ""
+        message = to_query_error(exc).message
+        log.warning("Connection %s lost: %s", name, message)
+        self.results.close_all()
+        self.session.close()
+        self.state_changed.emit(ConnectionState.ERROR.value, message)
+        self.connection_lost.emit(name, message)
+        self.context_changed.emit(SessionContext())
+        return True
 
     # -- script execution -------------------------------------------------
 
@@ -317,6 +358,7 @@ class SnowflakeWorker(QObject):
                 message="Cancelled.",
             )
         except Exception as exc:
+            self._note_failure(exc)
             error = to_query_error(exc, runner.current_query_id)
             return StatementOutcome(
                 index=index,
@@ -337,7 +379,8 @@ class SnowflakeWorker(QObject):
         try:
             rows = handle.fetch(page_size)
         except Exception as exc:
-            self.results.close(handle.result_id)
+            if not self._note_failure(exc):
+                self.results.close(handle.result_id)
             error = to_query_error(exc, qid)
             return StatementOutcome(
                 index=index,
@@ -388,7 +431,8 @@ class SnowflakeWorker(QObject):
             rows = handle.fetch(job.page_size)
         except Exception as exc:
             log.warning("Fetch failed for %s", job.result_id, exc_info=True)
-            self.results.close(job.result_id)
+            if not self._note_failure(exc):
+                self.results.close(job.result_id)
             self.fetch_failed.emit(job.result_id, to_query_error(exc).formatted())
             return
         self.rows_appended.emit(job.result_id, rows, handle.exhausted)
@@ -411,6 +455,7 @@ class SnowflakeWorker(QObject):
             else:
                 nodes = browse.list_columns(conn, path[0], path[1], path[2])
         except Exception as exc:
+            self._note_failure(exc)
             error: QueryError = to_query_error(exc)
             self.browse_failed.emit(path, error.message)
             return

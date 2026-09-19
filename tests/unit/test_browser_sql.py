@@ -66,3 +66,39 @@ def test_get_ddl_escapes_a_quote_in_the_name() -> None:
 
 def test_an_unknown_kind_falls_back_to_table() -> None:
     assert "'TABLE'" in browse.get_ddl_sql("something-else", "D", "S", "T")
+
+
+# -- robustness of the SHOW readers -----------------------------------------
+
+
+class _Cursor:
+    def __init__(self, description, rows):
+        self.description = description
+        self._rows = rows
+
+    def execute(self, _sql):
+        return self
+
+    def fetchall(self):
+        return self._rows
+
+    def close(self):
+        pass
+
+
+class _Conn:
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    def cursor(self):
+        return self._cursor
+
+
+def test_a_show_with_no_result_set_is_an_empty_listing() -> None:
+    """Never let a raw Python error reach the sidebar."""
+    assert browse.list_databases(_Conn(_Cursor(None, []))) == []
+
+
+def test_a_show_returning_rows_is_parsed() -> None:
+    cursor = _Cursor([("name", 2, None, None, None, None, True)], [("RAW",), ("ANALYTICS",)])
+    assert [n.name for n in browse.list_databases(_Conn(cursor))] == ["RAW", "ANALYTICS"]

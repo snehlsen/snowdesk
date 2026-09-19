@@ -29,7 +29,7 @@ from snowdesk import config
 from snowdesk.controllers.browser import BrowserController
 from snowdesk.controllers.query import QueryController
 from snowdesk.db.session import ConnectionState, ConnectParams
-from snowdesk.db.worker import ConnectJob, DisconnectJob, SnowflakeWorker
+from snowdesk.db.worker import ConnectJob, DisconnectJob, ReconnectJob, SnowflakeWorker
 from snowdesk.model import ColumnInfo, QueryError, RunStatus, SessionContext, StatementOutcome
 from snowdesk.storage.history import HistoryStore
 from snowdesk.storage.session import SessionStore
@@ -79,6 +79,7 @@ class MainWindow(QMainWindow):
         self._connections: dict[str, config.ConnectionInfo] = {}
 
         self._build_toolbar()
+        self._build_banner()
         self._build_central(dark=dark)
         self._build_statusbar()
         self._build_actions()
@@ -124,6 +125,48 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self.query.cancel)
         bar.addWidget(self.stop_button)
+
+    def _build_banner(self) -> None:
+        """A dismissible strip for connection trouble, with one-click Reconnect."""
+        self.banner = QWidget(self)
+        self.banner.setStyleSheet(
+            "QWidget { background: #fdf0e3; border-bottom: 1px solid #e0b884; }"
+            "QLabel { color: #7a4a00; }"
+        )
+        self.banner_label = QLabel("", self.banner)
+        self.banner_label.setWordWrap(True)
+        self.reconnect_button = QPushButton("Reconnect", self.banner)
+        self.reconnect_button.clicked.connect(self._reconnect)
+        self.dismiss_button = QPushButton("Dismiss", self.banner)
+        self.dismiss_button.clicked.connect(self.hide_banner)
+
+        layout = QHBoxLayout(self.banner)
+        layout.setContentsMargins(10, 6, 10, 6)
+        layout.addWidget(self.banner_label, 1)
+        layout.addWidget(self.reconnect_button)
+        layout.addWidget(self.dismiss_button)
+
+        # QToolBar.addWidget wraps the widget in a QWidgetAction and shows it,
+        # so the strip is hidden by toggling the toolbar, not the widget.
+        self.banner_bar = QToolBar("Banner", self)
+        self.banner_bar.setMovable(False)
+        self.banner_bar.setFloatable(False)
+        self.banner_bar.addWidget(self.banner)
+        self.addToolBarBreak()
+        self.addToolBar(self.banner_bar)
+        self.banner_bar.setVisible(False)
+
+    def show_banner(self, message: str, *, offer_reconnect: bool = True) -> None:
+        self.banner_label.setText(message)
+        self.reconnect_button.setVisible(offer_reconnect)
+        self.banner_bar.setVisible(True)
+
+    def hide_banner(self) -> None:
+        self.banner_bar.setVisible(False)
+
+    def _reconnect(self) -> None:
+        self.hide_banner()
+        self.worker.submit(ReconnectJob())
 
     def _build_central(self, dark: bool) -> None:
         # Left: object browser
@@ -248,6 +291,7 @@ class MainWindow(QMainWindow):
         w.connected.connect(self._on_connected)
         w.connect_failed.connect(self._on_connect_failed)
         w.passphrase_required.connect(self._on_passphrase_required)
+        w.connection_lost.connect(self._on_connection_lost)
         w.sso_hint.connect(self._on_sso_hint)
         w.statement_started.connect(self._on_statement_started)
         w.statement_finished.connect(self._on_statement_finished)
@@ -308,6 +352,7 @@ class MainWindow(QMainWindow):
         self.worker.submit(ConnectJob(params=ConnectParams(name=name)))
 
     def _on_connected(self, name: str, ctx: SessionContext) -> None:
+        self.hide_banner()
         self.statusBar().showMessage(f"Connected to {name}", 4000)
         self._set_context(ctx)
         self.object_tree.load_roots()
@@ -348,6 +393,17 @@ class MainWindow(QMainWindow):
         self.worker.submit(
             ConnectJob(params=ConnectParams(name=name, private_key_passphrase=passphrase))
         )
+
+    def _on_connection_lost(self, name: str, message: str) -> None:
+        """The session died mid-flight (spec 9).
+
+        Editor tabs and results are left exactly as they are; only the
+        connection is gone, and one click brings it back.
+        """
+        where = f" to {name}" if name else ""
+        self._log_message(f"Connection{where} lost: {message}")
+        self.show_banner(f"Connection{where} lost — {message}")
+        self.statusBar().showMessage("Disconnected", 6000)
 
     def _on_sso_hint(self) -> None:
         self._log_message(
