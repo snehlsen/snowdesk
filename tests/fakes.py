@@ -45,6 +45,10 @@ class FakeCursor:
         self._rows: list[tuple] = []
         self._pos = 0
         self.closed = False
+        #: Set by get_results_from_sfqid and applied on the first fetch, the
+        #: way the real connector's _prefetch_hook works: an async cursor has
+        #: no description until rows are pulled from it.
+        self._pending: FakeStatement | None = None
 
     # -- DB-API-ish --------------------------------------------------------
 
@@ -70,9 +74,15 @@ class FakeCursor:
         return self
 
     def get_results_from_sfqid(self, sfqid: str) -> None:
+        """Arm the result without materialising it, as the connector does."""
         sql, _ = self.conn.pending.get(sfqid, ("", 0))
-        self._apply(self.conn.plan_for(sql))
+        self._pending = self.conn.plan_for(sql)
         self.sfqid = sfqid
+
+    def _prefetch(self) -> None:
+        if self._pending is not None:
+            spec, self._pending = self._pending, None
+            self._apply(spec)
 
     def _apply(self, spec: FakeStatement) -> None:
         self.description = spec.columns or None
@@ -81,11 +91,13 @@ class FakeCursor:
         self.rowcount = spec.rowcount if spec.rowcount is not None else len(spec.rows)
 
     def fetchmany(self, size: int) -> list[tuple]:
+        self._prefetch()
         chunk = self._rows[self._pos : self._pos + size]
         self._pos += len(chunk)
         return chunk
 
     def fetchall(self) -> list[tuple]:
+        self._prefetch()
         chunk = self._rows[self._pos :]
         self._pos = len(self._rows)
         return chunk

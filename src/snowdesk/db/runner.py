@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
 from collections.abc import Callable
 from typing import Any
 
@@ -133,18 +132,3 @@ class StatementRunner:
         except Exception:
             log.warning("SYSTEM$CANCEL_QUERY failed for %s", qid, exc_info=True)
         return qid
-
-
-def status_message(cursor: Any, elapsed: float) -> str:
-    """Status line for DML/DDL statements that return no grid (Q6)."""
-    rowcount = getattr(cursor, "rowcount", None)
-    if isinstance(rowcount, int) and rowcount >= 0:
-        noun = "row" if rowcount == 1 else "rows"
-        return f"{rowcount:,} {noun} affected in {elapsed:.2f}s"
-    return f"Statement executed in {elapsed:.2f}s"
-
-
-def sleep_backoff(delay: float) -> float:
-    """Pure helper so the backoff schedule can be unit-tested."""
-    time.sleep(delay)
-    return min(delay * POLL_BACKOFF, MAX_POLL_SECONDS)

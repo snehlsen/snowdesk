@@ -26,8 +26,8 @@ from snowdesk.db.errors import (
     needs_private_key_passphrase,
     to_query_error,
 )
-from snowdesk.db.results import ResultRegistry, has_result_set
-from snowdesk.db.runner import Cancelled, StatementRunner, status_message
+from snowdesk.db.results import ResultRegistry, summarize_status
+from snowdesk.db.runner import Cancelled, StatementRunner
 from snowdesk.db.session import ConnectionState, ConnectParams, SnowflakeSession
 from snowdesk.model import QueryError, RunStatus, SessionContext, Statement, StatementOutcome
 
@@ -331,23 +331,8 @@ class SnowflakeWorker(QObject):
         elapsed = time.monotonic() - started
         qid = getattr(cursor, "sfqid", None) or runner.current_query_id
 
-        if not has_result_set(cursor):
-            message = status_message(cursor, elapsed)
-            rowcount = getattr(cursor, "rowcount", None)
-            try:
-                cursor.close()
-            except Exception:
-                log.debug("Ignoring error closing cursor", exc_info=True)
-            return StatementOutcome(
-                index=index,
-                statement=statement,
-                status=RunStatus.SUCCESS,
-                query_id=qid,
-                duration_s=elapsed,
-                row_count=rowcount if isinstance(rowcount, int) and rowcount >= 0 else None,
-                message=message,
-            )
-
+        # The first fetch is what makes an async cursor hand over its column
+        # metadata, so it has to happen before the result can be classified.
         handle = self.results.register(cursor)
         try:
             rows = handle.fetch(page_size)
@@ -362,6 +347,19 @@ class SnowflakeWorker(QObject):
                 duration_s=time.monotonic() - started,
                 message=error.formatted(),
                 error=error,
+            )
+
+        summary = summarize_status(handle.columns, rows, statement.sql)
+        if summary is not None:
+            self.results.close(handle.result_id)
+            return StatementOutcome(
+                index=index,
+                statement=statement,
+                status=RunStatus.SUCCESS,
+                query_id=qid,
+                duration_s=elapsed,
+                row_count=_affected_rows(handle.columns, rows),
+                message=f"{summary} ({elapsed:.2f}s)",
             )
 
         self.result_ready.emit(
@@ -419,9 +417,16 @@ class SnowflakeWorker(QObject):
         self.nodes_ready.emit(path, nodes)
 
 
-def fetch_all_batches(worker: SnowflakeWorker, result_id: str, page_size: int) -> Any:
-    """Iterate remaining batches of a result — used by streaming CSV export."""
-    handle = worker.results.get(result_id)
-    if handle is None:
-        return iter(())
-    return handle.iter_batches(page_size)
+def _affected_rows(columns: list[Any], rows: list[Any]) -> int | None:
+    """Rows affected, when Snowflake reported them as a counter column (Q6)."""
+    if len(rows) != 1 or not columns:
+        return None
+    total = 0
+    for column, value in zip(columns, rows[0], strict=False):
+        if not column.name.strip().lower().startswith("number of rows"):
+            return None
+        try:
+            total += int(value)
+        except (TypeError, ValueError):
+            return None
+    return total

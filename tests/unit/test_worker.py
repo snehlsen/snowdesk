@@ -74,18 +74,79 @@ def test_run_emits_first_page_then_fetches_more(worker_and_conn) -> None:
     assert appended[-1][2] is True  # exhausted
 
 
+# Snowflake hands DML and DDL results back through RESULT_SCAN, so they arrive
+# as one-row result sets rather than as bare status codes.
+INSERT_COLS = [("number of rows inserted", 0, None, None, 38, 0, True)]
+STATUS_COLS = [("status", 2, None, None, None, None, True)]
+
+
 @pytest.mark.parametrize(
     "worker_and_conn",
-    [{"insert": FakeStatement(rowcount=7)}],
+    [{"insert": FakeStatement(columns=INSERT_COLS, rows=[(7,)])}],
     indirect=True,
 )
 def test_dml_reports_rows_affected(worker_and_conn) -> None:
     worker, _conn = worker_and_conn
     outcomes = collect(worker.statement_finished)
+    results = collect(worker.result_ready)
     worker._dispatch(RunScriptJob(statements=split_sql("insert into t values (1)")))
     assert outcomes[0].status is RunStatus.SUCCESS
-    assert "7 rows affected" in outcomes[0].message
+    assert "7 rows inserted" in outcomes[0].message
+    assert outcomes[0].row_count == 7
     assert outcomes[0].result_id is None
+    assert results == []  # a counter row does not deserve a result tab
+
+
+@pytest.mark.parametrize(
+    "worker_and_conn",
+    [
+        {
+            "create table": FakeStatement(
+                columns=STATUS_COLS, rows=[("Table T successfully created.",)]
+            )
+        }
+    ],
+    indirect=True,
+)
+def test_ddl_reports_its_status_line(worker_and_conn) -> None:
+    worker, _conn = worker_and_conn
+    outcomes = collect(worker.statement_finished)
+    results = collect(worker.result_ready)
+    worker._dispatch(RunScriptJob(statements=split_sql("create table t (a int)")))
+    assert "Table T successfully created." in outcomes[0].message
+    assert results == []
+
+
+@pytest.mark.parametrize(
+    "worker_and_conn",
+    [{"select": FakeStatement(columns=[("N", 0, None, None, 38, 0, False)], rows=[(1,)])}],
+    indirect=True,
+)
+def test_select_opens_a_result_tab(worker_and_conn) -> None:
+    """The async cursor only reveals its columns once rows are pulled."""
+    worker, _conn = worker_and_conn
+    outcomes = collect(worker.statement_finished)
+    results = collect(worker.result_ready)
+    worker._dispatch(RunScriptJob(statements=split_sql("select 1 as n")))
+    assert len(results) == 1
+    result_id, columns, rows, exhausted, _total = results[0]
+    assert [c.name for c in columns] == ["N"]
+    assert rows == [(1,)]
+    assert exhausted
+    assert outcomes[0].result_id == result_id
+
+
+@pytest.mark.parametrize(
+    "worker_and_conn",
+    [{"select": FakeStatement(columns=STATUS_COLS, rows=[("shipped",)])}],
+    indirect=True,
+)
+def test_a_query_returning_one_status_column_still_gets_a_grid(worker_and_conn) -> None:
+    """`select status from t` has the exact shape of a DDL result."""
+    worker, _conn = worker_and_conn
+    results = collect(worker.result_ready)
+    worker._dispatch(RunScriptJob(statements=split_sql("select status from orders limit 1")))
+    assert len(results) == 1
 
 
 @pytest.mark.parametrize(
