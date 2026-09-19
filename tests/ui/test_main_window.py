@@ -456,3 +456,50 @@ def test_closing_the_sole_tab_with_the_shortcut(harness: Harness, monkeypatch) -
     window._close_current_tab()
     assert window.editors.count() == 1
     assert window.editor.toPlainText() == ""
+
+
+def test_run_current_at_end_of_line_runs_that_line(harness: Harness) -> None:
+    """⌘↩ with the cursor just past a semicolon ran the following statement."""
+    connect(harness)
+    window = harness.window
+    text = "select 1;\nselect * from orders;"
+    window.editor.setPlainText(text)
+
+    cursor = window.editor.textCursor()
+    cursor.setPosition(text.index("\n"))  # end of line 1, right after the ';'
+    window.editor.setTextCursor(cursor)
+
+    window.run_current()
+    harness.drain()
+    assert harness.conn.executed[-1] == "select 1"
+
+
+def test_run_current_on_the_second_line_runs_the_second_statement(harness: Harness) -> None:
+    connect(harness)
+    window = harness.window
+    text = "select 1;\nselect * from orders;"
+    window.editor.setPlainText(text)
+
+    cursor = window.editor.textCursor()
+    cursor.setPosition(len(text) - 1)  # end of line 2, before its ';'
+    window.editor.setTextCursor(cursor)
+
+    window.run_current()
+    harness.drain()
+    assert harness.conn.executed[-1] == "select * from orders"
+
+
+def test_run_current_still_prefers_a_selection(harness: Harness) -> None:
+    connect(harness)
+    window = harness.window
+    text = "select 1;\nselect * from orders;"
+    window.editor.setPlainText(text)
+
+    cursor = window.editor.textCursor()
+    cursor.setPosition(text.index("select * from orders"))
+    cursor.setPosition(len(text) - 1, cursor.MoveMode.KeepAnchor)
+    window.editor.setTextCursor(cursor)
+
+    window.run_current()
+    harness.drain()
+    assert harness.conn.executed[-1] == "select * from orders"

@@ -15,19 +15,45 @@ from snowdesk.storage.history import HistoryStore
 log = logging.getLogger(__name__)
 
 
+def _trailer_end(text: str, end: int) -> int:
+    """End of the terminator run after a statement, staying on its own line.
+
+    A statement's span stops before its semicolon, because the splitter strips
+    it.  This walks over the ``;`` and any spaces after it, but never over the
+    newline: whatever is on the next line belongs to the next statement.
+    """
+    index = end
+    while index < len(text) and text[index] in " \t;":
+        index += 1
+    return index
+
+
 def statement_at(text: str, position: int) -> Statement | None:
     """The statement under the cursor, for ⌘↩ (Q1).
 
-    A cursor sitting on the boundary belongs to the statement that ends there,
-    which is what you want after typing a trailing semicolon.
+    A cursor resting just after a statement's semicolon -- where it lands once
+    you finish typing the line -- belongs to that statement, not to the one on
+    the next line.
     """
     statements = split_sql(text)
     if not statements:
         return None
+
+    # Inside the statement text itself.  Checked first so that a cursor sitting
+    # exactly where the next statement starts, as with `select 1; select 2`,
+    # picks the statement it is touching rather than the one it follows.
     for stmt in statements:
         if stmt.start <= position <= stmt.end:
             return stmt
-    # Between statements: take the next one, else the last.
+
+    # In the `;` and trailing spaces that close a statement, on its own line.
+    for index, stmt in enumerate(statements):
+        following = statements[index + 1].start if index + 1 < len(statements) else len(text)
+        limit = min(_trailer_end(text, stmt.end), following)
+        if stmt.end < position <= limit:
+            return stmt
+
+    # Somewhere between statements: take the next one, else the last.
     for stmt in statements:
         if stmt.start > position:
             return stmt
