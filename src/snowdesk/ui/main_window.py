@@ -32,7 +32,9 @@ from snowdesk.db.session import ConnectionState, ConnectParams
 from snowdesk.db.worker import ConnectJob, DisconnectJob, SnowflakeWorker
 from snowdesk.model import ColumnInfo, QueryError, RunStatus, SessionContext, StatementOutcome
 from snowdesk.storage.history import HistoryStore
+from snowdesk.storage.session import SessionStore
 from snowdesk.ui.editor import SqlEditor
+from snowdesk.ui.editor_tabs import EditorTabs
 from snowdesk.ui.history_panel import HistoryPanel
 from snowdesk.ui.object_tree import ObjectTree
 from snowdesk.ui.result_view import ResultModel, ResultView
@@ -59,6 +61,7 @@ class MainWindow(QMainWindow):
         query: QueryController,
         browser: BrowserController,
         history: HistoryStore,
+        session: SessionStore | None = None,
         dark: bool = False,
     ) -> None:
         super().__init__()
@@ -66,6 +69,7 @@ class MainWindow(QMainWindow):
         self.query = query
         self.browser = browser
         self.history = history
+        self.session = session or SessionStore(config.session_path())
 
         self.setWindowTitle("SnowDesk")
         self.resize(1280, 820)
@@ -82,6 +86,11 @@ class MainWindow(QMainWindow):
 
         self._populate_connections()
         self._set_state(ConnectionState.DISCONNECTED.value, "")
+
+    @property
+    def editor(self) -> SqlEditor:
+        """The focused editor tab; most of the window only cares about this one."""
+        return self.editors.editor
 
     # -- construction ------------------------------------------------------
 
@@ -140,10 +149,12 @@ class MainWindow(QMainWindow):
         left_layout.addLayout(tree_top)
         left_layout.addWidget(self.object_tree)
 
-        # Right: editor over results
-        self.editor = SqlEditor(self, dark=dark)
-        self.editor.run_requested.connect(self.run_current)
-        self.editor.run_all_requested.connect(self.run_all)
+        # Right: editor tabs over results
+        self.editors = EditorTabs(self.session, self, dark=dark)
+        self.editors.run_requested.connect(self.run_current)
+        self.editors.run_all_requested.connect(self.run_all)
+        self.editors.current_file_changed.connect(self._on_file_changed)
+        self.editors.restore_session()
 
         self.result_tabs = QTabWidget(self)
         self.result_tabs.setDocumentMode(True)
@@ -161,7 +172,7 @@ class MainWindow(QMainWindow):
         self._pin_fixed_tabs()
 
         right = QSplitter(Qt.Orientation.Vertical, self)
-        right.addWidget(self.editor)
+        right.addWidget(self.editors)
         right.addWidget(self.result_tabs)
         right.setSizes([350, 420])
         right.setStretchFactor(0, 1)
@@ -199,7 +210,11 @@ class MainWindow(QMainWindow):
             act = QAction(text, self)
             if shortcut:
                 act.setShortcut(QKeySequence(shortcut))
-            act.triggered.connect(slot)
+            # QAction.triggered carries a `checked` bool.  Connecting a slot
+            # that takes optional arguments directly would receive it as the
+            # first one -- new_tab(text=False) is how ⌘T stopped working -- so
+            # the argument is dropped here, once, for every action.
+            act.triggered.connect(lambda _checked=False, fn=slot: fn())
             self._menu(menu_name).addAction(act)
             self.addAction(act)
             return act
@@ -209,6 +224,11 @@ class MainWindow(QMainWindow):
         self.cancel_action = action("Cancel", "Ctrl+.", self.query.cancel, "&Query")
         self.cancel_action.setEnabled(False)
         action("Reconnect", "Ctrl+R", self._on_connect_clicked, "&Query")
+        action("New Tab", "Ctrl+T", self.editors.new_tab, "&File")
+        action("Close Tab", "Ctrl+W", self._close_current_tab, "&File")
+        action("Open…", "Ctrl+O", self.editors.open_file, "&File")
+        action("Save", "Ctrl+S", self.editors.save, "&File")
+        action("Save As…", "Ctrl+Shift+S", self.editors.save_as, "&File")
         action("Copy with Headers", "Ctrl+Shift+C", self._copy_with_headers, "&Edit")
         action("Clear History…", "", self._clear_history, "&Edit")
 
@@ -479,6 +499,12 @@ class MainWindow(QMainWindow):
 
     # -- misc --------------------------------------------------------------
 
+    def _close_current_tab(self) -> None:
+        self.editors.close_tab(self.editors.currentIndex())
+
+    def _on_file_changed(self, path: object) -> None:
+        self.setWindowTitle(f"SnowDesk — {path}" if path else "SnowDesk")
+
     def _load_from_history(self, sql: str) -> None:
         self.editor.setPlainText(sql)
         self.editor.setFocus()
@@ -499,5 +525,7 @@ class MainWindow(QMainWindow):
         self.messages.appendPlainText(text)
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        # Tab contents are autosaved, so quitting never has to ask (E2).
+        self.editors.save_session()
         self.closing.emit()
         super().closeEvent(event)

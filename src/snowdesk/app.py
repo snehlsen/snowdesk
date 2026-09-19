@@ -16,6 +16,7 @@ from snowdesk.controllers.browser import BrowserController
 from snowdesk.controllers.query import QueryController
 from snowdesk.db.worker import SnowflakeWorker
 from snowdesk.storage.history import HistoryStore
+from snowdesk.storage.session import SessionStore
 from snowdesk.ui.main_window import MainWindow
 
 log = logging.getLogger(__name__)
@@ -37,9 +38,12 @@ def setup_logging(level: int = logging.INFO) -> None:
     except OSError:
         pass  # a missing log directory must never stop the app from starting
 
-    stream = logging.StreamHandler()
-    stream.setFormatter(fmt)
-    root.addHandler(stream)
+    # A windowed bundle launched from Finder can have no stderr at all; a
+    # StreamHandler on None fails on every record, so the file log stands alone.
+    if sys.stderr is not None:
+        stream = logging.StreamHandler()
+        stream.setFormatter(fmt)
+        root.addHandler(stream)
 
 
 def is_dark(app: QApplication) -> bool:
@@ -57,6 +61,7 @@ class Application:
         self.qt.setOrganizationName("SnowDesk")
 
         self.history = HistoryStore(config.history_db_path())
+        self.session = SessionStore(config.session_path())
         self.worker = SnowflakeWorker()
         self.thread = QThread()
         self.thread.setObjectName("snowdesk-worker")
@@ -72,6 +77,7 @@ class Application:
             query=self.query,
             browser=self.browser,
             history=self.history,
+            session=self.session,
             dark=is_dark(self.qt),
         )
         self.qt.aboutToQuit.connect(self.shutdown)
@@ -83,6 +89,7 @@ class Application:
 
     def shutdown(self) -> None:
         log.info("Shutting down")
+        self.window.editors.save_session()
         # Break any polling loop first so the worker reaches the shutdown job.
         self.worker.cancel_running()
         self.worker.shutdown()

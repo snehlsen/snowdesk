@@ -28,22 +28,37 @@ does not ask again, and is never written to disk.
 
 ## Status
 
-All **P0** requirements from the spec are implemented (milestones M0–M3, plus
-E1, B1 and H1).
+All **P0** requirements from the spec are implemented, plus milestones M0-M4.
 
 | Area | Done | Not yet |
 |------|------|---------|
-| Connections | C1–C6 | C7 role/warehouse override, C8 edit connections |
-| Query execution | Q1–Q6, Q7 (`QUERY_TAG`), Q8 (tab per result) | Q9 Snowsight link |
-| Results | R1–R5 | R6 CSV export UI\*, R7 sort/filter, R8 detail panel, R9 Parquet/XLSX |
+| Connections | C1-C6 | C7 role/warehouse override, C8 edit connections |
+| Query execution | Q1-Q6, Q7 (`QUERY_TAG`), Q8 (tab per result) | Q9 Snowsight link |
+| Results | R1-R5 | R6 CSV export UI\*, R7 sort/filter, R8 detail panel, R9 Parquet/XLSX |
 | Object browser | B1, B2, B3, B5 (filter, refresh) | B4 context menu (preview, GET_DDL) |
-| Editor | E1 | E2 tabs + autosave, E3 open/save, E4 autocompletion |
+| Editor | E1, E2, E3 | E4 autocompletion |
 | History | H1, H2 | — |
 | Preferences | — | S1 preferences dialog |
 
 \* The streaming CSV writer (`util/export.py`) and batch iteration
 (`ResultHandle.iter_batches`) are in place; only the menu action and file dialog
-are missing.
+are missing. That is the one shortcut from spec section 8 that does nothing
+yet (⌘E); it belongs with R6 in M6.
+
+### Keyboard shortcuts
+
+| | |
+|---|---|
+| ⌘↩ / ⌘⇧↩ | run the statement under the cursor (or selection) / run everything |
+| ⌘. | cancel the running statement, server-side |
+| ⌘T / ⌘W | new editor tab / close tab |
+| ⌘O / ⌘S / ⌘⇧S | open a `.sql` file / save / save as |
+| ⌘⇧C | copy selected cells with headers |
+
+Editor tabs are autosaved every few seconds to
+`~/Library/Application Support/SnowDesk/session.json`, so unsaved work survives
+a relaunch. A tab backed by an unmodified file stores only its path and is
+re-read from disk, so editing a file outside SnowDesk is picked up.
 
 ## Development
 

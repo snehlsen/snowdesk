@@ -167,3 +167,8 @@ def log_dir() -> Path:
 
 def history_db_path() -> Path:
     return support_dir() / "history.db"
+
+
+def session_path() -> Path:
+    """Where autosaved editor tabs live (E2)."""
+    return support_dir() / "session.json"

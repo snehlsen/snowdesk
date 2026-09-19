@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import queue
+import sys
 
 import pytest
+from PySide6.QtWidgets import QMessageBox
 
 from snowdesk.controllers.browser import BrowserController
 from snowdesk.controllers.query import QueryController
 from snowdesk.db.session import ConnectParams, SnowflakeSession
 from snowdesk.db.worker import ConnectJob, SnowflakeWorker
 from snowdesk.storage.history import HistoryStore
+from snowdesk.storage.session import SessionStore
+from snowdesk.ui.editor import SqlEditor
 from snowdesk.ui.main_window import MainWindow
 from snowdesk.ui.result_view import ResultView
 from tests.fakes import FakeConnection, FakeProgrammingError, FakeStatement
@@ -59,6 +63,7 @@ def harness(qtbot, tmp_path, monkeypatch):
         query=QueryController(worker, history=history),
         browser=BrowserController(worker),
         history=history,
+        session=SessionStore(tmp_path / "session.json"),
     )
     qtbot.addWidget(window)
     yield Harness(window, worker, conn)
@@ -234,6 +239,7 @@ def key_harness(qtbot, tmp_path, monkeypatch):
         query=QueryController(worker, history=history),
         browser=BrowserController(worker),
         history=history,
+        session=SessionStore(tmp_path / "session.json"),
     )
     qtbot.addWidget(window)
     yield Harness(window, worker, conn)
@@ -306,3 +312,147 @@ def test_the_passphrase_never_reaches_the_messages_pane(key_harness, monkeypatch
     key_harness.window._on_connect_clicked()
     key_harness.drain()
     assert "hunter2" not in key_harness.window.messages.toPlainText()
+
+
+# -- editor tabs and shortcuts (M4: E2, E3, section 8) ----------------------
+
+
+def shortcuts(window) -> dict[str, str]:
+    """Every action's shortcut, keyed by action text."""
+    return {
+        a.text(): a.shortcut().toString() for a in window.actions() if not a.shortcut().isEmpty()
+    }
+
+
+def test_every_section_8_shortcut_is_bound(harness: Harness) -> None:
+    bound = set(shortcuts(harness.window).values())
+    # ⌘ maps to Ctrl in Qt's portable notation.
+    expected = {
+        "Ctrl+Return",  # run statement or selection
+        "Ctrl+Shift+Return",  # run all
+        "Ctrl+.",  # cancel
+        "Ctrl+T",  # new tab
+        "Ctrl+W",  # close tab
+        "Ctrl+O",  # open
+        "Ctrl+S",  # save
+        "Ctrl+Shift+C",  # copy with headers
+    }
+    assert expected <= bound, f"missing: {expected - bound}"
+
+
+def test_new_and_close_tab_actions_work(harness: Harness) -> None:
+    window = harness.window
+    assert window.editors.count() == 1
+    window.editors.new_tab()
+    assert window.editors.count() == 2
+    window._close_current_tab()
+    assert window.editors.count() == 1
+
+
+def test_the_window_runs_the_focused_tab(harness: Harness) -> None:
+    connect(harness)
+    window = harness.window
+    window.editor.setPlainText("select 1")
+    window.editors.new_tab()
+    window.editor.setPlainText("select * from orders")
+
+    window.run_all()
+    harness.drain()
+    assert harness.conn.executed[-1] == "select * from orders"
+
+
+def test_the_title_follows_the_open_file(harness: Harness, tmp_path) -> None:
+    path = tmp_path / "report.sql"
+    path.write_text("select 1")
+    harness.window.editors.open_file(path)
+    assert "report.sql" in harness.window.windowTitle()
+
+
+def test_history_loads_into_the_focused_tab(harness: Harness) -> None:
+    connect(harness)
+    window = harness.window
+    window.editor.setPlainText("select * from orders")
+    window.run_all()
+    harness.drain()
+
+    window.editors.new_tab()
+    window.history_panel._on_double_click(0, 0)
+    assert window.editor.toPlainText() == "select * from orders"
+    assert window.editors.count() == 2
+
+
+def test_closing_the_window_saves_the_session(harness: Harness) -> None:
+    window = harness.window
+    cursor = window.editor.textCursor()
+    cursor.insertText("select 'unsaved'")
+    window.close()
+
+    restored = window.session.load()
+    assert [t.text for t in restored.tabs] == ["select 'unsaved'"]
+
+
+def test_every_action_survives_the_checked_argument(harness: Harness, monkeypatch) -> None:
+    """Qt passes `triggered(checked: bool)`; no slot may take it as data.
+
+    Connecting a slot with optional parameters straight to `triggered` silently
+    fed that bool in as the first argument, which is how ⌘T stopped working.
+    Qt swallows exceptions raised inside a slot -- it prints them through
+    sys.excepthook and carries on -- which is why the breakage was invisible,
+    so the hook is what this asserts on.
+    """
+    nothing_chosen = staticmethod(lambda *a, **k: ("", ""))
+    monkeypatch.setattr("snowdesk.ui.editor_tabs.QFileDialog.getOpenFileName", nothing_chosen)
+    monkeypatch.setattr("snowdesk.ui.editor_tabs.QFileDialog.getSaveFileName", nothing_chosen)
+    monkeypatch.setattr(
+        QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.StandardButton.Discard)
+    )
+
+    escaped: list[str] = []
+    monkeypatch.setattr(
+        sys, "excepthook", lambda kind, value, tb: escaped.append(f"{kind.__name__}: {value}")
+    )
+
+    for act in harness.window.actions():
+        act.trigger()  # exactly what a shortcut or menu item does
+        assert not escaped, f"{act.text()} raised {escaped}"
+
+
+def test_new_tab_action_actually_adds_a_tab(harness: Harness) -> None:
+    window = harness.window
+    before = window.editors.count()
+    next(a for a in window.actions() if a.text() == "New Tab").trigger()
+    assert window.editors.count() == before + 1
+    assert window.editor.toPlainText() == ""  # not the checked bool
+
+
+def test_a_failed_new_tab_leaves_no_stray_editor(harness: Harness) -> None:
+    """The tab widget must never hold an editor that is not one of its pages."""
+    tabs = harness.window.editors
+    tabs.new_tab()
+    strays = tabs.findChildren(SqlEditor)
+    pages = [tabs.widget(i) for i in range(tabs.count())]
+    assert sorted(map(id, strays)) == sorted(map(id, pages))
+
+
+def test_closing_the_sole_tab_keeps_the_window_usable(harness: Harness) -> None:
+    window = harness.window
+    assert window.editors.count() == 1
+    window.editors.tabCloseRequested.emit(0)
+    assert window.editors.count() == 1
+    # The replacement tab is a working editor, not a corpse.
+    cursor = window.editor.textCursor()
+    cursor.insertText("select 1")
+    assert window.editor.toPlainText() == "select 1"
+    assert window.editors.capture_session().tabs[0].text == "select 1"
+
+
+def test_closing_the_sole_tab_with_the_shortcut(harness: Harness, monkeypatch) -> None:
+    monkeypatch.setattr(
+        QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.StandardButton.Discard)
+    )
+    window = harness.window
+    cursor = window.editor.textCursor()
+    cursor.insertText("select 1")
+    window._close_current_tab()
+    assert window.editors.count() == 1
+    assert window.editor.toPlainText() == ""

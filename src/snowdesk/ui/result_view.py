@@ -334,7 +334,7 @@ class ResultView(QWidget):
     def _add_shortcuts(self) -> None:
         copy = QAction("Copy", self)
         copy.setShortcut(QKeySequence.StandardKey.Copy)
-        copy.triggered.connect(self.copy_selection)
+        copy.triggered.connect(lambda: self.copy_selection())
         copy_headers = QAction("Copy with Headers", self)
         copy_headers.setShortcut(QKeySequence("Ctrl+Shift+C"))
         copy_headers.triggered.connect(lambda: self.copy_selection(with_headers=True))
