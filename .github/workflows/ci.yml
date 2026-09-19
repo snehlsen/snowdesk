@@ -13,7 +13,9 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - run: uv sync --frozen || uv sync
+      # --locked fails if uv.lock is out of date with pyproject.toml,
+      # rather than quietly resolving something else.
+      - run: uv sync --locked
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run mypy
