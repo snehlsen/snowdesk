@@ -1,25 +1,35 @@
 # PyInstaller spec for SnowDesk (spec 12).
 #
-# The Snowflake connector ships compiled extensions and Arrow components that
-# PyInstaller does not find on its own, hence the explicit hidden imports and
-# collected data files.  Build with:
+# Build from the repository root:
 #
 #     uv run pyinstaller packaging/snowdesk.spec --noconfirm
 #
 # then sign, notarize and staple as described in docs/spec.md section 12.
+#
+# Two things here are not obvious and were found by running the M0 spike
+# (`--selftest` on the built bundle) rather than by reading PyInstaller's
+# output, which reported success either way:
+#
+#   * The connector's Arrow result reader is a compiled Cython extension that
+#     imports `snowflake.connector.snow_logging` and looks its type converters
+#     up by name from C++.  None of that is visible to static analysis, so the
+#     whole package is collected rather than a hand-written list, which would
+#     only grow stale the next time the connector changes.
+#   * PySide6's own hook pulls in QML, Quick and friends as frameworks, which
+#     `excludes` does not touch because they are not imported modules.  They
+#     are dropped from the tables below instead.
+
+import os
 
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(SPEC)))
+
 hiddenimports = [
-    "snowflake.connector",
-    "snowflake.connector.arrow_iterator",
-    "snowflake.connector.nanoarrow_arrow_iterator",
-    "snowflake.connector.auth",
-    "snowflake.connector.auth.webbrowser",
-    "snowflake.connector.auth.keypair",
-    "snowflake.connector.auth.okta",
-    "snowflake.connector.vendored.requests",
-    *collect_submodules("snowflake.connector.auth"),
+    # See the note above: the compiled Arrow reader's imports are invisible.
+    *collect_submodules("snowflake.connector"),
+    "snowflake.connector.snow_logging",
+    "keyring",  # used by the connector's SSO token cache
 ]
 
 datas = [
@@ -28,28 +38,54 @@ datas = [
 ]
 
 a = Analysis(
-    ["../src/snowdesk/__main__.py"],
-    pathex=["../src"],
+    [os.path.join(ROOT, "src", "snowdesk", "__main__.py")],
+    pathex=[os.path.join(ROOT, "src")],
     binaries=[],
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
     runtime_hooks=[],
-    # PySide6 ships far more than SnowDesk uses; excluding the heavy modules
-    # keeps the bundle to a sane size.
     excludes=[
-        "PySide6.Qt3DCore",
-        "PySide6.QtCharts",
-        "PySide6.QtDataVisualization",
-        "PySide6.QtMultimedia",
-        "PySide6.QtQuick",
-        "PySide6.QtQml",
-        "PySide6.QtWebEngineCore",
-        "PySide6.QtWebEngineWidgets",
         "tkinter",
+        "setuptools",
+        "pip",
+        "pytest",
+        "IPython",
+        "numpy",
+        "pandas",
+        "pyarrow",
     ],
     noarchive=False,
 )
+
+# PySide6 ships far more than a widgets app uses, and the connector ships its
+# own C++ sources next to the built extension.  Neither belongs in the bundle.
+_UNUSED = (
+    "QtQml",
+    "QtQuick",
+    "QtVirtualKeyboard",
+    "QtPdf",
+    "QtOpenGL",
+    "Qt3D",
+    "QtWebEngine",
+    "QtMultimedia",
+    "QtCharts",
+    "QtDataVisualization",
+    "QtSensors",
+    "QtTest",
+    "QtDesigner",
+    "QtSpatialAudio",
+    "QtRemoteObjects",
+    "nanoarrow_cpp",  # C++ sources, not the built extension
+)
+
+
+def _prune(entries):
+    return [entry for entry in entries if not any(name in entry[0] for name in _UNUSED)]
+
+
+a.binaries = _prune(a.binaries)
+a.datas = _prune(a.datas)
 
 pyz = PYZ(a.pure)
 
@@ -65,7 +101,7 @@ exe = EXE(
     console=False,
     target_arch="arm64",
     codesign_identity=None,
-    entitlements_file="packaging/entitlements.plist",
+    entitlements_file=os.path.join(ROOT, "packaging", "entitlements.plist"),
 )
 
 coll = COLLECT(

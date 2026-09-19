@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import logging
 import logging.handlers
 import sys
@@ -10,7 +11,7 @@ from PySide6.QtCore import QThread
 from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import QApplication
 
-from snowdesk import config
+from snowdesk import __version__, config
 from snowdesk.controllers.browser import BrowserController
 from snowdesk.controllers.query import QueryController
 from snowdesk.db.worker import SnowflakeWorker
@@ -92,5 +93,24 @@ class Application:
 
 
 def main(argv: list[str] | None = None) -> int:
+    args = sys.argv[1:] if argv is None else argv[1:]
+    parser = argparse.ArgumentParser(prog="snowdesk", description=__doc__)
+    parser.add_argument("--version", action="version", version=f"snowdesk {__version__}")
+    parser.add_argument(
+        "--selftest",
+        action="store_true",
+        help="check that this build can load Qt, the connector and the crypto stack",
+    )
+    parser.add_argument(
+        "--connection",
+        metavar="NAME",
+        help="with --selftest, also connect and read CURRENT_VERSION()",
+    )
+    parsed, _unknown = parser.parse_known_args(args)
+
     setup_logging()
+    if parsed.selftest:
+        from snowdesk.selftest import run_selftest
+
+        return run_selftest(parsed.connection)
     return Application(argv).run()

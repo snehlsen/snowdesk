@@ -65,7 +65,26 @@ SNOWDESK_IT_CONNECTION=default uv run pytest -m integration
 
 ```
 uv run pyinstaller packaging/snowdesk.spec --noconfirm
+open dist/SnowDesk.app
 ```
 
 For personal use, `uv run snowdesk` is enough. See spec section 12 for signing
-and notarization.
+and notarization; the build is ad-hoc signed, so Gatekeeper rejects it until it
+is signed with a Developer ID and notarized.
+
+### Verifying a build
+
+A bundle that builds is not a bundle that runs: PyInstaller reports success
+whether or not the connector's compiled pieces can actually be imported. Check
+a build with:
+
+```
+./dist/SnowDesk.app/Contents/MacOS/snowdesk --selftest
+```
+
+It loads Qt and opens a window, imports the connector and its compiled Arrow
+result reader, round-trips an encrypted RSA key, checks the CA store and the
+history database, and reads the connection config. Add `--connection NAME` to
+also open a session and run `SELECT CURRENT_VERSION()`. The same command works
+from source (`uv run snowdesk --selftest`), so a failure tells you whether the
+problem is the build or the environment.
