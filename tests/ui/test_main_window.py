@@ -197,3 +197,112 @@ def test_messages_and_history_tabs_cannot_be_closed(harness: Harness) -> None:
     before = window.result_tabs.count()
     window._close_result_tab(window.result_tabs.indexOf(window.messages))
     assert window.result_tabs.count() == before
+
+
+# -- encrypted private keys (C3) -------------------------------------------
+
+
+@pytest.fixture
+def key_harness(qtbot, tmp_path, monkeypatch):
+    """A connection whose private key is encrypted, unlocked by 'right'."""
+    cfg = tmp_path / "snowflake"
+    cfg.mkdir()
+    (cfg / "config.toml").write_text(
+        'default_connection_name = "keypair"\n'
+        "[connections.keypair]\n"
+        'account = "a"\n'
+        'user = "u"\n'
+        'authenticator = "SNOWFLAKE_JWT"\n'
+        'private_key_file = "/keys/sf_rsa_key.p8"\n'
+    )
+    monkeypatch.setenv("SNOWFLAKE_HOME", str(cfg))
+    monkeypatch.delenv("SNOWFLAKE_DEFAULT_CONNECTION_NAME", raising=False)
+
+    conn = FakeConnection()
+
+    def connect_fn(params):
+        if params.private_key_passphrase is None:
+            raise TypeError("Password was not given but private key is encrypted")
+        if params.private_key_passphrase != "right":
+            raise ValueError("Incorrect password, could not decrypt key")
+        return conn
+
+    worker = SnowflakeWorker(session=SnowflakeSession(connect_fn=connect_fn))
+    history = HistoryStore(tmp_path / "history.db")
+    window = MainWindow(
+        worker=worker,
+        query=QueryController(worker, history=history),
+        browser=BrowserController(worker),
+        history=history,
+    )
+    qtbot.addWidget(window)
+    yield Harness(window, worker, conn)
+    history.close()
+
+
+def answer_prompt(monkeypatch, *replies):
+    """Queue answers for the passphrase dialog; each is (text, accepted)."""
+    seen: list[str] = []
+    answers = iter(replies)
+
+    def fake_get_text(_parent, _title, label, _echo):
+        seen.append(label)
+        return next(answers)
+
+    monkeypatch.setattr("snowdesk.ui.main_window.QInputDialog.getText", staticmethod(fake_get_text))
+    return seen
+
+
+def test_encrypted_key_prompts_and_then_connects(key_harness, monkeypatch) -> None:
+    labels = answer_prompt(monkeypatch, ("right", True))
+    key_harness.window._on_connect_clicked()
+    key_harness.drain()
+
+    assert key_harness.worker.session.is_connected
+    assert "Connected" in key_harness.window.state_label.text()
+    assert "encrypted" in labels[0]
+    assert "/keys/sf_rsa_key.p8" in labels[0]
+
+
+def test_wrong_passphrase_reprompts_then_succeeds(key_harness, monkeypatch) -> None:
+    labels = answer_prompt(monkeypatch, ("wrong", True), ("right", True))
+    key_harness.window._on_connect_clicked()
+    key_harness.drain()
+
+    assert len(labels) == 2
+    assert "Incorrect passphrase" in labels[1]
+    assert key_harness.worker.session.is_connected
+
+
+def test_cancelling_the_prompt_leaves_the_app_usable(key_harness, monkeypatch) -> None:
+    answer_prompt(monkeypatch, ("", False))
+    key_harness.window._on_connect_clicked()
+    key_harness.drain()
+
+    window = key_harness.window
+    assert not key_harness.worker.session.is_connected
+    assert "Disconnected" in window.state_label.text()
+    assert "passphrase is required" in window.messages.toPlainText()
+    assert window.connect_button.isEnabled()  # can try again
+
+
+def test_passphrase_is_not_asked_again_after_reconnect(key_harness, monkeypatch) -> None:
+    labels = answer_prompt(monkeypatch, ("right", True))
+    window = key_harness.window
+    window._on_connect_clicked()
+    key_harness.drain()
+
+    window._on_connect_clicked()  # Disconnect
+    key_harness.drain()
+    window._on_connect_clicked()  # Connect again
+    key_harness.drain()
+
+    assert len(labels) == 1  # asked once for the whole run
+    assert key_harness.worker.session.is_connected
+
+
+def test_the_passphrase_never_reaches_the_messages_pane(key_harness, monkeypatch) -> None:
+    answer_prompt(monkeypatch, ("hunter2", True), ("right", True))
+    key_harness.window._on_connect_clicked()
+    key_harness.drain()
+    assert "hunter2" not in key_harness.window.messages.toPlainText()

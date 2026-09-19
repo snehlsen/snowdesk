@@ -21,6 +21,11 @@ Both are merged, `connections.toml` winning on a name collision. Override the
 directory with `SNOWFLAKE_HOME`. SnowDesk never reads or stores credentials
 itself — the connector resolves those at connect time.
 
+If key-pair auth points at an encrypted private key and the config has no
+`private_key_file_pwd`, SnowDesk prompts for the passphrase and retries the
+connect. The passphrase is kept in memory for that run only, so a reconnect
+does not ask again, and is never written to disk.
+
 ## Status
 
 All **P0** requirements from the spec are implemented (milestones M0–M3, plus

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Protocol
 
@@ -47,6 +47,10 @@ class ConnectParams:
     name: str
     role: str | None = None
     warehouse: str | None = None
+    #: Passphrase for an encrypted ``private_key_file``, asked for at connect
+    #: time.  ``repr=False`` keeps it out of logs and tracebacks; it is never
+    #: written to disk (spec 5, Security).
+    private_key_passphrase: str | None = field(default=None, repr=False)
 
 
 def _default_connect(params: ConnectParams) -> Connection:
@@ -54,7 +58,11 @@ def _default_connect(params: ConnectParams) -> Connection:
 
     overrides = {
         key: value
-        for key, value in {"role": params.role, "warehouse": params.warehouse}.items()
+        for key, value in {
+            "role": params.role,
+            "warehouse": params.warehouse,
+            "private_key_file_pwd": params.private_key_passphrase,
+        }.items()
         if value
     }
     return snowflake.connector.connect(  # type: ignore[no-any-return]

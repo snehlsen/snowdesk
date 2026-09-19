@@ -38,3 +38,34 @@ def to_query_error(exc: BaseException, query_id: str | None = None) -> QueryErro
         sqlstate=str(sqlstate) if sqlstate else None,
         query_id=str(sfqid) if sfqid else None,
     )
+
+
+#: Raised by ``cryptography`` (through the connector) when a key-pair
+#: connection points at an encrypted private key and no passphrase was given.
+#: The wording has changed between ``cryptography`` releases, so several
+#: phrasings are matched.
+_MISSING_PASSPHRASE_MARKERS = (
+    "password was not given but private key is encrypted",
+    "private key is encrypted",
+)
+_BAD_PASSPHRASE_MARKERS = (
+    "incorrect password",
+    "bad decrypt",
+    "could not deserialize key data",
+)
+
+
+def needs_private_key_passphrase(exc: BaseException) -> bool:
+    """True when connecting failed only because the key passphrase is missing."""
+    if not isinstance(exc, TypeError):
+        return False
+    text = str(exc).lower()
+    return any(marker in text for marker in _MISSING_PASSPHRASE_MARKERS)
+
+
+def is_bad_private_key_passphrase(exc: BaseException) -> bool:
+    """True when the supplied key passphrase did not decrypt the key."""
+    if not isinstance(exc, (ValueError, TypeError)):
+        return False
+    text = str(exc).lower()
+    return any(marker in text for marker in _BAD_PASSPHRASE_MARKERS)

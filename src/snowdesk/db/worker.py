@@ -14,14 +14,18 @@ import queue
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from PySide6.QtCore import QObject, Signal
 
 from snowdesk.config import DEFAULT_PAGE_SIZE
 from snowdesk.db import browser as browse
-from snowdesk.db.errors import to_query_error
+from snowdesk.db.errors import (
+    is_bad_private_key_passphrase,
+    needs_private_key_passphrase,
+    to_query_error,
+)
 from snowdesk.db.results import ResultRegistry, has_result_set
 from snowdesk.db.runner import Cancelled, StatementRunner, status_message
 from snowdesk.db.session import ConnectionState, ConnectParams, SnowflakeSession
@@ -97,6 +101,9 @@ class SnowflakeWorker(QObject):
     context_changed = Signal(object)  # SessionContext
     connected = Signal(str, object)  # connection name, SessionContext
     connect_failed = Signal(object)  # QueryError
+    #: The connection uses an encrypted private key and needs a passphrase:
+    #: connection name, and whether a previous attempt was rejected.
+    passphrase_required = Signal(str, bool)
     sso_hint = Signal()
 
     script_started = Signal(int)  # statement count
@@ -122,6 +129,10 @@ class SnowflakeWorker(QObject):
         self._runner_lock = threading.Lock()
         self._cancel_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="snowdesk-cancel")
         self._busy = threading.Event()
+        # Key passphrases the user has entered this run, so Disconnect followed
+        # by Connect does not ask again.  In memory only, never persisted, and
+        # dropped as soon as one is rejected.
+        self._passphrases: dict[str, str] = {}
 
     # -- public API (called from the UI thread) ---------------------------
 
@@ -196,20 +207,44 @@ class SnowflakeWorker(QObject):
 
     def _connect(self, job: ConnectJob) -> None:
         self.results.close_all()
-        self.state_changed.emit(ConnectionState.CONNECTING.value, job.params.name)
+        params = job.params
+        if params.private_key_passphrase is None:
+            remembered = self._passphrases.get(params.name)
+            if remembered is not None:
+                params = replace(params, private_key_passphrase=remembered)
+        self.state_changed.emit(ConnectionState.CONNECTING.value, params.name)
         try:
-            ctx = self.session.connect(job.params)
+            ctx = self.session.connect(params)
         except Exception as exc:
-            error = to_query_error(exc)
-            log.warning("Connect to %s failed: %s", job.params.name, error.message)
-            self.state_changed.emit(ConnectionState.ERROR.value, error.message)
-            self.connect_failed.emit(error)
+            self._on_connect_error(params, exc)
             return
-        self.state_changed.emit(ConnectionState.CONNECTED.value, job.params.name)
-        self.connected.emit(job.params.name, ctx)
+        if params.private_key_passphrase:
+            self._passphrases[params.name] = params.private_key_passphrase
+        self.state_changed.emit(ConnectionState.CONNECTED.value, params.name)
+        self.connected.emit(params.name, ctx)
         self.context_changed.emit(ctx)
         if self.session.should_hint_id_token():
             self.sso_hint.emit()
+
+    def _on_connect_error(self, params: ConnectParams, exc: BaseException) -> None:
+        """Route an encrypted-key failure to the passphrase prompt, not an error.
+
+        The key is encrypted and either no passphrase was given or the one we
+        had is wrong; in both cases the user can still get connected, so this
+        is a prompt rather than a dead end.
+        """
+        rejected = is_bad_private_key_passphrase(exc)
+        if needs_private_key_passphrase(exc) or rejected:
+            if rejected:
+                self._passphrases.pop(params.name, None)
+            log.info("Connection %s needs a private key passphrase", params.name)
+            self.state_changed.emit(ConnectionState.DISCONNECTED.value, "")
+            self.passphrase_required.emit(params.name, rejected)
+            return
+        error = to_query_error(exc)
+        log.warning("Connect to %s failed: %s", params.name, error.message)
+        self.state_changed.emit(ConnectionState.ERROR.value, error.message)
+        self.connect_failed.emit(error)
 
     def _disconnect(self) -> None:
         self.results.close_all()

@@ -43,6 +43,9 @@ class ConnectionInfo:
     database: str | None = None
     schema: str | None = None
     authenticator: str | None = None
+    #: Path to the key file for key-pair auth.  The path is not a secret;
+    #: it lets the passphrase prompt name the key being unlocked.
+    private_key_file: str | None = None
     is_default: bool = False
 
     @property
@@ -129,6 +132,7 @@ def _to_info(name: str, section: dict[str, object], default: str | None) -> Conn
         database=_str_or_none(section, "database"),
         schema=_str_or_none(section, "schema"),
         authenticator=_str_or_none(section, "authenticator"),
+        private_key_file=_str_or_none(section, "private_key_file"),
         is_default=(name == default),
     )
 

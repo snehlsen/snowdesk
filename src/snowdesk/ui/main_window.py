@@ -9,6 +9,7 @@ from PySide6.QtGui import QAction, QCloseEvent, QKeySequence
 from PySide6.QtWidgets import (
     QComboBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -71,6 +72,7 @@ class MainWindow(QMainWindow):
 
         self._results: dict[str, ResultView] = {}
         self._context = SessionContext()
+        self._connections: dict[str, config.ConnectionInfo] = {}
 
         self._build_toolbar()
         self._build_central(dark=dark)
@@ -225,6 +227,7 @@ class MainWindow(QMainWindow):
         w.context_changed.connect(self._set_context)
         w.connected.connect(self._on_connected)
         w.connect_failed.connect(self._on_connect_failed)
+        w.passphrase_required.connect(self._on_passphrase_required)
         w.sso_hint.connect(self._on_sso_hint)
         w.statement_started.connect(self._on_statement_started)
         w.statement_finished.connect(self._on_statement_finished)
@@ -254,6 +257,7 @@ class MainWindow(QMainWindow):
             self.connect_button.setEnabled(False)
             self._show_missing_config_hint()
             return
+        self._connections = {c.name: c for c in connections}
         for conn in connections:
             label = f"{conn.name} — {conn.summary}" if conn.summary else conn.name
             self.connection_box.addItem(label, conn.name)
@@ -289,6 +293,39 @@ class MainWindow(QMainWindow):
     def _on_connect_failed(self, error: QueryError) -> None:
         self._log_message(f"Connection failed: {error.formatted()}")
         QMessageBox.warning(self, "Could not connect", error.message)
+
+    def _on_passphrase_required(self, name: str, rejected: bool) -> None:
+        """Ask for the private key passphrase and retry the connect (C3).
+
+        The passphrase is held in memory for this run only so a reconnect does
+        not ask again; SnowDesk never writes it anywhere (spec 5, Security).
+        """
+        info = self._connections.get(name)
+        headline = (
+            "Incorrect passphrase. Try again."
+            if rejected
+            else f"The private key for \u201c{name}\u201d is encrypted."
+        )
+        lines = [headline]
+        if info and info.private_key_file:
+            lines.append(f"Key: {info.private_key_file}")
+        lines.extend(["", "Enter the passphrase to unlock it:"])
+
+        passphrase, accepted = QInputDialog.getText(
+            self,
+            "Private key passphrase",
+            "\n".join(lines),
+            QLineEdit.EchoMode.Password,
+        )
+        if not accepted or not passphrase:
+            self._log_message(
+                f"Connection to {name} cancelled: the private key passphrase is required."
+            )
+            self.statusBar().showMessage("Passphrase required to connect", 6000)
+            return
+        self.worker.submit(
+            ConnectJob(params=ConnectParams(name=name, private_key_passphrase=passphrase))
+        )
 
     def _on_sso_hint(self) -> None:
         self._log_message(
