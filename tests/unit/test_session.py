@@ -121,3 +121,44 @@ def test_clear_removes_the_file(tmp_path: Path) -> None:
     store.clear()
     assert not (tmp_path / "session.json").exists()
     store.clear()  # idempotent
+
+
+# -- permissions ------------------------------------------------------------
+
+
+def mode_of(path: Path) -> int:
+    return path.stat().st_mode & 0o777
+
+
+def test_a_written_session_is_private(tmp_path: Path) -> None:
+    """mkstemp creates at 0600 and os.replace keeps that mode."""
+    path = tmp_path / "session.json"
+    store = SessionStore(path)
+    store.save(SessionState(tabs=[TabState(title="a", text="select 1")]))
+    assert mode_of(path) == 0o600
+
+
+def test_a_loose_file_from_an_earlier_version_is_tightened(tmp_path: Path) -> None:
+    """Restoring clears the autosave flag, so an untouched run never saves and
+    would otherwise leave the old mode in place."""
+    path = tmp_path / "session.json"
+    path.write_text('{"version": 1, "current": 0, "tabs": []}')
+    path.chmod(0o644)
+
+    SessionStore(path)
+    assert mode_of(path) == 0o600
+
+
+def test_the_owner_s_own_bits_are_left_alone(tmp_path: Path) -> None:
+    """secure() only ever takes access away."""
+    path = tmp_path / "session.json"
+    path.write_text("{}")
+    path.chmod(0o444)
+
+    SessionStore(path)
+    assert mode_of(path) == 0o400
+
+
+def test_opening_a_missing_session_is_harmless(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "nothing-here.json")
+    assert store.load().tabs == []

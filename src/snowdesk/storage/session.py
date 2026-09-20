@@ -105,6 +105,14 @@ class SessionStore:
 
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
+        # Writing goes through mkstemp, which creates at 0600, so a file this
+        # version wrote is already private.  One left loose by an earlier
+        # version would never be tightened otherwise: restoring clears the
+        # autosave flag, so a run where nothing is edited never saves, and the
+        # file keeps whatever mode it had.  Tightened here instead, as the
+        # history database is.
+        if self.path.exists():
+            config.secure(self.path)
 
     def load(self) -> SessionState:
         """Read the session, returning an empty one if it is absent or damaged.
