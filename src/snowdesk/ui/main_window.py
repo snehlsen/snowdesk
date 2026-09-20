@@ -6,8 +6,9 @@ import logging
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QAction, QCloseEvent, QKeySequence
+from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QKeySequence
 from PySide6.QtWidgets import (
+    QApplication,
     QComboBox,
     QHBoxLayout,
     QInputDialog,
@@ -34,6 +35,7 @@ from snowdesk.db.worker import ConnectJob, DisconnectJob, ReconnectJob, Snowflak
 from snowdesk.model import ColumnInfo, QueryError, RunStatus, SessionContext, StatementOutcome
 from snowdesk.storage.history import HistoryStore
 from snowdesk.storage.session import SessionStore
+from snowdesk.ui import theme
 from snowdesk.ui.editor import SqlEditor
 from snowdesk.ui.editor_tabs import EditorTabs
 from snowdesk.ui.history_panel import HistoryPanel
@@ -281,23 +283,34 @@ class MainWindow(QMainWindow):
         self.rows_label = QLabel("", self)
         self.time_label = QLabel("", self)
         self.qid_label = QLabel("", self)
-        # Separated, or the segments read as one run-on string:
-        # "RAW.PUBLIC 0 rows 0 ms 01b0-0001".
+
+        # Separated, or the segments read as one run-on string
+        # ("RAW.PUBLIC 0 rows 0 ms 01b0-0001").  Each divider belongs to the
+        # segment after it and hides with it, so an empty segment does not
+        # leave a dangling bar.
+        self._status_dividers: dict[QLabel, QLabel] = {}
         for index, widget in enumerate(
             (self.context_label, self.rows_label, self.time_label, self.qid_label)
         ):
             if index:
                 divider = QLabel("│", self)
                 divider.setEnabled(False)
+                divider.setVisible(False)
                 self.statusBar().addPermanentWidget(divider)
+                self._status_dividers[widget] = divider
             self.statusBar().addPermanentWidget(widget)
-        self.statusBar().showMessage("Ready")
+
+    def _set_status_segment(self, label: QLabel, text: str) -> None:
+        label.setText(text)
+        divider = self._status_dividers.get(label)
+        if divider is not None:
+            divider.setVisible(bool(text))
 
     def _build_actions(self) -> None:
         self._menus: dict[str, QMenu] = {}
         # macOS orders menus File, Edit, then app-specific, then Help; the
         # menu bar follows creation order, so they are created up front.
-        for name in ("&File", "&Edit", "&Query", "&Help"):
+        for name in ("&File", "&Edit", "&View", "&Query", "&Help"):
             self._menu(name)
 
         def action(
@@ -341,6 +354,8 @@ class MainWindow(QMainWindow):
         self._menu("&Query").addSeparator()
         action("Reconnect", "Ctrl+R", self._reconnect, "&Query")
 
+        self._build_appearance_menu()
+
         action(
             "About SnowDesk",
             "",
@@ -348,6 +363,40 @@ class MainWindow(QMainWindow):
             "&Help",
             QAction.MenuRole.AboutRole,
         )
+
+    def _build_appearance_menu(self) -> None:
+        """View ▸ Appearance, as a set of mutually exclusive choices."""
+        submenu = self._menu("&View").addMenu("Appearance")
+        group = QActionGroup(self)
+        group.setExclusive(True)
+        self._appearance_actions: dict[theme.Appearance, QAction] = {}
+
+        current = theme.load()
+        for appearance in theme.Appearance:
+            act = QAction(appearance.label, self)
+            act.setCheckable(True)
+            act.setChecked(appearance is current)
+            act.triggered.connect(
+                lambda _checked=False, choice=appearance: self.set_appearance(choice)
+            )
+            group.addAction(act)
+            submenu.addAction(act)
+            self._appearance_actions[appearance] = act
+
+    def set_appearance(self, appearance: theme.Appearance) -> None:
+        """Switch appearance and remember the choice (S1)."""
+        theme.save(appearance)
+        theme.apply(appearance)
+        act = self._appearance_actions.get(appearance)
+        if act is not None:
+            act.setChecked(True)
+        # Qt repaints its own palette; SnowDesk's own colours are re-applied by
+        # the colour-scheme handler, which fires for system changes too.
+        self.refresh_theme()
+
+    def refresh_theme(self) -> None:
+        """Re-apply SnowDesk's own colours for the appearance now in force."""
+        self.editors.set_dark(theme.is_dark())
 
     def _show_about(self) -> None:
         QMessageBox.about(
@@ -386,6 +435,12 @@ class MainWindow(QMainWindow):
         self.query.run_started.connect(self._on_run_started)
         self.query.run_finished.connect(self._on_run_finished)
         self.query.rejected.connect(lambda msg: self.statusBar().showMessage(msg, 4000))
+
+        app = QApplication.instance()
+        if isinstance(app, QApplication):
+            # Fires for an explicit switch and for the system appearance
+            # changing while SnowDesk is running.
+            app.styleHints().colorSchemeChanged.connect(lambda _scheme: self.refresh_theme())
 
         self.object_tree.insert_requested.connect(self._insert_into_editor)
         self.object_tree.run_requested.connect(self._run_browser_sql)
@@ -533,7 +588,7 @@ class MainWindow(QMainWindow):
         label = f"[{index + 1}] running"
         if query_id:
             label += f" · {query_id}"
-            self.qid_label.setText(query_id)
+            self._set_status_segment(self.qid_label, query_id)
         self.statusBar().showMessage(label)
 
     def _on_statement_finished(self, outcome: StatementOutcome) -> None:
@@ -548,9 +603,9 @@ class MainWindow(QMainWindow):
         else:
             self._log_message(f"{prefix} {outcome.message}")
         if outcome.duration_s:
-            self.time_label.setText(format_duration(outcome.duration_s))
+            self._set_status_segment(self.time_label, format_duration(outcome.duration_s))
         if outcome.query_id:
-            self.qid_label.setText(outcome.query_id)
+            self._set_status_segment(self.qid_label, outcome.query_id)
 
     def _on_run_finished(self, outcomes: list[StatementOutcome]) -> None:
         self.run_button.setEnabled(self.worker.session.is_connected)
@@ -586,13 +641,15 @@ class MainWindow(QMainWindow):
         )
         view = ResultView(result_id, model, self)
         view.more_requested.connect(self.query.fetch_more)
-        model.cap_reached.connect(lambda: self.rows_label.setText(model.status_text()))
+        model.cap_reached.connect(
+            lambda: self._set_status_segment(self.rows_label, model.status_text())
+        )
         self._results[result_id] = view
         index = self.result_tabs.insertTab(
             max(0, self.result_tabs.count() - 2), view, f"Result {len(self._results)}"
         )
         self.result_tabs.setCurrentIndex(index)
-        self.rows_label.setText(model.status_text())
+        self._set_status_segment(self.rows_label, model.status_text())
 
     def _on_rows_appended(self, result_id: str, rows: list, exhausted: bool) -> None:
         view = self._results.get(result_id)
@@ -600,7 +657,7 @@ class MainWindow(QMainWindow):
             return
         view.append_rows(rows, exhausted)
         if self.result_tabs.currentWidget() is view:
-            self.rows_label.setText(view.model.status_text())
+            self._set_status_segment(self.rows_label, view.model.status_text())
 
     def _on_fetch_failed(self, result_id: str, message: str) -> None:
         view = self._results.get(result_id)
@@ -628,9 +685,9 @@ class MainWindow(QMainWindow):
                 self.result_tabs.removeTab(index)
             view.deleteLater()
         self._results.clear()
-        self.rows_label.setText("")
-        self.time_label.setText("")
-        self.qid_label.setText("")
+        self._set_status_segment(self.rows_label, "")
+        self._set_status_segment(self.time_label, "")
+        self._set_status_segment(self.qid_label, "")
 
     def _copy_with_headers(self) -> None:
         view = self.result_tabs.currentWidget()

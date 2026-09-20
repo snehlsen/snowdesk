@@ -8,7 +8,7 @@ import sys
 import pytest
 from PySide6.QtCore import QPoint
 from PySide6.QtGui import QAction
-from PySide6.QtWidgets import QLabel, QMenu
+from PySide6.QtWidgets import QLabel
 
 from snowdesk.controllers.browser import BrowserController
 from snowdesk.controllers.query import QueryController
@@ -16,6 +16,7 @@ from snowdesk.db.session import ConnectParams, SnowflakeSession
 from snowdesk.db.worker import ConnectJob, SnowflakeWorker
 from snowdesk.storage.history import HistoryStore
 from snowdesk.storage.session import SessionStore
+from snowdesk.ui import theme
 from snowdesk.ui.editor import SqlEditor
 from snowdesk.ui.editor_tabs import SaveAnswer
 from snowdesk.ui.main_window import CONTROL_SPACING, WINDOW_MARGIN, MainWindow
@@ -651,8 +652,12 @@ def test_the_banner_can_be_dismissed(harness: Harness) -> None:
 
 def test_menus_are_in_platform_order(harness: Harness) -> None:
     """macOS puts File and Edit first, app-specific menus after, Help last."""
-    titles = [m.title().replace("&", "") for m in harness.window.menuBar().findChildren(QMenu)]
-    assert titles == ["File", "Edit", "Query", "Help"]
+    titles = [
+        act.menu().title().replace("&", "")
+        for act in harness.window.menuBar().actions()
+        if act.menu() is not None
+    ]
+    assert titles == ["File", "Edit", "View", "Query", "Help"]
 
 
 def test_about_carries_the_menu_role_that_moves_it_to_the_app_menu(harness: Harness) -> None:
@@ -744,3 +749,84 @@ def test_neighbouring_controls_are_not_run_together(harness: Harness) -> None:
     assert row.spacing() == CONTROL_SPACING
     margins = row.contentsMargins()
     assert margins.left() == margins.right() == WINDOW_MARGIN
+
+
+# -- appearance (View ▸ Appearance) -----------------------------------------
+
+
+def appearance_menu(window) -> list[str]:
+    view = next(
+        act.menu()
+        for act in window.menuBar().actions()
+        if act.menu() is not None and act.menu().title().replace("&", "") == "View"
+    )
+    submenu = view.actions()[0].menu()
+    return [a.text() for a in submenu.actions()]
+
+
+def test_appearance_offers_system_light_and_dark(harness: Harness) -> None:
+    assert appearance_menu(harness.window) == ["Follow System", "Light", "Dark"]
+
+
+def test_the_choices_are_mutually_exclusive(harness: Harness) -> None:
+    actions = list(harness.window._appearance_actions.values())
+    assert all(a.isCheckable() for a in actions)
+    assert sum(a.isChecked() for a in actions) == 1
+
+
+def test_choosing_dark_re_themes_every_open_tab(harness: Harness, monkeypatch) -> None:
+    """Syntax colours are SnowDesk's own, so Qt's palette change is not enough."""
+    window = harness.window
+    window.editors.new_tab()
+    monkeypatch.setattr(theme, "apply", lambda *a, **k: None)
+    monkeypatch.setattr(theme, "save", lambda *a, **k: None)
+    monkeypatch.setattr(theme, "is_dark", lambda *a, **k: True)
+
+    window.set_appearance(theme.Appearance.DARK)
+
+    assert window.editors._dark is True
+    for index in range(window.editors.count()):
+        assert window.editors.widget(index)._dark is True
+    assert window._appearance_actions[theme.Appearance.DARK].isChecked()
+
+
+def test_a_tab_opened_afterwards_keeps_the_appearance(harness: Harness, monkeypatch) -> None:
+    window = harness.window
+    monkeypatch.setattr(theme, "apply", lambda *a, **k: None)
+    monkeypatch.setattr(theme, "save", lambda *a, **k: None)
+    monkeypatch.setattr(theme, "is_dark", lambda *a, **k: True)
+    window.set_appearance(theme.Appearance.DARK)
+
+    editor = window.editors.new_tab()
+    assert editor._dark is True
+
+
+def test_a_system_appearance_change_is_picked_up(harness: Harness, monkeypatch) -> None:
+    """Following the system has to keep following it while the app runs."""
+    window = harness.window
+    monkeypatch.setattr(theme, "is_dark", lambda *a, **k: True)
+    window.refresh_theme()
+    assert window.editors._dark is True
+
+    monkeypatch.setattr(theme, "is_dark", lambda *a, **k: False)
+    window.refresh_theme()
+    assert window.editors._dark is False
+
+
+def test_status_dividers_hide_with_their_segment(harness: Harness) -> None:
+    """An empty segment used to leave a dangling bar: "RAW.PUBLIC │ │ │"."""
+    window = harness.window
+    window.show()
+    try:
+        assert not any(d.isVisible() for d in window._status_dividers.values())
+
+        connect(harness)
+        window.editor.setPlainText("select * from orders")
+        window.run_all()
+        harness.drain()
+        assert window._status_dividers[window.rows_label].isVisible()
+
+        window._clear_result_tabs()
+        assert not any(d.isVisible() for d in window._status_dividers.values())
+    finally:
+        window.hide()

@@ -8,7 +8,6 @@ import logging.handlers
 import sys
 
 from PySide6.QtCore import QThread
-from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import QApplication
 
 from snowdesk import __version__, config
@@ -17,6 +16,7 @@ from snowdesk.controllers.query import QueryController
 from snowdesk.db.worker import SnowflakeWorker
 from snowdesk.storage.history import HistoryStore
 from snowdesk.storage.session import SessionStore
+from snowdesk.ui import theme
 from snowdesk.ui.main_window import MainWindow
 
 log = logging.getLogger(__name__)
@@ -55,9 +55,8 @@ def setup_logging(level: int = logging.INFO, verbose: bool = False) -> None:
 
 
 def is_dark(app: QApplication) -> bool:
-    palette = app.palette()
-    window = palette.color(QPalette.ColorRole.Window)
-    return window.lightness() < 128
+    """Deprecated shim; :func:`snowdesk.ui.theme.is_dark` is authoritative."""
+    return theme.is_dark(app)
 
 
 class Application:
@@ -67,6 +66,10 @@ class Application:
         self.qt = QApplication(argv if argv is not None else sys.argv)
         self.qt.setApplicationName("SnowDesk")
         self.qt.setOrganizationName("SnowDesk")
+
+        # Before any widget is built, so nothing is created with the wrong
+        # colours and then repainted.
+        theme.apply(theme.load(), self.qt)
 
         self.history = HistoryStore(config.history_db_path())
         self.session = SessionStore(config.session_path())
@@ -86,7 +89,7 @@ class Application:
             browser=self.browser,
             history=self.history,
             session=self.session,
-            dark=is_dark(self.qt),
+            dark=theme.is_dark(self.qt),
         )
         self.qt.aboutToQuit.connect(self.shutdown)
 

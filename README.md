@@ -55,6 +55,10 @@ yet (⌘E); it belongs with R6 in M6.
 | ⌘O / ⌘S / ⌘⇧S | open a `.sql` file / save / save as |
 | ⌘⇧C | copy selected cells with headers |
 
+**View ▸ Appearance** switches between Follow System, Light and Dark. The choice
+is remembered, and with Follow System the window changes with macOS while
+SnowDesk is running.
+
 If the session expires or the network drops, SnowDesk marks the connection
 dead and shows a strip offering one-click Reconnect. Editor tabs, their
 contents and the messages log are left alone — only the connection is gone.

@@ -203,6 +203,10 @@ class SqlHighlighter(QSyntaxHighlighter):
 
     def __init__(self, document: QTextDocument, dark: bool = False) -> None:
         super().__init__(document)
+        self.set_dark(dark)
+
+    def set_dark(self, dark: bool) -> None:
+        """Rebuild the formats for a new appearance and repaint the document."""
         keyword = _fmt("#7aa2f7" if dark else "#0b5cad", bold=True)
         type_fmt = _fmt("#bb9af7" if dark else "#7a3ea3")
         func = _fmt("#7dcfff" if dark else "#0a7285")
@@ -224,6 +228,8 @@ class SqlHighlighter(QSyntaxHighlighter):
 
         self._block_start = QRegularExpression(r"/\*")
         self._block_end = QRegularExpression(r"\*/")
+        if self.document() is not None:
+            self.rehighlight()
 
     def highlightBlock(self, text: str) -> None:
         for expr, fmt in self._rules:

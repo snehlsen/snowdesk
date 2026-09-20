@@ -60,6 +60,14 @@ class EditorTabs(QTabWidget):
         self._autosave.timeout.connect(self._autosave_tick)
         self._autosave.start()
 
+    def set_dark(self, dark: bool) -> None:
+        """Re-theme every open tab, and any opened afterwards."""
+        self._dark = dark
+        for index in range(self.count()):
+            editor = self.widget(index)
+            if isinstance(editor, SqlEditor):
+                editor.set_dark(dark)
+
     # -- current tab -------------------------------------------------------
 
     @property

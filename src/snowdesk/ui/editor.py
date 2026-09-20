@@ -110,6 +110,12 @@ class SqlEditor(QPlainTextEdit):
 
     # -- selections --------------------------------------------------------
 
+    def set_dark(self, dark: bool) -> None:
+        """Re-theme in place, so a running app can change appearance."""
+        self._dark = dark
+        self.highlighter.set_dark(dark)
+        self._refresh_extra_selections()
+
     def selection_range(self) -> tuple[int, int]:
         cursor = self.textCursor()
         return cursor.selectionStart(), cursor.selectionEnd()
