@@ -861,6 +861,52 @@ def test_export_streams_the_whole_result_by_query_id(
     assert window.result_tabs.currentWidget().model.rowCount() == 500
 
 
+def test_exported_rows_are_safe_to_open_in_a_spreadsheet(
+    harness: Harness, tmp_path, monkeypatch
+) -> None:
+    """A value the account chose must not become a formula on the way out."""
+    connect(harness)
+    window = harness.window
+    hostile = FakeStatement(columns=COLS, rows=[("=1+1",)])
+    harness.conn.plan["from orders"] = hostile
+    # The export re-reads the result rather than draining the grid's cursor,
+    # so the same rows have to come back through RESULT_SCAN.
+    harness.conn.plan["RESULT_SCAN"] = hostile
+    window.editor.setPlainText("select * from orders")
+    window.run_all()
+    harness.drain()
+
+    target = tmp_path / "out.csv"
+    monkeypatch.setattr(window, "ask_export_path", lambda: str(target))
+    window.export_current_result()
+    harness.worker._export_pool.shutdown(wait=True)
+
+    assert "'=1+1" in target.read_text()
+
+
+def test_turning_formula_escaping_off_reaches_the_grids_already_open(
+    harness: Harness,
+) -> None:
+    connect(harness)
+    window = harness.window
+    window.editor.setPlainText("select * from orders")
+    window.run_all()
+    harness.drain()
+    view = window.result_tabs.currentWidget()
+    assert view._escape_formulas is True
+
+    window.apply_preferences(
+        preferences.Preferences(
+            page_size=500,
+            row_cap=100_000,
+            font_size=13,
+            appearance=theme.Appearance.SYSTEM,
+            escape_formulas=False,
+        )
+    )
+    assert view._escape_formulas is False
+
+
 def test_export_without_a_result_tab_says_so(harness: Harness) -> None:
     harness.window.result_tabs.setCurrentWidget(harness.window.messages)
     harness.window.export_current_result()

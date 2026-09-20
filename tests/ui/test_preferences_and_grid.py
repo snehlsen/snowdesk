@@ -38,6 +38,24 @@ def test_defaults_when_nothing_is_stored(qapp) -> None:
     assert prefs.appearance is theme.Appearance.SYSTEM
 
 
+def test_formula_escaping_defaults_on(qapp) -> None:
+    """Off by default would mean shipping the safe behaviour switched off."""
+    assert preferences.load().escape_formulas is True
+
+
+def test_formula_escaping_persists_when_turned_off(qapp) -> None:
+    preferences.save(preferences.Preferences(escape_formulas=False))
+    assert preferences.load().escape_formulas is False
+
+
+def test_formula_escaping_survives_the_round_trip_through_settings(qapp) -> None:
+    """QSettings hands back the string it wrote, not the bool it was given."""
+    QSettings().setValue("escape_formulas", "false")
+    assert preferences.load().escape_formulas is False
+    QSettings().setValue("escape_formulas", "true")
+    assert preferences.load().escape_formulas is True
+
+
 def test_preferences_persist(qapp) -> None:
     preferences.save(
         preferences.Preferences(

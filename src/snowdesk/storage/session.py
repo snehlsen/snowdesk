@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from snowdesk import config
+
 log = logging.getLogger(__name__)
 
 SESSION_VERSION = 1
@@ -132,9 +134,11 @@ class SessionStore:
                 # Too big to carry; a file-backed tab still restores from disk.
                 del tab["text"]
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
+            config.private_dir(self.path.parent)
             # Write beside the target and rename, so a crash or a full disk
-            # never leaves a half-written session behind.
+            # never leaves a half-written session behind.  mkstemp also opens
+            # at 0600, which is what the restored file should keep: unsaved
+            # editor buffers are the user's working notes.
             fd, tmp_name = tempfile.mkstemp(
                 dir=self.path.parent, prefix=self.path.name + ".", suffix=".tmp"
             )

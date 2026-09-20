@@ -322,10 +322,12 @@ class ResultView(QWidget):
         result_id: str,
         model: ResultModel,
         parent: QWidget | None = None,
+        escape_formulas: bool = True,
     ) -> None:
         super().__init__(parent)
         self.result_id = result_id
         self.model = model
+        self._escape_formulas = escape_formulas
 
         self.table = QTableView(self)
         self.table.setModel(model)
@@ -419,6 +421,10 @@ class ResultView(QWidget):
 
     # -- cell detail (R8) --------------------------------------------------
 
+    def set_escape_formulas(self, escape: bool) -> None:
+        """Follow the preference for copies out of this grid."""
+        self._escape_formulas = escape
+
     def set_detail_visible(self, visible: bool) -> None:
         self.detail.setVisible(visible)
         if visible:
@@ -433,7 +439,11 @@ class ResultView(QWidget):
         self.detail.setPlainText(self.current_cell_text())
 
     def current_cell_text(self) -> str:
-        """The focused cell in full: JSON pretty-printed, everything else raw."""
+        """The focused cell in full: JSON pretty-printed, everything else raw.
+
+        Raw on purpose: this panel is for reading the value, not for handing it
+        to a spreadsheet, so it shows exactly what the database returned.
+        """
         index = self.table.currentIndex()
         if not index.isValid():
             return ""
@@ -451,12 +461,21 @@ class ResultView(QWidget):
             self.table.selectionModel().selectedIndexes() if self.table.selectionModel() else []
         )
         if not indexes:
-            return rows_to_tsv(self.model.rows, self.model.columns, with_headers=with_headers)
+            return rows_to_tsv(
+                self.model.rows,
+                self.model.columns,
+                with_headers=with_headers,
+                escape_formulas=self._escape_formulas,
+            )
         rows = sorted({i.row() for i in indexes})
         cols = sorted({i.column() for i in indexes})
         subset = [self.model.rows[r] for r in rows]
         return rows_to_tsv(
-            subset, self.model.columns, with_headers=with_headers, column_indexes=cols
+            subset,
+            self.model.columns,
+            with_headers=with_headers,
+            column_indexes=cols,
+            escape_formulas=self._escape_formulas,
         )
 
     def copy_selection(self, with_headers: bool = False) -> None:

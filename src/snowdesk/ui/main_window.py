@@ -38,6 +38,7 @@ from snowdesk.model import ColumnInfo, QueryError, RunStatus, SessionContext, St
 from snowdesk.storage.history import HistoryStore
 from snowdesk.storage.session import SessionStore
 from snowdesk.ui import preferences, theme
+from snowdesk.ui.dialogs import warn
 from snowdesk.ui.editor import SqlEditor
 from snowdesk.ui.editor_tabs import EditorTabs
 from snowdesk.ui.history_panel import HistoryPanel
@@ -91,6 +92,7 @@ class MainWindow(QMainWindow):
         self._export_dialog: QProgressDialog | None = None
         self._context = SessionContext()
         self._connections: dict[str, config.ConnectionInfo] = {}
+        self._escape_formulas = True
 
         self._build_toolbar()
         self._build_banner()
@@ -141,6 +143,9 @@ class MainWindow(QMainWindow):
 
         row.addSpacing(CONTROL_SPACING)
         self.state_label = QLabel("", content)
+        # This one is markup on purpose: the coloured dot is a span SnowDesk
+        # writes itself, from the fixed table above.
+        self.state_label.setTextFormat(Qt.TextFormat.RichText)
         row.addWidget(self.state_label)
 
         row.addStretch(1)
@@ -176,6 +181,8 @@ class MainWindow(QMainWindow):
         )
         self.banner_label = QLabel("", self.banner)
         self.banner_label.setWordWrap(True)
+        # The banner quotes the connector's own words for what went wrong.
+        self.banner_label.setTextFormat(Qt.TextFormat.PlainText)
         self.reconnect_button = QPushButton("Reconnect", self.banner)
         self.reconnect_button.clicked.connect(self._reconnect)
         self.dismiss_button = QPushButton("Dismiss", self.banner)
@@ -284,6 +291,10 @@ class MainWindow(QMainWindow):
 
     def _build_statusbar(self) -> None:
         self.context_label = QLabel("no context", self)
+        # Role, warehouse, database and schema are read back from the account,
+        # so their text is the account's to choose.  A database called
+        # "<b>PROD</b>" should read as that and not redecorate the status bar.
+        self.context_label.setTextFormat(Qt.TextFormat.PlainText)
         self.rows_label = QLabel("", self)
         self.time_label = QLabel("", self)
         self.qid_label = QLabel("", self)
@@ -423,6 +434,7 @@ class MainWindow(QMainWindow):
         prefs = preferences.load()
         self.query.page_size = prefs.page_size
         self.query.row_cap = prefs.row_cap
+        self._set_escape_formulas(prefs.escape_formulas)
         self.editors.set_font_size(prefs.font_size)
 
     def open_preferences(self) -> None:
@@ -445,8 +457,15 @@ class MainWindow(QMainWindow):
         # on the next run without rebuilding anything that already exists.
         self.query.page_size = prefs.page_size
         self.query.row_cap = prefs.row_cap
+        self._set_escape_formulas(prefs.escape_formulas)
         self.editors.set_font_size(prefs.font_size)
         self.set_appearance(prefs.appearance)
+
+    def _set_escape_formulas(self, escape: bool) -> None:
+        """Apply the export preference to the grids already open, too."""
+        self._escape_formulas = escape
+        for view in self._results.values():
+            view.set_escape_formulas(escape)
 
     def _show_about(self) -> None:
         QMessageBox.about(
@@ -551,7 +570,7 @@ class MainWindow(QMainWindow):
 
     def _on_connect_failed(self, error: QueryError) -> None:
         self._log_message(f"Connection failed: {error.formatted()}")
-        QMessageBox.warning(self, "Could not connect", error.message)
+        warn(self, "Could not connect", error.message)
 
     def _on_passphrase_required(self, name: str, rejected: bool) -> None:
         """Ask for the private key passphrase and retry the connect (C3).
@@ -693,7 +712,7 @@ class MainWindow(QMainWindow):
             row_cap=self.query.row_cap,
             total=total,
         )
-        view = ResultView(result_id, model, self)
+        view = ResultView(result_id, model, self, escape_formulas=self._escape_formulas)
         view.more_requested.connect(self.query.fetch_more)
         model.cap_reached.connect(
             lambda: self._set_status_segment(self.rows_label, model.status_text())
@@ -766,7 +785,9 @@ class MainWindow(QMainWindow):
         self._export_dialog.canceled.connect(self.worker.cancel_export)
         self._export_dialog.show()
 
-        self.worker.export_csv(view.result_id, str(path), self.query.page_size)
+        self.worker.export_csv(
+            view.result_id, str(path), self.query.page_size, self._escape_formulas
+        )
 
     def ask_export_path(self) -> str:
         """Where to write the CSV; empty when the user backs out."""
@@ -796,7 +817,7 @@ class MainWindow(QMainWindow):
     def _on_export_failed(self, _result_id: str, message: str) -> None:
         self._close_export_dialog()
         self._log_message(f"Export failed: {message}")
-        QMessageBox.warning(self, "Could not export", message)
+        warn(self, "Could not export", message)
 
     def _on_export_cancelled(self, _result_id: str) -> None:
         self._close_export_dialog()

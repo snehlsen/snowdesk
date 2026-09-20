@@ -152,7 +152,10 @@ class SnowflakeWorker(QObject):
         self._busy = threading.Event()
         # Key passphrases the user has entered this run, so Disconnect followed
         # by Connect does not ask again.  In memory only, never persisted, and
-        # dropped as soon as one is rejected.
+        # dropped as soon as one is rejected.  They deliberately outlive a
+        # Disconnect: being asked again for a key the app already unlocked
+        # reads as a fault, and a passphrase held in a Python str cannot be
+        # wiped anyway, so dropping the reference buys less than it costs.
         self._passphrases: dict[str, str] = {}
         # Survives a lost session, which clears the session's own copy.
         self._last_name: str | None = None
@@ -187,7 +190,9 @@ class SnowflakeWorker(QObject):
 
     # -- export (R6) -------------------------------------------------------
 
-    def export_csv(self, result_id: str, path: str, page_size: int) -> None:
+    def export_csv(
+        self, result_id: str, path: str, page_size: int, escape_formulas: bool = True
+    ) -> None:
         """Stream a finished result to a CSV file, off the job queue."""
         handle = self.results.get(result_id)
         if handle is None or not handle.query_id:
@@ -199,12 +204,21 @@ class SnowflakeWorker(QObject):
             self.export_failed.emit(result_id, "Not connected.")
             return
         self._export_stop.clear()
-        self._export_pool.submit(self._do_export, result_id, handle.query_id, path, page_size)
+        self._export_pool.submit(
+            self._do_export, result_id, handle.query_id, path, page_size, escape_formulas
+        )
 
     def cancel_export(self) -> None:
         self._export_stop.set()
 
-    def _do_export(self, result_id: str, query_id: str, path: str, page_size: int) -> None:
+    def _do_export(
+        self,
+        result_id: str,
+        query_id: str,
+        path: str,
+        page_size: int,
+        escape_formulas: bool = True,
+    ) -> None:
         try:
             rows = csv_export.export_result(
                 self.session.connection,
@@ -213,6 +227,7 @@ class SnowflakeWorker(QObject):
                 page_size,
                 self._export_stop,
                 on_progress=lambda written: self.export_progress.emit(result_id, written),
+                escape_formulas=escape_formulas,
             )
         except csv_export.ExportCancelled:
             csv_export.discard(path)

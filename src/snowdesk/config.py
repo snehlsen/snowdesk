@@ -16,14 +16,25 @@ matching the connector's own precedence.
 
 from __future__ import annotations
 
+import logging
 import os
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
+log = logging.getLogger(__name__)
+
 DEFAULT_CONFIG_DIR = Path.home() / ".snowflake"
 SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "SnowDesk"
 LOG_DIR = Path.home() / "Library" / "Logs" / "SnowDesk"
+
+#: Everything SnowDesk writes to its own directories is derived from what was
+#: queried: the history database holds the text of every statement run, and the
+#: log holds what the connector was doing.  Both are kept to the owner, the way
+#: the connector requires of ``connections.toml`` itself (spec 5, Security).
+DIR_MODE = 0o700
+#: The bits :func:`secure` takes away: group and world, all three of each.
+SHARED_BITS = 0o077
 
 #: Default page size for incremental result fetching (R2).
 DEFAULT_PAGE_SIZE = 500
@@ -154,15 +165,45 @@ def list_connections(cfg_dir: Path | None = None) -> list[ConnectionInfo]:
     return out
 
 
+def private_dir(path: Path) -> Path:
+    """Create ``path`` if needed, and keep it to its owner.
+
+    ``mkdir``'s mode applies only when it does the creating, and the umask
+    masks it even then, so an existing directory is tightened separately --
+    which is what fixes one an earlier version left at 0755.
+    """
+    path.mkdir(parents=True, exist_ok=True, mode=DIR_MODE)
+    secure(path)
+    return path
+
+
+def secure(path: Path) -> None:
+    """Take group and world access away from an existing file or directory.
+
+    Only ever takes access away.  The owner's own bits are left alone, so a
+    file deliberately made read-only stays read-only and a locked-down
+    directory is not quietly reopened by being handed to SnowDesk.
+
+    Failing to tighten something is worth a line in the log but never worth
+    refusing to start over: the alternative to a readable history file is no
+    history at all, and the user is better placed to sort out an odd
+    filesystem than the app is.
+    """
+    try:
+        mode = path.stat().st_mode & 0o777
+        if mode & SHARED_BITS:
+            path.chmod(mode & ~SHARED_BITS)
+    except OSError:
+        log.warning("Could not restrict permissions on %s", path, exc_info=True)
+
+
 def support_dir() -> Path:
     """Application support directory, created on demand."""
-    SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
-    return SUPPORT_DIR
+    return private_dir(SUPPORT_DIR)
 
 
 def log_dir() -> Path:
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    return LOG_DIR
+    return private_dir(LOG_DIR)
 
 
 def history_db_path() -> Path:

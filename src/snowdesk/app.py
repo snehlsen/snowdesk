@@ -6,6 +6,8 @@ import argparse
 import logging
 import logging.handlers
 import sys
+from io import TextIOWrapper
+from pathlib import Path
 
 from PySide6.QtCore import QThread
 from PySide6.QtWidgets import QApplication
@@ -22,6 +24,41 @@ from snowdesk.ui.main_window import MainWindow
 log = logging.getLogger(__name__)
 
 
+LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
+
+
+class PrivateRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """A rotating log that stays readable only by its owner.
+
+    Every file it rolls over to is tightened, not just the first one: the
+    handler opens a fresh ``snowdesk.log`` on each rollover, and a backup that
+    was private when it was the live file stays private when it is renamed.
+    """
+
+    def _open(self) -> TextIOWrapper:  # type: ignore[type-arg]
+        stream = super()._open()
+        config.secure(Path(self.baseFilename))
+        return stream
+
+
+def _verbose_formatter() -> logging.Formatter:
+    """The connector's own scrubbing formatter, when it can be had.
+
+    ``--verbose`` turns the connector, botocore and urllib3 up to DEBUG, and at
+    that level they log request bodies and header material that can carry
+    tokens.  The connector ships the filter it applies to its own log file for
+    exactly this; borrowing it keeps SnowDesk's log from becoming the one place
+    those end up in the clear.  Importing it pulls in the connector, so this
+    happens only on the verbose path, and a build without it still logs.
+    """
+    try:
+        from snowflake.connector.secret_detector import SecretDetector
+    except ImportError:
+        log.debug("SecretDetector unavailable; verbose log is unscrubbed", exc_info=True)
+        return logging.Formatter(LOG_FORMAT)
+    return SecretDetector(LOG_FORMAT)
+
+
 def setup_logging(level: int = logging.INFO, verbose: bool = False) -> None:
     """Log to ``~/Library/Logs/SnowDesk/snowdesk.log`` plus stderr (spec 9).
 
@@ -29,18 +66,19 @@ def setup_logging(level: int = logging.INFO, verbose: bool = False) -> None:
     boto3 and urllib3 it pulls in, are chatty at INFO -- an ordinary connect
     writes several lines about credential lookups and HTTP pools -- which
     buries the records that say what SnowDesk did.  ``verbose`` opens
-    everything up to DEBUG for diagnosing connector trouble.
+    everything up to DEBUG for diagnosing connector trouble, and scrubs what
+    that turns up.
     """
     root = logging.getLogger()
     if root.handlers:
         return
     root.setLevel(logging.DEBUG if verbose else logging.WARNING)
     logging.getLogger(__name__.split(".")[0]).setLevel(logging.DEBUG if verbose else level)
-    fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
+    fmt = _verbose_formatter() if verbose else logging.Formatter(LOG_FORMAT)
 
     try:
         path = config.log_dir() / "snowdesk.log"
-        file_handler = logging.handlers.RotatingFileHandler(path, maxBytes=2_000_000, backupCount=3)
+        file_handler = PrivateRotatingFileHandler(path, maxBytes=2_000_000, backupCount=3)
         file_handler.setFormatter(fmt)
         root.addHandler(file_handler)
     except OSError:

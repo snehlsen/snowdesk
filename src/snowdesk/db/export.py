@@ -49,6 +49,7 @@ def export_result(
     page_size: int,
     cancelled: threading.Event,
     on_progress: Callable[[int], None] | None = None,
+    escape_formulas: bool = True,
 ) -> int:
     """Stream the whole result of ``query_id`` to ``path``; return the row count."""
     cursor = conn.cursor()
@@ -74,7 +75,7 @@ def export_result(
 
         target = Path(path)
         with target.open("w", encoding="utf-8", newline="") as handle:
-            total = write_csv(handle, columns, batches())
+            total = write_csv(handle, columns, batches(), escape_formulas=escape_formulas)
         if on_progress:
             on_progress(total)
         return total

@@ -1,7 +1,14 @@
 """Query history in SQLite (H1, spec 7.8).
 
 Stored locally at ``~/Library/Application Support/SnowDesk/history.db`` and
-clearable by the user.  Nothing leaves the machine.
+clearable by the user.
+
+Nothing leaves the machine, but the file is still the most sensitive thing
+SnowDesk writes: it holds the full text of every statement run, and statement
+text is where credentials turn up in the open -- ``CREATE USER ... PASSWORD=``,
+``CREATE STAGE ... CREDENTIALS=(...)`` -- alongside whatever a ``WHERE`` clause
+had to name.  So it is created private to the owner and kept that way, rather
+than at whatever the umask happens to allow.
 """
 
 from __future__ import annotations
@@ -13,6 +20,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
+from snowdesk import config
 from snowdesk.model import RunStatus, StatementOutcome
 
 _SCHEMA = """
@@ -56,9 +64,12 @@ class HistoryStore:
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
         if self.path.parent != Path("."):
-            self.path.parent.mkdir(parents=True, exist_ok=True)
+            config.private_dir(self.path.parent)
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
+        # sqlite3 creates the file at the umask, so it is tightened as soon as
+        # it exists -- before the first statement is written into it.
+        config.secure(self.path)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.executescript(_SCHEMA)

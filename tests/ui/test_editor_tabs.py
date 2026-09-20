@@ -5,9 +5,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from PySide6.QtWidgets import QMessageBox
 
 from snowdesk.storage.session import SessionStore
+from snowdesk.ui import editor_tabs
 from snowdesk.ui.editor_tabs import DIRTY_MARK, EditorTabs, SaveAnswer
 
 
@@ -107,9 +107,9 @@ def test_opening_the_same_file_twice_reuses_its_tab(tabs: EditorTabs, tmp_path: 
 
 def test_open_reports_an_unreadable_file(tabs: EditorTabs, tmp_path: Path, monkeypatch) -> None:
     shown: list[str] = []
-    monkeypatch.setattr(
-        QMessageBox, "warning", staticmethod(lambda _p, _t, msg, *a: shown.append(msg))
-    )
+    # Patched where it is used: warn() puts up a modal box, which would hang
+    # an offscreen run waiting for a click that never comes.
+    monkeypatch.setattr(editor_tabs, "warn", lambda _p, _t, msg: shown.append(msg))
     assert tabs.open_file(tmp_path / "does-not-exist.sql") is None
     assert shown and "does-not-exist.sql" in shown[0]
     assert tabs.count() == 1  # no empty tab left behind

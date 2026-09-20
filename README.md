@@ -26,6 +26,14 @@ If key-pair auth points at an encrypted private key and the config has no
 connect. The passphrase is kept in memory for that run only, so a reconnect
 does not ask again, and is never written to disk.
 
+What SnowDesk does write — the query history at
+`~/Library/Application Support/SnowDesk/history.db`, the autosaved editor
+tabs beside it, and the log in `~/Library/Logs/SnowDesk` — is kept readable
+only by you. History holds the text of every statement you run, which is
+where credentials tend to appear in the open, so it is treated the way the
+`snow` CLI treats `connections.toml`. Files left world-readable by an earlier
+version are tightened the next time the app starts.
+
 ## Status
 
 All **P0** requirements from the spec are implemented, plus milestones M0-M6.
@@ -57,6 +65,12 @@ Clicking a column header sorts the rows currently loaded. That is a
 client-side sort, not a re-query, so the grid says as much whenever the result
 is not fully fetched — otherwise a sorted page looks like an ordered answer to
 a question nobody asked the database.
+
+Values that Excel and Sheets would run as a formula — anything starting `=`,
+`+`, `-` or `@` — get a leading apostrophe when exported or copied, so opening
+a result in a spreadsheet cannot execute what was in the table. The apostrophe
+is visible in the file; turn it off under Settings → Exports if you need the
+bytes verbatim.
 
 **⌘E exports the whole result**, not the rows on screen. It re-reads the result
 by query id rather than draining the grid's cursor, so the export is complete

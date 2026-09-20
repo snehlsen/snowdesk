@@ -3,16 +3,23 @@
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <!-- CPython and the connector's compiled extensions need these under the
-       hardened runtime. -->
+  <!-- ctypes builds its call trampolines at run time, and on Apple Silicon
+       that needs MAP_JIT, which needs this. Deliberately not paired with
+       com.apple.security.cs.allow-unsigned-executable-memory, which is the
+       same permission without the MAP_JIT requirement: nothing here has been
+       shown to need the broader form. -->
   <key>com.apple.security.cs.allow-jit</key>
-  <true/>
-  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
-  <true/>
-  <key>com.apple.security.cs.disable-library-validation</key>
   <true/>
   <!-- Talking to Snowflake, and opening the browser for SSO. -->
   <key>com.apple.security.network.client</key>
   <true/>
+  <!-- Deliberately absent: com.apple.security.cs.disable-library-validation.
+       It would let a library signed by anyone load into a process holding a
+       live Snowflake session and reach into the Keychain token cache, which
+       is most of what signing this bundle was for. Everything PyInstaller
+       collects is re-signed with the same Developer ID at packaging time, so
+       validation has no reason to fail; but if it does, it fails at launch.
+       A build that changes what is bundled is worth checking by running the
+       signed, notarized bundle with the selftest flag, not the source tree. -->
 </dict>
 </plist>

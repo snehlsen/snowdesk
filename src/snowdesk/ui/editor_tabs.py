@@ -10,6 +10,7 @@ from PySide6.QtCore import QTimer, Signal
 from PySide6.QtWidgets import QFileDialog, QMessageBox, QTabWidget, QWidget
 
 from snowdesk.storage.session import SessionState, SessionStore, TabState
+from snowdesk.ui.dialogs import warn
 from snowdesk.ui.editor import SqlEditor
 
 log = logging.getLogger(__name__)
@@ -205,7 +206,7 @@ class EditorTabs(QTabWidget):
         try:
             text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
-            QMessageBox.warning(self, "Could not open file", f"{path}\n\n{exc}")
+            warn(self, "Could not open file", f"{path}\n\n{exc}")
             return None
         return self.new_tab(text=text, path=path)
 
@@ -236,7 +237,7 @@ class EditorTabs(QTabWidget):
         try:
             path.write_text(editor.toPlainText(), encoding="utf-8")
         except OSError as exc:
-            QMessageBox.warning(self, "Could not save file", f"{path}\n\n{exc}")
+            warn(self, "Could not save file", f"{path}\n\n{exc}")
             return False
         self._paths[editor] = path
         editor.document().setModified(False)
