@@ -315,7 +315,14 @@ class ResultView(QWidget):
 
         self.footer = QLabel("", self)
         self.footer.setVisible(False)
-        self.footer.setStyleSheet("color: #a15c00; padding: 4px 8px;")
+        self.footer.setStyleSheet("padding: 4px 8px;")
+
+        # A query that legitimately returns nothing should say so rather than
+        # leaving an empty panel that looks like a failure.
+        self.empty_label = QLabel("No rows returned", self.table)
+        self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_label.setEnabled(False)
+        self.empty_label.setVisible(False)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -325,6 +332,9 @@ class ResultView(QWidget):
 
         model.more_requested.connect(lambda: self.more_requested.emit(self.result_id))
         model.cap_reached.connect(self._on_cap_reached)
+        model.modelReset.connect(self._refresh_empty_state)
+        model.rowsInserted.connect(self._refresh_empty_state)
+        self._refresh_empty_state()
 
         self._add_shortcuts()
         self._size_columns()
@@ -382,6 +392,16 @@ class ResultView(QWidget):
             "Export to CSV to get the full result."
         )
         self.footer.setVisible(True)
+
+    def _refresh_empty_state(self, *_args: object) -> None:
+        empty = self.model.rowCount() == 0 and self.model.exhausted
+        self.empty_label.setVisible(empty)
+        if empty:
+            self.empty_label.setGeometry(self.table.viewport().geometry())
+
+    def resizeEvent(self, event: object) -> None:
+        super().resizeEvent(event)  # type: ignore[arg-type]
+        self._refresh_empty_state()
 
     def _size_columns(self) -> None:
         """Size columns from the loaded rows once, then leave them to the user.

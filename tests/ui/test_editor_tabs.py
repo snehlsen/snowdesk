@@ -8,7 +8,7 @@ import pytest
 from PySide6.QtWidgets import QMessageBox
 
 from snowdesk.storage.session import SessionStore
-from snowdesk.ui.editor_tabs import DIRTY_MARK, EditorTabs
+from snowdesk.ui.editor_tabs import DIRTY_MARK, EditorTabs, SaveAnswer
 
 
 @pytest.fixture
@@ -62,15 +62,11 @@ def test_an_edited_tab_is_marked_dirty(tabs: EditorTabs) -> None:
 
 def test_closing_an_edited_tab_asks_first(tabs: EditorTabs, monkeypatch) -> None:
     type_into(tabs.editor, "select 1")
-    monkeypatch.setattr(
-        QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.StandardButton.Cancel)
-    )
+    monkeypatch.setattr(tabs, "ask_save_changes", lambda _name: SaveAnswer.CANCEL)
     assert not tabs.close_tab(0)
     assert tabs.count() == 1
 
-    monkeypatch.setattr(
-        QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.StandardButton.Discard)
-    )
+    monkeypatch.setattr(tabs, "ask_save_changes", lambda _name: SaveAnswer.DONT_SAVE)
     assert tabs.close_tab(0)
 
 
@@ -79,9 +75,7 @@ def test_an_empty_edited_tab_closes_without_asking(tabs: EditorTabs, monkeypatch
     type_into(tabs.editor, "select 1")
     type_into(tabs.editor, "   ")
     monkeypatch.setattr(
-        QMessageBox,
-        "question",
-        staticmethod(lambda *a, **k: pytest.fail("should not have asked")),
+        tabs, "ask_save_changes", lambda _name: pytest.fail("should not have asked")
     )
     tabs.new_tab()
     assert tabs.close_tab(0)

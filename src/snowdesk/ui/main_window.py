@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QAction, QCloseEvent, QKeySequence
@@ -17,15 +18,15 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
-    QSizePolicy,
     QSplitter,
+    QStyle,
     QTabWidget,
     QToolBar,
     QVBoxLayout,
     QWidget,
 )
 
-from snowdesk import config
+from snowdesk import __version__, config
 from snowdesk.controllers.browser import BrowserController
 from snowdesk.controllers.query import QueryController
 from snowdesk.db.session import ConnectionState, ConnectParams
@@ -41,6 +42,14 @@ from snowdesk.ui.result_view import ResultModel, ResultView
 from snowdesk.util.formatting import format_duration
 
 log = logging.getLogger(__name__)
+
+#: Inset from the window edge for chrome that runs the full width.  Qt leaves
+#: toolbars flush to the edge, which reads as cramped next to the rest of the
+#: window; macOS insets its toolbar content.
+WINDOW_MARGIN = 12
+#: Gap between neighbouring controls.  Qt's default toolbar spacing is 1px,
+#: which runs adjacent buttons together.
+CONTROL_SPACING = 8
 
 _STATE_DOT = {
     ConnectionState.DISCONNECTED.value: ("○", "#8a8f98", "Disconnected"),
@@ -96,42 +105,68 @@ class MainWindow(QMainWindow):
     # -- construction ------------------------------------------------------
 
     def _build_toolbar(self) -> None:
+        """Toolbar chrome, laid out inside one container widget.
+
+        QToolBarLayout recomputes its own margins from the style, so setting
+        them there does not stick and the controls sit flush against the window
+        edge.  Everything lives in a container whose layout we do control,
+        which is also how the banner below is built.
+        """
         bar = QToolBar("Main", self)
         bar.setMovable(False)
+        bar.setFloatable(False)
         bar.setIconSize(bar.iconSize() * 0.8)
         self.addToolBar(bar)
 
-        bar.addWidget(QLabel("Connection: ", self))
-        self.connection_box = QComboBox(self)
+        content = QWidget(bar)
+        row = QHBoxLayout(content)
+        row.setContentsMargins(WINDOW_MARGIN, 4, WINDOW_MARGIN, 4)
+        row.setSpacing(CONTROL_SPACING)
+
+        row.addWidget(QLabel("Connection:", content))
+        self.connection_box = QComboBox(content)
         self.connection_box.setMinimumWidth(200)
-        bar.addWidget(self.connection_box)
+        self.connection_box.setAccessibleName("Connection")
+        row.addWidget(self.connection_box)
 
-        self.connect_button = QPushButton("Connect", self)
+        self.connect_button = QPushButton("Connect", content)
         self.connect_button.clicked.connect(self._on_connect_clicked)
-        bar.addWidget(self.connect_button)
+        row.addWidget(self.connect_button)
 
-        bar.addSeparator()
-        self.state_label = QLabel("", self)
-        bar.addWidget(self.state_label)
+        row.addSpacing(CONTROL_SPACING)
+        self.state_label = QLabel("", content)
+        row.addWidget(self.state_label)
 
-        spacer = QWidget(self)
-        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        bar.addWidget(spacer)
+        row.addStretch(1)
 
-        self.run_button = QPushButton("Run", self)
+        self.run_button = QPushButton("Run", content)
+        self.run_button.setToolTip("Run the statement under the cursor (⌘↩)")
+        self.run_button.setAccessibleName("Run statement")
+        self.run_button.setDefault(True)
         self.run_button.clicked.connect(self.run_current)
-        bar.addWidget(self.run_button)
-        self.stop_button = QPushButton("Stop", self)
+        row.addWidget(self.run_button)
+
+        self.stop_button = QPushButton("Stop", content)
+        self.stop_button.setToolTip("Cancel the running statement (⌘.)")
+        self.stop_button.setAccessibleName("Cancel statement")
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self.query.cancel)
-        bar.addWidget(self.stop_button)
+        row.addWidget(self.stop_button)
+
+        bar.addWidget(content)
 
     def _build_banner(self) -> None:
         """A dismissible strip for connection trouble, with one-click Reconnect."""
         self.banner = QWidget(self)
+        self.banner.setObjectName("connectionBanner")
+        # Scoped to the strip by object name: an unscoped QWidget rule cascades
+        # into the buttons and washes them out.  A translucent tint over
+        # whatever the window colour is keeps this readable in either
+        # appearance, and the text and buttons keep their palette colours.
         self.banner.setStyleSheet(
-            "QWidget { background: #fdf0e3; border-bottom: 1px solid #e0b884; }"
-            "QLabel { color: #7a4a00; }"
+            "#connectionBanner {"
+            " background: rgba(232, 150, 40, 0.20);"
+            " border-bottom: 1px solid rgba(232, 150, 40, 0.45); }"
         )
         self.banner_label = QLabel("", self.banner)
         self.banner_label.setWordWrap(True)
@@ -141,7 +176,8 @@ class MainWindow(QMainWindow):
         self.dismiss_button.clicked.connect(self.hide_banner)
 
         layout = QHBoxLayout(self.banner)
-        layout.setContentsMargins(10, 6, 10, 6)
+        layout.setContentsMargins(WINDOW_MARGIN, 6, WINDOW_MARGIN, 6)
+        layout.setSpacing(CONTROL_SPACING)
         layout.addWidget(self.banner_label, 1)
         layout.addWidget(self.reconnect_button)
         layout.addWidget(self.dismiss_button)
@@ -175,13 +211,16 @@ class MainWindow(QMainWindow):
         self.tree_filter.setPlaceholderText("filter…")
         self.tree_filter.setClearButtonEnabled(True)
         self.tree_filter.textChanged.connect(self.object_tree.filter_tree)
-        refresh = QPushButton("⟳", self)
-        refresh.setFixedWidth(30)
-        refresh.setToolTip("Refresh objects")
+        refresh = QPushButton(self)
+        refresh.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
+        refresh.setFixedWidth(32)
+        refresh.setToolTip("Refresh the object list")
+        refresh.setAccessibleName("Refresh objects")
         refresh.clicked.connect(lambda: self.object_tree.refresh())
 
         tree_top = QHBoxLayout()
-        tree_top.setContentsMargins(6, 6, 6, 0)
+        tree_top.setContentsMargins(CONTROL_SPACING, CONTROL_SPACING, CONTROL_SPACING, 0)
+        tree_top.setSpacing(CONTROL_SPACING // 2)
         tree_top.addWidget(self.tree_filter, 1)
         tree_top.addWidget(refresh)
 
@@ -242,14 +281,32 @@ class MainWindow(QMainWindow):
         self.rows_label = QLabel("", self)
         self.time_label = QLabel("", self)
         self.qid_label = QLabel("", self)
-        for widget in (self.context_label, self.rows_label, self.time_label, self.qid_label):
+        # Separated, or the segments read as one run-on string:
+        # "RAW.PUBLIC 0 rows 0 ms 01b0-0001".
+        for index, widget in enumerate(
+            (self.context_label, self.rows_label, self.time_label, self.qid_label)
+        ):
+            if index:
+                divider = QLabel("│", self)
+                divider.setEnabled(False)
+                self.statusBar().addPermanentWidget(divider)
             self.statusBar().addPermanentWidget(widget)
         self.statusBar().showMessage("Ready")
 
     def _build_actions(self) -> None:
         self._menus: dict[str, QMenu] = {}
+        # macOS orders menus File, Edit, then app-specific, then Help; the
+        # menu bar follows creation order, so they are created up front.
+        for name in ("&File", "&Edit", "&Query", "&Help"):
+            self._menu(name)
 
-        def action(text: str, shortcut: str, slot, menu_name: str) -> QAction:
+        def action(
+            text: str,
+            shortcut: str,
+            slot,
+            menu_name: str,
+            role: QAction.MenuRole = QAction.MenuRole.NoRole,
+        ) -> QAction:
             act = QAction(text, self)
             if shortcut:
                 act.setShortcut(QKeySequence(shortcut))
@@ -258,22 +315,48 @@ class MainWindow(QMainWindow):
             # first one -- new_tab(text=False) is how ⌘T stopped working -- so
             # the argument is dropped here, once, for every action.
             act.triggered.connect(lambda _checked=False, fn=slot: fn())
+            # A role tells Qt to move the item into the macOS application menu,
+            # where the platform expects to find it.
+            act.setMenuRole(role)
             self._menu(menu_name).addAction(act)
             self.addAction(act)
             return act
+
+        action("New Tab", "Ctrl+T", self.editors.new_tab, "&File")
+        action("Open…", "Ctrl+O", self.editors.open_file, "&File")
+        self._menu("&File").addSeparator()
+        action("Close Tab", "Ctrl+W", self._close_current_tab, "&File")
+        action("Save", "Ctrl+S", self.editors.save, "&File")
+        action("Save As…", "Ctrl+Shift+S", self.editors.save_as, "&File")
+
+        # Apple's title case capitalises words of four letters or more.
+        action("Copy With Headers", "Ctrl+Shift+C", self._copy_with_headers, "&Edit")
+        self._menu("&Edit").addSeparator()
+        action("Clear History…", "", self._clear_history, "&Edit")
 
         action("Run Statement", "Ctrl+Return", self.run_current, "&Query")
         action("Run All", "Ctrl+Shift+Return", self.run_all, "&Query")
         self.cancel_action = action("Cancel", "Ctrl+.", self.query.cancel, "&Query")
         self.cancel_action.setEnabled(False)
-        action("Reconnect", "Ctrl+R", self._on_connect_clicked, "&Query")
-        action("New Tab", "Ctrl+T", self.editors.new_tab, "&File")
-        action("Close Tab", "Ctrl+W", self._close_current_tab, "&File")
-        action("Open…", "Ctrl+O", self.editors.open_file, "&File")
-        action("Save", "Ctrl+S", self.editors.save, "&File")
-        action("Save As…", "Ctrl+Shift+S", self.editors.save_as, "&File")
-        action("Copy with Headers", "Ctrl+Shift+C", self._copy_with_headers, "&Edit")
-        action("Clear History…", "", self._clear_history, "&Edit")
+        self._menu("&Query").addSeparator()
+        action("Reconnect", "Ctrl+R", self._reconnect, "&Query")
+
+        action(
+            "About SnowDesk",
+            "",
+            self._show_about,
+            "&Help",
+            QAction.MenuRole.AboutRole,
+        )
+
+    def _show_about(self) -> None:
+        QMessageBox.about(
+            self,
+            "About SnowDesk",
+            f"<b>SnowDesk {__version__}</b><br><br>"
+            "A lightweight macOS client for Snowflake.<br>"
+            "Connections come from the same files the <code>snow</code> CLI uses.",
+        )
 
     def _menu(self, name: str) -> QMenu:
         menu = self._menus.get(name)
@@ -569,19 +652,47 @@ class MainWindow(QMainWindow):
         self.editors.close_tab(self.editors.currentIndex())
 
     def _on_file_changed(self, path: object) -> None:
-        self.setWindowTitle(f"SnowDesk — {path}" if path else "SnowDesk")
+        """Title the window the way macOS titles a document window.
+
+        The file name alone; the full path belongs to the proxy icon, which
+        setWindowFilePath provides.
+        """
+        if path:
+            self.setWindowTitle(Path(str(path)).name)
+            self.setWindowFilePath(str(path))
+        else:
+            self.setWindowTitle("SnowDesk")
+            self.setWindowFilePath("")
 
     def _load_from_history(self, sql: str) -> None:
         self.editor.setPlainText(sql)
         self.editor.setFocus()
 
     def _clear_history(self) -> None:
-        answer = QMessageBox.question(
-            self, "Clear history", "Delete all locally stored query history?"
-        )
-        if answer == QMessageBox.StandardButton.Yes:
+        if self.confirm_clear_history():
             self.history.clear()
             self.history_panel.reload()
+
+    def confirm_clear_history(self) -> bool:
+        """Confirm before destroying history, defaulting to keeping it.
+
+        Qt's question() makes Yes the default, so Return would wipe the
+        history; the platform convention is the safe choice by default and a
+        distinct destructive button.
+        """
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText("Delete all query history?")
+        box.setInformativeText(
+            "Every statement SnowDesk has recorded on this Mac will be removed. "
+            "You can't undo this action."
+        )
+        delete = box.addButton("Delete History", QMessageBox.ButtonRole.DestructiveRole)
+        cancel = box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(cancel)
+        box.setEscapeButton(cancel)
+        box.exec()
+        return box.clickedButton() is delete
 
     def _on_worker_error(self, message: str) -> None:
         self._log_message(f"Internal error: {message}")

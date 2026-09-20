@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from enum import StrEnum
 from pathlib import Path
 
 from PySide6.QtCore import QTimer, Signal
@@ -12,6 +13,15 @@ from snowdesk.storage.session import SessionState, SessionStore, TabState
 from snowdesk.ui.editor import SqlEditor
 
 log = logging.getLogger(__name__)
+
+
+class SaveAnswer(StrEnum):
+    """What the user chose when asked about unsaved changes."""
+
+    SAVE = "save"
+    DONT_SAVE = "dont_save"
+    CANCEL = "cancel"
+
 
 AUTOSAVE_INTERVAL_MS = 3000
 SQL_FILTER = "SQL files (*.sql);;All files (*)"
@@ -125,19 +135,38 @@ class EditorTabs(QTabWidget):
         if not editor.document().isModified() or not editor.toPlainText().strip():
             return True
         name = self.tabText(self._index_of(editor)).removesuffix(DIRTY_MARK)
-        answer = QMessageBox.question(
-            self,
-            "Unsaved changes",
-            f"“{name}” has unsaved changes.",
-            QMessageBox.StandardButton.Save
-            | QMessageBox.StandardButton.Discard
-            | QMessageBox.StandardButton.Cancel,
-        )
-        if answer == QMessageBox.StandardButton.Cancel:
+        answer = self.ask_save_changes(name)
+        if answer is SaveAnswer.CANCEL:
             return False
-        if answer == QMessageBox.StandardButton.Save:
+        if answer is SaveAnswer.SAVE:
             return self.save(editor)
         return True
+
+    def ask_save_changes(self, name: str) -> SaveAnswer:
+        """Put macOS's save-changes question to the user.
+
+        Worded and ordered the way the platform words it: a question about the
+        document, informative text about the consequence, and "Don't Save"
+        rather than "Discard".  Separate from the decision above so the
+        decision can be exercised without a modal dialog.
+        """
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText(f"Do you want to save the changes you made to \u201c{name}\u201d?")
+        box.setInformativeText("Your changes will be lost if you don't save them.")
+        dont_save = box.addButton("Don't Save", QMessageBox.ButtonRole.DestructiveRole)
+        cancel = box.addButton(QMessageBox.StandardButton.Cancel)
+        save = box.addButton(QMessageBox.StandardButton.Save)
+        box.setDefaultButton(save)
+        box.setEscapeButton(cancel)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is save:
+            return SaveAnswer.SAVE
+        if clicked is dont_save:
+            return SaveAnswer.DONT_SAVE
+        return SaveAnswer.CANCEL
 
     # -- files (E3) --------------------------------------------------------
 

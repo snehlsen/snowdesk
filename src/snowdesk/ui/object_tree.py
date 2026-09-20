@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QPoint, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QGuiApplication
+from PySide6.QtGui import QColor, QFont, QGuiApplication, QIcon
 from PySide6.QtWidgets import (
     QHeaderView,
     QMenu,
+    QStyle,
     QTreeWidget,
     QTreeWidgetItem,
     QWidget,
@@ -25,6 +26,13 @@ _EXPANDABLE = {browse.DATABASE, browse.SCHEMA, browse.TABLE, browse.VIEW}
 #: Kinds GET_DDL understands; a column has no DDL of its own.
 _DDL_KINDS = {browse.DATABASE, browse.SCHEMA, browse.TABLE, browse.VIEW}
 
+_ICONS = {
+    browse.DATABASE: QStyle.StandardPixmap.SP_DriveHDIcon,
+    browse.SCHEMA: QStyle.StandardPixmap.SP_DirIcon,
+    browse.TABLE: QStyle.StandardPixmap.SP_FileIcon,
+    browse.VIEW: QStyle.StandardPixmap.SP_FileDialogContentsView,
+}
+
 
 class ObjectTree(QTreeWidget):
     """Each level is fetched with a single ``SHOW`` on first expand."""
@@ -42,8 +50,7 @@ class ObjectTree(QTreeWidget):
         # elides deeply nested names in a narrow sidebar.  The tree scrolls
         # horizontally instead.
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        header.setStretchLastSection(False)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.setUniformRowHeights(True)
         self.setAlternatingRowColors(False)
         self.setExpandsOnDoubleClick(False)
@@ -101,7 +108,12 @@ class ObjectTree(QTreeWidget):
             self._set_placeholder(parent, "empty")
             return
         for node in nodes:
-            item = QTreeWidgetItem([node.name, node.detail or node.kind])
+            # Capitalised even when a node carries no detail of its own, or the
+            # column reads "database" beside "Table".
+            item = QTreeWidgetItem([node.name, node.detail or node.kind.capitalize()])
+            icon = self._icon_for(node.kind)
+            if icon is not None:
+                item.setIcon(0, icon)
             item.setData(0, PATH_ROLE, node.path)
             item.setData(0, KIND_ROLE, node.kind)
             item.setData(0, LOADED_ROLE, False)
@@ -132,6 +144,17 @@ class ObjectTree(QTreeWidget):
         else:
             parent.takeChildren()
             parent.addChild(item)
+
+    def _icon_for(self, kind: str) -> QIcon | None:
+        """A stock icon per node kind, so the levels are distinguishable.
+
+        Standard pixmaps are used rather than bundled artwork: on macOS they
+        resolve to the platform's own icons and follow its appearance.
+        """
+        pixmap = _ICONS.get(kind)
+        if pixmap is None:
+            return None
+        return self.style().standardIcon(pixmap)
 
     # -- lookups -----------------------------------------------------------
 

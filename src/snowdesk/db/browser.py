@@ -51,7 +51,9 @@ def list_databases(conn: Connection) -> list[ObjectNode]:
         ObjectNode(
             name=str(r["name"]),
             kind=DATABASE,
-            detail=str(r.get("kind") or r.get("origin") or ""),
+            # A consistent, capitalised label: the Type column showed
+            # "database" beside "Table" when this fell back to the kind.
+            detail="Database",
             path=(str(r["name"]),),
         )
         for r in rows
@@ -65,6 +67,7 @@ def list_schemas(conn: Connection, database: str) -> list[ObjectNode]:
         ObjectNode(
             name=str(r["name"]),
             kind=SCHEMA,
+            detail="Schema",
             path=(database, str(r["name"])),
         )
         for r in rows

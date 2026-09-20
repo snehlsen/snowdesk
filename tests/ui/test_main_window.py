@@ -6,7 +6,9 @@ import queue
 import sys
 
 import pytest
-from PySide6.QtWidgets import QMessageBox
+from PySide6.QtCore import QPoint
+from PySide6.QtGui import QAction
+from PySide6.QtWidgets import QLabel, QMenu
 
 from snowdesk.controllers.browser import BrowserController
 from snowdesk.controllers.query import QueryController
@@ -15,7 +17,8 @@ from snowdesk.db.worker import ConnectJob, SnowflakeWorker
 from snowdesk.storage.history import HistoryStore
 from snowdesk.storage.session import SessionStore
 from snowdesk.ui.editor import SqlEditor
-from snowdesk.ui.main_window import MainWindow
+from snowdesk.ui.editor_tabs import SaveAnswer
+from snowdesk.ui.main_window import CONTROL_SPACING, WINDOW_MARGIN, MainWindow
 from snowdesk.ui.result_view import ResultView
 from tests.fakes import FakeConnection, FakeProgrammingError, FakeStatement
 
@@ -404,8 +407,9 @@ def test_every_action_survives_the_checked_argument(harness: Harness, monkeypatc
     monkeypatch.setattr("snowdesk.ui.editor_tabs.QFileDialog.getOpenFileName", nothing_chosen)
     monkeypatch.setattr("snowdesk.ui.editor_tabs.QFileDialog.getSaveFileName", nothing_chosen)
     monkeypatch.setattr(
-        QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.StandardButton.Discard)
+        harness.window.editors, "ask_save_changes", lambda _name: SaveAnswer.DONT_SAVE
     )
+    monkeypatch.setattr(harness.window, "confirm_clear_history", lambda: False)
 
     escaped: list[str] = []
     monkeypatch.setattr(
@@ -448,7 +452,7 @@ def test_closing_the_sole_tab_keeps_the_window_usable(harness: Harness) -> None:
 
 def test_closing_the_sole_tab_with_the_shortcut(harness: Harness, monkeypatch) -> None:
     monkeypatch.setattr(
-        QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.StandardButton.Discard)
+        harness.window.editors, "ask_save_changes", lambda _name: SaveAnswer.DONT_SAVE
     )
     window = harness.window
     cursor = window.editor.textCursor()
@@ -640,3 +644,103 @@ def test_the_banner_can_be_dismissed(harness: Harness) -> None:
     assert window.banner_bar.isVisibleTo(window)
     window.dismiss_button.click()
     assert not window.banner_bar.isVisibleTo(window)
+
+
+# -- macOS conventions ------------------------------------------------------
+
+
+def test_menus_are_in_platform_order(harness: Harness) -> None:
+    """macOS puts File and Edit first, app-specific menus after, Help last."""
+    titles = [m.title().replace("&", "") for m in harness.window.menuBar().findChildren(QMenu)]
+    assert titles == ["File", "Edit", "Query", "Help"]
+
+
+def test_about_carries_the_menu_role_that_moves_it_to_the_app_menu(harness: Harness) -> None:
+    about = next(a for a in harness.window.actions() if a.text() == "About SnowDesk")
+    assert about.menuRole() == QAction.MenuRole.AboutRole
+
+
+def test_menu_items_that_open_a_dialog_end_in_an_ellipsis(harness: Harness) -> None:
+    opens_dialog = {"Open", "Save As", "Clear History"}
+    for act in harness.window.actions():
+        stem = act.text().removesuffix("…")
+        if stem in opens_dialog:
+            assert act.text().endswith("…"), f"{act.text()} should end with an ellipsis"
+
+
+def test_clearing_history_is_confirmed_and_can_be_refused(harness: Harness, monkeypatch) -> None:
+    connect(harness)
+    window = harness.window
+    window.editor.setPlainText("select 1")
+    window.run_all()
+    harness.drain()
+    assert window.history.recent()
+
+    monkeypatch.setattr(window, "confirm_clear_history", lambda: False)
+    window._clear_history()
+    assert window.history.recent(), "history was destroyed without consent"
+
+    monkeypatch.setattr(window, "confirm_clear_history", lambda: True)
+    window._clear_history()
+    assert window.history.recent() == []
+
+
+def test_the_window_title_is_the_file_name_not_its_path(harness: Harness, tmp_path) -> None:
+    path = tmp_path / "quarterly report.sql"
+    path.write_text("select 1")
+    harness.window.editors.open_file(path)
+
+    assert harness.window.windowTitle() == "quarterly report.sql"
+    # The full path belongs to the proxy icon.
+    assert harness.window.windowFilePath() == str(path)
+
+
+def test_the_title_returns_to_the_app_name_for_an_unsaved_tab(harness: Harness, tmp_path) -> None:
+    path = tmp_path / "q.sql"
+    path.write_text("select 1")
+    harness.window.editors.open_file(path)
+    harness.window.editors.new_tab()
+    assert harness.window.windowTitle() == "SnowDesk"
+    assert harness.window.windowFilePath() == ""
+
+
+def test_toolbar_buttons_are_labelled_for_assistive_tech(harness: Harness) -> None:
+    for button in (harness.window.run_button, harness.window.stop_button):
+        assert button.accessibleName()
+        assert button.toolTip()
+
+
+def test_status_bar_segments_are_separated(harness: Harness) -> None:
+    dividers = [
+        label for label in harness.window.statusBar().findChildren(QLabel) if label.text() == "│"
+    ]
+    assert len(dividers) == 3  # between four segments
+
+
+def test_toolbar_content_is_inset_from_both_window_edges(harness: Harness) -> None:
+    """Qt leaves toolbar content flush to the edge, which reads as cramped.
+
+    QToolBarLayout recomputes its own margins, so the inset only holds as long
+    as the controls live in a container whose layout we own.
+    """
+    window = harness.window
+    window.resize(1000, 700)
+    window.show()
+    try:
+        left = window.connection_box.parentWidget().mapTo(window, QPoint(0, 0)).x()
+        first = window.connection_box.parentWidget().layout().itemAt(0).widget()
+        first_left = first.mapTo(window, QPoint(0, 0)).x()
+        last_right = window.stop_button.mapTo(window, QPoint(0, 0)).x() + window.stop_button.width()
+        assert first_left - left >= WINDOW_MARGIN
+        assert window.width() - last_right >= WINDOW_MARGIN
+        # Symmetric, give or take the toolbar's own frame.
+        assert abs(first_left - (window.width() - last_right)) <= 2
+    finally:
+        window.hide()
+
+
+def test_neighbouring_controls_are_not_run_together(harness: Harness) -> None:
+    row = harness.window.run_button.parentWidget().layout()
+    assert row.spacing() == CONTROL_SPACING
+    margins = row.contentsMargins()
+    assert margins.left() == margins.right() == WINDOW_MARGIN

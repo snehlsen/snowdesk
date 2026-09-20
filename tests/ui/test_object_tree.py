@@ -11,8 +11,8 @@ from snowdesk.db.worker import SnowflakeWorker
 from snowdesk.model import ObjectNode
 from snowdesk.ui.object_tree import KIND_ROLE, ObjectTree
 
-DATABASES = [ObjectNode(name="RAW", kind=browse.DATABASE, path=("RAW",))]
-SCHEMAS = [ObjectNode(name="PUBLIC", kind=browse.SCHEMA, path=("RAW", "PUBLIC"))]
+DATABASES = [ObjectNode(name="RAW", kind=browse.DATABASE, detail="Database", path=("RAW",))]
+SCHEMAS = [ObjectNode(name="PUBLIC", kind=browse.SCHEMA, detail="Schema", path=("RAW", "PUBLIC"))]
 OBJECTS = [
     ObjectNode(name="ORDERS", kind=browse.TABLE, detail="Table", path=("RAW", "PUBLIC", "ORDERS")),
     ObjectNode(
@@ -181,3 +181,25 @@ def test_filter_hides_non_matching_nodes(tree: ObjectTree) -> None:
 
     tree.filter_tree("")
     assert not item_for(tree, ("RAW", "PUBLIC", "ORDERS")).isHidden()
+
+
+# -- presentation (macOS conventions) ---------------------------------------
+
+
+def test_the_type_column_is_consistently_capitalised(tree: ObjectTree) -> None:
+    """It read "database" beside "Table" when nodes without a detail fell
+    back to the raw kind string."""
+    labels = [item_for(tree, p).text(1) for p in [("RAW",), ("RAW", "PUBLIC")]]
+    labels += [item_for(tree, ("RAW", "PUBLIC", name)).text(1) for name in ("ORDERS", "V_Orders")]
+    assert labels == ["Database", "Schema", "Table", "View"]
+    assert all(label[:1].isupper() for label in labels)
+
+
+def test_each_level_carries_an_icon(tree: ObjectTree) -> None:
+    for path in [("RAW",), ("RAW", "PUBLIC"), ("RAW", "PUBLIC", "ORDERS")]:
+        assert not item_for(tree, path).icon(0).isNull(), f"{path} has no icon"
+
+
+def test_columns_have_no_icon_of_their_own(tree: ObjectTree) -> None:
+    tree.controller._on_nodes(("RAW", "PUBLIC", "ORDERS"), COLUMNS)
+    assert item_for(tree, ("RAW", "PUBLIC", "ORDERS", "ORDER_ID")).icon(0).isNull()
