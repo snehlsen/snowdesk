@@ -173,3 +173,7 @@ history database, and reads the connection config. Add `--connection NAME` to
 also open a session and run `SELECT CURRENT_VERSION()`. The same command works
 from source (`uv run snowdesk --selftest`), so a failure tells you whether the
 problem is the build or the environment.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
