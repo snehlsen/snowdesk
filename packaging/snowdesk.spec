@@ -113,10 +113,16 @@ coll = COLLECT(
     name="snowdesk",
 )
 
+# Drop a 1024x1024 PNG through packaging/make_icon.sh to produce icon.icns.
+# Without one PyInstaller substitutes its own icon-windowed.icns, which is what
+# a stock build shows in the Dock and in Finder.
+_icon = os.path.join(ROOT, "packaging", "icon.icns")
+icon = _icon if os.path.exists(_icon) else None
+
 app = BUNDLE(
     coll,
     name="SnowDesk.app",
-    icon=None,
+    icon=icon,
     bundle_identifier="dev.snowdesk.app",
     info_plist={
         "CFBundleShortVersionString": "0.1.0",

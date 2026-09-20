@@ -140,7 +140,22 @@ open dist/SnowDesk.app
 
 For personal use, `uv run snowdesk` is enough. See spec section 12 for signing
 and notarization; the build is ad-hoc signed, so Gatekeeper rejects it until it
-is signed with a Developer ID and notarized.
+is signed with a Developer ID and notarized. No `.dmg` is produced yet — the
+build stops at `dist/SnowDesk.app`.
+
+### Application icon
+
+Without an icon of its own the bundle shows PyInstaller's stock one. Convert a
+square PNG, 1024x1024 or larger, and rebuild:
+
+```
+packaging/make_icon.sh path/to/logo.png
+uv run pyinstaller packaging/snowdesk.spec --noconfirm
+```
+
+That writes `packaging/icon.icns`, which the spec file picks up when it exists.
+macOS caches icons aggressively, so a rebuilt bundle in the same place may keep
+showing the old one until it is moved, renamed, or the Finder is restarted.
 
 ### Verifying a build
 
