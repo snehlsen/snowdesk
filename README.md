@@ -28,22 +28,17 @@ does not ask again, and is never written to disk.
 
 ## Status
 
-All **P0** requirements from the spec are implemented, plus milestones M0-M5.
+All **P0** requirements from the spec are implemented, plus milestones M0-M6.
 
 | Area | Done | Not yet |
 |------|------|---------|
 | Connections | C1-C6 | C7 role/warehouse override, C8 edit connections |
 | Query execution | Q1-Q6, Q7 (`QUERY_TAG`), Q8 (tab per result) | Q9 Snowsight link |
-| Results | R1-R5 | R6 CSV export UI\*, R7 sort/filter, R8 detail panel, R9 Parquet/XLSX |
+| Results | R1-R8 | R7 filtering (sort only), R9 Parquet/XLSX |
 | Object browser | B1-B5 | — |
 | Editor | E1, E2, E3 | E4 autocompletion |
 | History | H1, H2 | — |
-| Preferences | — | S1 preferences dialog |
-
-\* The streaming CSV writer (`util/export.py`) and batch iteration
-(`ResultHandle.iter_batches`) are in place; only the menu action and file dialog
-are missing. That is the one shortcut from spec section 8 that does nothing
-yet (⌘E); it belongs with R6 in M6.
+| Preferences | S1 | — |
 
 ### Keyboard shortcuts
 
@@ -54,6 +49,22 @@ yet (⌘E); it belongs with R6 in M6.
 | ⌘T / ⌘W | new editor tab / close tab |
 | ⌘O / ⌘S / ⌘⇧S | open a `.sql` file / save / save as |
 | ⌘⇧C | copy selected cells with headers |
+| ⌘E | export the full result to CSV |
+| ⌘I | show or hide the cell detail pane |
+| ⌘, | settings |
+
+Clicking a column header sorts the rows currently loaded. That is a
+client-side sort, not a re-query, so the grid says as much whenever the result
+is not fully fetched — otherwise a sorted page looks like an ordered answer to
+a question nobody asked the database.
+
+**⌘E exports the whole result**, not the rows on screen. It re-reads the result
+by query id rather than draining the grid's cursor, so the export is complete
+even when the row cap stopped the grid, the grid stays usable, and it can be
+repeated. Rows are streamed a page at a time and never accumulated, so
+exporting a million rows costs the same memory as exporting a thousand. The
+export runs off the job queue, so queries and the object browser keep working
+while it writes, and it can be cancelled.
 
 **View ▸ Appearance** switches between Follow System, Light and Dark. The choice
 is remembered, and with Follow System the window changes with macOS while

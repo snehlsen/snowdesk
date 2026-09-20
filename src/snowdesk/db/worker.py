@@ -21,6 +21,7 @@ from PySide6.QtCore import QObject, Signal
 
 from snowdesk.config import DEFAULT_PAGE_SIZE
 from snowdesk.db import browser as browse
+from snowdesk.db import export as csv_export
 from snowdesk.db.errors import (
     is_bad_private_key_passphrase,
     is_session_lost,
@@ -124,6 +125,11 @@ class SnowflakeWorker(QObject):
     rows_appended = Signal(str, object, bool)  # id, rows, exhausted
     fetch_failed = Signal(str, str)  # result id, message
 
+    export_progress = Signal(str, int)  # result id, rows written
+    export_finished = Signal(str, str, int)  # result id, path, rows
+    export_failed = Signal(str, str)  # result id, message
+    export_cancelled = Signal(str)
+
     nodes_ready = Signal(object, object)  # path tuple, list[ObjectNode]
     browse_failed = Signal(object, str)  # path tuple, message
 
@@ -137,6 +143,12 @@ class SnowflakeWorker(QObject):
         self._runner: StatementRunner | None = None
         self._runner_lock = threading.Lock()
         self._cancel_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="snowdesk-cancel")
+        # Exports run off the job queue: a million rows takes minutes, and
+        # blocking every other job behind it would freeze the browser and
+        # any further queries.  Its own cursor, as the cancel path already
+        # does (spec 6.2).
+        self._export_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="snowdesk-export")
+        self._export_stop = threading.Event()
         self._busy = threading.Event()
         # Key passphrases the user has entered this run, so Disconnect followed
         # by Connect does not ask again.  In memory only, never persisted, and
@@ -173,7 +185,47 @@ class SnowflakeWorker(QObject):
         except Exception:
             log.warning("Cancel failed", exc_info=True)
 
+    # -- export (R6) -------------------------------------------------------
+
+    def export_csv(self, result_id: str, path: str, page_size: int) -> None:
+        """Stream a finished result to a CSV file, off the job queue."""
+        handle = self.results.get(result_id)
+        if handle is None or not handle.query_id:
+            self.export_failed.emit(
+                result_id, "That result can no longer be exported; run the query again."
+            )
+            return
+        if not self.session.is_connected:
+            self.export_failed.emit(result_id, "Not connected.")
+            return
+        self._export_stop.clear()
+        self._export_pool.submit(self._do_export, result_id, handle.query_id, path, page_size)
+
+    def cancel_export(self) -> None:
+        self._export_stop.set()
+
+    def _do_export(self, result_id: str, query_id: str, path: str, page_size: int) -> None:
+        try:
+            rows = csv_export.export_result(
+                self.session.connection,
+                query_id,
+                path,
+                page_size,
+                self._export_stop,
+                on_progress=lambda written: self.export_progress.emit(result_id, written),
+            )
+        except csv_export.ExportCancelled:
+            csv_export.discard(path)
+            self.export_cancelled.emit(result_id)
+        except Exception as exc:
+            log.warning("Export of %s failed", result_id, exc_info=True)
+            csv_export.discard(path)
+            self.export_failed.emit(result_id, to_query_error(exc).message)
+        else:
+            self.export_finished.emit(result_id, path, rows)
+
     def shutdown(self) -> None:
+        self._export_stop.set()
         self._queue.put(ShutdownJob())
 
     # -- job loop (runs on the worker thread) -----------------------------
@@ -198,6 +250,7 @@ class SnowflakeWorker(QObject):
         self.results.close_all()
         self.session.close()
         self._cancel_pool.shutdown(wait=False)
+        self._export_pool.shutdown(wait=False)
         self.state_changed.emit(ConnectionState.DISCONNECTED.value, "")
 
     def _dispatch(self, job: Job) -> None:

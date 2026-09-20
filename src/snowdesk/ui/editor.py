@@ -110,6 +110,13 @@ class SqlEditor(QPlainTextEdit):
 
     # -- selections --------------------------------------------------------
 
+    def set_font_size(self, points: int) -> None:
+        font = self.font()
+        font.setPointSize(points)
+        self.setFont(font)
+        self.setTabStopDistance(4 * self.fontMetrics().horizontalAdvance(" "))
+        self._update_margins()
+
     def set_dark(self, dark: bool) -> None:
         """Re-theme in place, so a running app can change appearance."""
         self._dark = dark

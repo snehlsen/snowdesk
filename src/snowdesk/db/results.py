@@ -36,6 +36,9 @@ class ResultHandle:
 
     result_id: str
     cursor: Any
+    #: The statement's query id, kept so the full result can be re-read with
+    #: RESULT_SCAN without disturbing the grid's own cursor (R6).
+    query_id: str | None = None
     columns: list[ColumnInfo] = field(default_factory=list)
     loaded: int = 0
     exhausted: bool = False
@@ -93,7 +96,11 @@ class ResultRegistry:
 
     def register(self, cursor: Any) -> ResultHandle:
         """Take ownership of a cursor. Metadata is read on its first fetch."""
-        handle = ResultHandle(result_id=new_result_id(), cursor=cursor)
+        handle = ResultHandle(
+            result_id=new_result_id(),
+            cursor=cursor,
+            query_id=str(getattr(cursor, "sfqid", "") or "") or None,
+        )
         self._handles[handle.result_id] = handle
         return handle
 

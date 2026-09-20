@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import datetime as dt
+from decimal import Decimal
 from typing import Any
 
 from PySide6.QtCore import (
@@ -17,6 +19,7 @@ from PySide6.QtGui import (
     QAction,
     QColor,
     QFont,
+    QFontDatabase,
     QFontMetrics,
     QGuiApplication,
     QIcon,
@@ -28,6 +31,8 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QMenu,
+    QPlainTextEdit,
+    QSplitter,
     QStyle,
     QStyleOptionHeader,
     QTableView,
@@ -38,7 +43,7 @@ from PySide6.QtWidgets import (
 from snowdesk.config import DEFAULT_ROW_CAP
 from snowdesk.model import ColumnInfo
 from snowdesk.util.export import rows_to_tsv
-from snowdesk.util.formatting import NULL_TEXT, format_cell, format_row_count
+from snowdesk.util.formatting import NULL_TEXT, format_cell, format_row_count, pretty_json
 
 MAX_COLUMN_WIDTH = 420
 NULL_COLOR = QColor("#8a8f98")
@@ -53,6 +58,7 @@ class ResultModel(QAbstractTableModel):
 
     more_requested = Signal()
     cap_reached = Signal()
+    sorted_changed = Signal()
 
     def __init__(
         self,
@@ -71,6 +77,8 @@ class ResultModel(QAbstractTableModel):
         self._row_cap = row_cap
         self._total = total
         self._capped = False
+        self._sorted_column: int | None = None
+        self._sort_order = Qt.SortOrder.AscendingOrder
 
     # -- introspection -----------------------------------------------------
 
@@ -187,6 +195,27 @@ class ResultModel(QAbstractTableModel):
             return
         self._capped = True
         self.cap_reached.emit()
+
+    @property
+    def sorted_column(self) -> int | None:
+        return self._sorted_column
+
+    def sort(self, column: int, order: Qt.SortOrder = Qt.SortOrder.AscendingOrder) -> None:
+        """Sort the rows held in memory (R7).
+
+        Client-side: it orders what has been fetched, not the whole result.
+        The view says so, because a sorted partial result otherwise looks like
+        an ordered answer to a question nobody asked the database.
+        """
+        if not 0 <= column < len(self._columns):
+            return
+        reverse = order == Qt.SortOrder.DescendingOrder
+        self.layoutAboutToBeChanged.emit()
+        self._rows.sort(key=lambda row: _sort_key(row[column]), reverse=reverse)
+        self._sorted_column = column
+        self._sort_order = order
+        self.layoutChanged.emit()
+        self.sorted_changed.emit()
 
     def mark_exhausted(self) -> None:
         self._loading = False
@@ -310,6 +339,15 @@ class ResultView(QWidget):
         # Uniform row heights keep very wide results scrolling smoothly.
         self.table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
         self.table.verticalHeader().setDefaultSectionSize(self.fontMetrics().height() + 8)
+        # Enabling sorting makes Qt sort by the indicator's column straight
+        # away, which would reorder the result before the user asked for
+        # anything.  Clearing the indicator first leaves the rows in the order
+        # Snowflake returned them until a header is clicked.
+        header = self.table.horizontalHeader()
+        header.setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
+        self.table.setSortingEnabled(True)
+        header.setSectionsClickable(True)
+        header.setSortIndicatorShown(True)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_context_menu)
 
@@ -324,17 +362,36 @@ class ResultView(QWidget):
         self.empty_label.setEnabled(False)
         self.empty_label.setVisible(False)
 
+        # A cell can hold a paragraph or a nested JSON document; the grid
+        # shows one line of it, and this shows the rest (R8).
+        self.detail = QPlainTextEdit(self)
+        self.detail.setReadOnly(True)
+        self.detail.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+        self.detail.setPlaceholderText("Select a cell to see its full value.")
+        self.detail.setVisible(False)
+
+        self.splitter = QSplitter(Qt.Orientation.Vertical, self)
+        self.splitter.addWidget(self.table)
+        self.splitter.addWidget(self.detail)
+        self.splitter.setStretchFactor(0, 3)
+        self.splitter.setStretchFactor(1, 1)
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        layout.addWidget(self.table)
+        layout.addWidget(self.splitter)
         layout.addWidget(self.footer)
 
         model.more_requested.connect(lambda: self.more_requested.emit(self.result_id))
         model.cap_reached.connect(self._on_cap_reached)
+        model.sorted_changed.connect(self._refresh_footer)
         model.modelReset.connect(self._refresh_empty_state)
         model.rowsInserted.connect(self._refresh_empty_state)
         self._refresh_empty_state()
+
+        selection = self.table.selectionModel()
+        if selection is not None:
+            selection.currentChanged.connect(lambda *_: self._refresh_detail())
 
         self._add_shortcuts()
         self._size_columns()
@@ -359,6 +416,34 @@ class ResultView(QWidget):
         menu.addAction(self._copy_action)
         menu.addAction(self._copy_headers_action)
         menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    # -- cell detail (R8) --------------------------------------------------
+
+    def set_detail_visible(self, visible: bool) -> None:
+        self.detail.setVisible(visible)
+        if visible:
+            self._refresh_detail()
+
+    def detail_is_visible(self) -> bool:
+        return self.detail.isVisibleTo(self)
+
+    def _refresh_detail(self) -> None:
+        if not self.detail.isVisibleTo(self):
+            return
+        self.detail.setPlainText(self.current_cell_text())
+
+    def current_cell_text(self) -> str:
+        """The focused cell in full: JSON pretty-printed, everything else raw."""
+        index = self.table.currentIndex()
+        if not index.isValid():
+            return ""
+        value = self.model.data(index, Qt.ItemDataRole.UserRole)
+        if value is None:
+            return NULL_TEXT
+        column = self.model.columns[index.column()]
+        if column.is_json:
+            return pretty_json(value)
+        return format_cell(value, column)
 
     def selected_tsv(self, with_headers: bool = False) -> str:
         """Selected cells as TSV; the whole visible result when nothing is selected."""
@@ -387,11 +472,19 @@ class ResultView(QWidget):
             self._size_columns()
 
     def _on_cap_reached(self) -> None:
-        self.footer.setText(
-            f"Row cap reached — {self.model.rowCount():,} rows loaded. "
-            "Export to CSV to get the full result."
-        )
-        self.footer.setVisible(True)
+        self._refresh_footer()
+
+    def _refresh_footer(self) -> None:
+        """Say what the grid is not showing, when it is not showing all of it."""
+        notes: list[str] = []
+        if self.model.capped:
+            notes.append(f"Row cap reached — {self.model.rowCount():,} rows loaded.")
+        if self.model.sorted_column is not None and not self.model.exhausted:
+            notes.append("Sorted over the rows loaded so far, not the whole result.")
+        if notes:
+            notes.append("Export to CSV (⌘E) for the full result.")
+            self.footer.setText(" ".join(notes))
+        self.footer.setVisible(bool(notes))
 
     def _refresh_empty_state(self, *_args: object) -> None:
         empty = self.model.rowCount() == 0 and self.model.exhausted
@@ -415,6 +508,24 @@ class ResultView(QWidget):
             if self.table.columnWidth(i) > MAX_COLUMN_WIDTH:
                 self.table.setColumnWidth(i, MAX_COLUMN_WIDTH)
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+
+
+def _sort_key(value: Any) -> tuple[int, Any]:
+    """Order values of mixed types without comparing across them.
+
+    A column can hold NULLs beside numbers, or strings beside dates.  NULLs
+    sort last in ascending order, and anything not directly comparable falls
+    back to its rendered text rather than raising.
+    """
+    if value is None:
+        return (2, "")
+    if isinstance(value, bool):
+        return (0, int(value))
+    if isinstance(value, (int, float, Decimal)):
+        return (0, value)
+    if isinstance(value, (dt.datetime, dt.date, dt.time)):
+        return (1, value.isoformat())
+    return (1, str(value))
 
 
 def null_display_text() -> str:

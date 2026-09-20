@@ -48,6 +48,7 @@ class EditorTabs(QTabWidget):
         self._untitled_count = 0
         self._paths: dict[SqlEditor, Path | None] = {}
         self._pending_save = False
+        self._font_size: int | None = None
 
         self.setDocumentMode(True)
         self.setTabsClosable(True)
@@ -59,6 +60,14 @@ class EditorTabs(QTabWidget):
         self._autosave.setInterval(AUTOSAVE_INTERVAL_MS)
         self._autosave.timeout.connect(self._autosave_tick)
         self._autosave.start()
+
+    def set_font_size(self, points: int) -> None:
+        """Resize every open tab's font, and any opened afterwards."""
+        self._font_size = points
+        for index in range(self.count()):
+            editor = self.widget(index)
+            if isinstance(editor, SqlEditor):
+                editor.set_font_size(points)
 
     def set_dark(self, dark: bool) -> None:
         """Re-theme every open tab, and any opened afterwards."""
@@ -96,6 +105,8 @@ class EditorTabs(QTabWidget):
         behind inside the tab widget.
         """
         editor = SqlEditor(None, dark=self._dark)
+        if self._font_size is not None:
+            editor.set_font_size(self._font_size)
         editor.setPlainText(text)
         editor.document().setModified(False)
         editor.run_requested.connect(self.run_requested)

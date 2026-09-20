@@ -10,6 +10,7 @@ from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QFileDialog,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -18,6 +19,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPlainTextEdit,
+    QProgressDialog,
     QPushButton,
     QSplitter,
     QStyle,
@@ -35,7 +37,7 @@ from snowdesk.db.worker import ConnectJob, DisconnectJob, ReconnectJob, Snowflak
 from snowdesk.model import ColumnInfo, QueryError, RunStatus, SessionContext, StatementOutcome
 from snowdesk.storage.history import HistoryStore
 from snowdesk.storage.session import SessionStore
-from snowdesk.ui import theme
+from snowdesk.ui import preferences, theme
 from snowdesk.ui.editor import SqlEditor
 from snowdesk.ui.editor_tabs import EditorTabs
 from snowdesk.ui.history_panel import HistoryPanel
@@ -86,6 +88,7 @@ class MainWindow(QMainWindow):
         self.resize(1280, 820)
 
         self._results: dict[str, ResultView] = {}
+        self._export_dialog: QProgressDialog | None = None
         self._context = SessionContext()
         self._connections: dict[str, config.ConnectionInfo] = {}
 
@@ -97,6 +100,7 @@ class MainWindow(QMainWindow):
         self._connect_signals()
 
         self._populate_connections()
+        self._apply_saved_preferences()
         self._set_state(ConnectionState.DISCONNECTED.value, "")
 
     @property
@@ -344,6 +348,7 @@ class MainWindow(QMainWindow):
 
         # Apple's title case capitalises words of four letters or more.
         action("Copy With Headers", "Ctrl+Shift+C", self._copy_with_headers, "&Edit")
+        action("Export to CSV…", "Ctrl+E", self.export_current_result, "&File")
         self._menu("&Edit").addSeparator()
         action("Clear History…", "", self._clear_history, "&Edit")
 
@@ -353,6 +358,18 @@ class MainWindow(QMainWindow):
         self.cancel_action.setEnabled(False)
         self._menu("&Query").addSeparator()
         action("Reconnect", "Ctrl+R", self._reconnect, "&Query")
+
+        action(
+            "Settings…",
+            "Ctrl+,",
+            self.open_preferences,
+            "&Edit",
+            QAction.MenuRole.PreferencesRole,
+        )
+
+        self.detail_action = action("Show Cell Detail", "Ctrl+I", self.toggle_cell_detail, "&View")
+        self.detail_action.setCheckable(True)
+        self._menu("&View").addSeparator()
 
         self._build_appearance_menu()
 
@@ -398,6 +415,39 @@ class MainWindow(QMainWindow):
         """Re-apply SnowDesk's own colours for the appearance now in force."""
         self.editors.set_dark(theme.is_dark())
 
+    def _apply_saved_preferences(self) -> None:
+        """Adopt the stored preferences without re-saving or re-theming.
+
+        The appearance has already been applied before any widget was built.
+        """
+        prefs = preferences.load()
+        self.query.page_size = prefs.page_size
+        self.query.row_cap = prefs.row_cap
+        self.editors.set_font_size(prefs.font_size)
+
+    def open_preferences(self) -> None:
+        """Show the settings sheet and apply whatever comes back (S1)."""
+        chosen = self.ask_preferences()
+        if chosen is not None:
+            self.apply_preferences(chosen)
+
+    def ask_preferences(self) -> preferences.Preferences | None:
+        """Put the settings sheet up. Separate from applying the result, so the
+        applying can be exercised without a modal dialog."""
+        dialog = preferences.PreferencesDialog(self)
+        if dialog.exec() != preferences.PreferencesDialog.DialogCode.Accepted:
+            return None
+        return dialog.values()
+
+    def apply_preferences(self, prefs: preferences.Preferences) -> None:
+        preferences.save(prefs)
+        # Page size and row cap are read when a query runs, so a change lands
+        # on the next run without rebuilding anything that already exists.
+        self.query.page_size = prefs.page_size
+        self.query.row_cap = prefs.row_cap
+        self.editors.set_font_size(prefs.font_size)
+        self.set_appearance(prefs.appearance)
+
     def _show_about(self) -> None:
         QMessageBox.about(
             self,
@@ -431,6 +481,10 @@ class MainWindow(QMainWindow):
         w.rows_appended.connect(self._on_rows_appended)
         w.fetch_failed.connect(self._on_fetch_failed)
         w.worker_error.connect(self._on_worker_error)
+        w.export_progress.connect(self._on_export_progress)
+        w.export_finished.connect(self._on_export_finished)
+        w.export_failed.connect(self._on_export_failed)
+        w.export_cancelled.connect(self._on_export_cancelled)
 
         self.query.run_started.connect(self._on_run_started)
         self.query.run_finished.connect(self._on_run_finished)
@@ -644,6 +698,7 @@ class MainWindow(QMainWindow):
         model.cap_reached.connect(
             lambda: self._set_status_segment(self.rows_label, model.status_text())
         )
+        view.set_detail_visible(getattr(self, "_show_detail", False))
         self._results[result_id] = view
         index = self.result_tabs.insertTab(
             max(0, self.result_tabs.count() - 2), view, f"Result {len(self._results)}"
@@ -688,6 +743,71 @@ class MainWindow(QMainWindow):
         self._set_status_segment(self.rows_label, "")
         self._set_status_segment(self.time_label, "")
         self._set_status_segment(self.qid_label, "")
+
+    # -- export (R6) -------------------------------------------------------
+
+    def export_current_result(self) -> None:
+        """Write the focused result to CSV in full, not just its loaded rows."""
+        view = self.result_tabs.currentWidget()
+        if not isinstance(view, ResultView):
+            self.statusBar().showMessage("Select a result tab to export.", 4000)
+            return
+        chosen = self.ask_export_path()
+        if not chosen:
+            return
+        path = Path(chosen)
+        if path.suffix == "":
+            path = path.with_suffix(".csv")
+
+        self._export_dialog = QProgressDialog("Exporting…", "Cancel", 0, 0, self)
+        self._export_dialog.setWindowTitle("Export to CSV")
+        self._export_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        self._export_dialog.setMinimumDuration(0)
+        self._export_dialog.canceled.connect(self.worker.cancel_export)
+        self._export_dialog.show()
+
+        self.worker.export_csv(view.result_id, str(path), self.query.page_size)
+
+    def ask_export_path(self) -> str:
+        """Where to write the CSV; empty when the user backs out."""
+        chosen, _filter = QFileDialog.getSaveFileName(
+            self, "Export result to CSV", "result.csv", "CSV files (*.csv);;All files (*)"
+        )
+        return chosen
+
+    def _close_export_dialog(self) -> None:
+        dialog = self._export_dialog
+        if dialog is not None:
+            dialog.reset()
+            dialog.deleteLater()
+            self._export_dialog = None
+
+    def _on_export_progress(self, _result_id: str, rows: int) -> None:
+        dialog = self._export_dialog
+        if dialog is not None:
+            dialog.setLabelText(f"Exporting… {rows:,} rows")
+
+    def _on_export_finished(self, _result_id: str, path: str, rows: int) -> None:
+        self._close_export_dialog()
+        noun = "row" if rows == 1 else "rows"
+        self._log_message(f"Exported {rows:,} {noun} to {path}")
+        self.statusBar().showMessage(f"Exported {rows:,} {noun}", 6000)
+
+    def _on_export_failed(self, _result_id: str, message: str) -> None:
+        self._close_export_dialog()
+        self._log_message(f"Export failed: {message}")
+        QMessageBox.warning(self, "Could not export", message)
+
+    def _on_export_cancelled(self, _result_id: str) -> None:
+        self._close_export_dialog()
+        self.statusBar().showMessage("Export cancelled", 4000)
+
+    def toggle_cell_detail(self) -> None:
+        """Show or hide the detail pane on every result tab (R8)."""
+        self._show_detail = not getattr(self, "_show_detail", False)
+        self.detail_action.setChecked(self._show_detail)
+        for view in self._results.values():
+            view.set_detail_visible(self._show_detail)
 
     def _copy_with_headers(self) -> None:
         view = self.result_tabs.currentWidget()

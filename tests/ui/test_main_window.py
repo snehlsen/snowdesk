@@ -16,7 +16,7 @@ from snowdesk.db.session import ConnectParams, SnowflakeSession
 from snowdesk.db.worker import ConnectJob, SnowflakeWorker
 from snowdesk.storage.history import HistoryStore
 from snowdesk.storage.session import SessionStore
-from snowdesk.ui import theme
+from snowdesk.ui import preferences, theme
 from snowdesk.ui.editor import SqlEditor
 from snowdesk.ui.editor_tabs import SaveAnswer
 from snowdesk.ui.main_window import CONTROL_SPACING, WINDOW_MARGIN, MainWindow
@@ -411,6 +411,8 @@ def test_every_action_survives_the_checked_argument(harness: Harness, monkeypatc
         harness.window.editors, "ask_save_changes", lambda _name: SaveAnswer.DONT_SAVE
     )
     monkeypatch.setattr(harness.window, "confirm_clear_history", lambda: False)
+    monkeypatch.setattr(harness.window, "ask_preferences", lambda: None)
+    monkeypatch.setattr(harness.window, "ask_export_path", lambda: "")
 
     escaped: list[str] = []
     monkeypatch.setattr(
@@ -760,7 +762,9 @@ def appearance_menu(window) -> list[str]:
         for act in window.menuBar().actions()
         if act.menu() is not None and act.menu().title().replace("&", "") == "View"
     )
-    submenu = view.actions()[0].menu()
+    submenu = next(
+        a.menu() for a in view.actions() if a.menu() is not None and a.text() == "Appearance"
+    )
     return [a.text() for a in submenu.actions()]
 
 
@@ -830,3 +834,74 @@ def test_status_dividers_hide_with_their_segment(harness: Harness) -> None:
         assert not any(d.isVisible() for d in window._status_dividers.values())
     finally:
         window.hide()
+
+
+# -- export, preferences, detail (M6) ---------------------------------------
+
+
+def test_export_streams_the_whole_result_by_query_id(
+    harness: Harness, tmp_path, monkeypatch
+) -> None:
+    connect(harness)
+    window = harness.window
+    harness.conn.plan["from orders"] = FakeStatement(columns=COLS, rows=[(i,) for i in range(900)])
+    window.editor.setPlainText("select * from orders")
+    window.run_all()
+    harness.drain()
+    assert window.result_tabs.currentWidget().model.rowCount() == 500  # grid holds a page
+
+    target = tmp_path / "out.csv"
+    monkeypatch.setattr(window, "ask_export_path", lambda: str(target))
+    window.export_current_result()
+    harness.worker._export_pool.shutdown(wait=True)
+    harness.window.worker.export_finished.emit("", str(target), 900)
+
+    # The export re-read the result rather than draining the grid's cursor.
+    assert any("RESULT_SCAN" in sql.upper() for sql in harness.conn.executed)
+    assert window.result_tabs.currentWidget().model.rowCount() == 500
+
+
+def test_export_without_a_result_tab_says_so(harness: Harness) -> None:
+    harness.window.result_tabs.setCurrentWidget(harness.window.messages)
+    harness.window.export_current_result()
+    assert "result tab" in harness.window.statusBar().currentMessage()
+
+
+def test_applying_preferences_takes_effect_on_the_next_run(harness: Harness) -> None:
+    window = harness.window
+    window.apply_preferences(
+        preferences.Preferences(
+            page_size=125, row_cap=4_000, font_size=17, appearance=theme.Appearance.SYSTEM
+        )
+    )
+    assert window.query.page_size == 125
+    assert window.query.row_cap == 4_000
+    assert window.editor.font().pointSize() == 17
+    assert preferences.load().page_size == 125
+
+
+def test_a_new_tab_inherits_the_font_size(harness: Harness) -> None:
+    window = harness.window
+    window.apply_preferences(
+        preferences.Preferences(
+            page_size=500, row_cap=100_000, font_size=18, appearance=theme.Appearance.SYSTEM
+        )
+    )
+    assert window.editors.new_tab().font().pointSize() == 18
+
+
+def test_the_detail_pane_toggles_across_result_tabs(harness: Harness) -> None:
+    connect(harness)
+    window = harness.window
+    window.editor.setPlainText("select * from orders")
+    window.run_all()
+    harness.drain()
+    view = window.result_tabs.currentWidget()
+    assert not view.detail_is_visible()
+
+    window.toggle_cell_detail()
+    assert view.detail_is_visible()
+    assert window.detail_action.isChecked()
+
+    window.toggle_cell_detail()
+    assert not view.detail_is_visible()
