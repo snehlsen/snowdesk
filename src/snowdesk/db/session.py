@@ -7,6 +7,7 @@ is owned by the worker thread and must not be touched from the UI thread.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -17,6 +18,21 @@ from snowdesk.model import SessionContext
 log = logging.getLogger(__name__)
 
 QUERY_TAG = "snowdesk"
+
+#: At login the connector fingerprints the environment to see whether it is
+#: running on a cloud platform whose workload identity it could authenticate
+#: with, and reports what it finds to Snowflake.  The AWS probe builds an STS
+#: client, so botocore resolves whatever credentials it can find (hence the
+#: "Found credentials in shared credentials file" line in the log) and calls
+#: AWS with them on every connect.  SnowDesk promises no telemetry (spec 5),
+#: so this is turned off -- but only as a default, so anyone who deliberately
+#: sets the variable still gets what they asked for.
+DISABLE_PLATFORM_DETECTION_VAR = "SNOWFLAKE_DISABLE_PLATFORM_DETECTION"
+
+
+def disable_platform_detection() -> None:
+    """Opt out of the connector's platform fingerprinting, unless overridden."""
+    os.environ.setdefault(DISABLE_PLATFORM_DETECTION_VAR, "true")
 
 
 class ConnectionState(StrEnum):
@@ -55,6 +71,8 @@ class ConnectParams:
 
 def _default_connect(params: ConnectParams) -> Connection:
     import snowflake.connector
+
+    disable_platform_detection()
 
     overrides = {
         key: value

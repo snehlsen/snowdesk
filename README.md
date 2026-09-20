@@ -69,6 +69,19 @@ Editor tabs are autosaved every few seconds to
 a relaunch. A tab backed by an unmodified file stores only its path and is
 re-read from disk, so editing a file outside SnowDesk is picked up.
 
+## Logging and privacy
+
+Logs go to `~/Library/Logs/SnowDesk/snowdesk.log`. Only SnowDesk's own records
+are kept at INFO; the connector and the boto3 and urllib3 it depends on are
+pinned to WARNING, since an ordinary connect writes several lines about
+credential lookups and HTTP pools. Run with `--verbose` to see everything,
+which is what you want when diagnosing connector trouble.
+
+SnowDesk also opts out of the connector's platform detection, which otherwise
+probes cloud metadata endpoints and calls AWS STS with whatever credentials it
+finds, then reports the result to Snowflake at login. Setting
+`SNOWFLAKE_DISABLE_PLATFORM_DETECTION` yourself overrides this either way.
+
 ## Development
 
 ```

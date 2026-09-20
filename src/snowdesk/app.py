@@ -22,12 +22,20 @@ from snowdesk.ui.main_window import MainWindow
 log = logging.getLogger(__name__)
 
 
-def setup_logging(level: int = logging.INFO) -> None:
-    """Log to ``~/Library/Logs/SnowDesk/snowdesk.log`` plus stderr (spec 9)."""
+def setup_logging(level: int = logging.INFO, verbose: bool = False) -> None:
+    """Log to ``~/Library/Logs/SnowDesk/snowdesk.log`` plus stderr (spec 9).
+
+    Only SnowDesk's own records are kept at ``level``.  The connector, and the
+    boto3 and urllib3 it pulls in, are chatty at INFO -- an ordinary connect
+    writes several lines about credential lookups and HTTP pools -- which
+    buries the records that say what SnowDesk did.  ``verbose`` opens
+    everything up to DEBUG for diagnosing connector trouble.
+    """
     root = logging.getLogger()
     if root.handlers:
         return
-    root.setLevel(level)
+    root.setLevel(logging.DEBUG if verbose else logging.WARNING)
+    logging.getLogger(__name__.split(".")[0]).setLevel(logging.DEBUG if verbose else level)
     fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
 
     try:
@@ -113,9 +121,14 @@ def main(argv: list[str] | None = None) -> int:
         metavar="NAME",
         help="with --selftest, also connect and read CURRENT_VERSION()",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="log everything, including the connector's own output",
+    )
     parsed, _unknown = parser.parse_known_args(args)
 
-    setup_logging()
+    setup_logging(verbose=parsed.verbose)
     if parsed.selftest:
         from snowdesk.selftest import run_selftest
 
