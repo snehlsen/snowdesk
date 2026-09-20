@@ -36,13 +36,16 @@ version are tightened the next time the app starts.
 
 ## Status
 
-All **P0** requirements from the spec are implemented, plus milestones M0-M6.
+All **P0** requirements from the spec are implemented, along with milestones
+M0-M6. M7 is partly done: a dropped session is detected and recoverable, and
+logging is in place; the manual checklist, the first real run of the
+integration tests, and signing and notarization are not.
 
 | Area | Done | Not yet |
 |------|------|---------|
 | Connections | C1-C6 | C7 role/warehouse override, C8 edit connections |
 | Query execution | Q1-Q6, Q7 (`QUERY_TAG`), Q8 (tab per result) | Q9 Snowsight link |
-| Results | R1-R8 | R7 filtering (sort only), R9 Parquet/XLSX |
+| Results | R1-R6, R7 sort, R8 | R7 filtering, R9 Parquet/XLSX |
 | Object browser | B1-B5 | — |
 | Editor | E1, E2, E3 | E4 autocompletion |
 | History | H1, H2 | — |
@@ -56,10 +59,11 @@ All **P0** requirements from the spec are implemented, plus milestones M0-M6.
 | ⌘. | cancel the running statement, server-side |
 | ⌘T / ⌘W | new editor tab / close tab |
 | ⌘O / ⌘S / ⌘⇧S | open a `.sql` file / save / save as |
-| ⌘⇧C | copy selected cells with headers |
+| ⌘C / ⌘⇧C | copy selected cells / copy with headers |
 | ⌘E | export the full result to CSV |
 | ⌘I | show or hide the cell detail pane |
 | ⌘, | settings |
+| ⌘R | reconnect |
 
 Clicking a column header sorts the rows currently loaded. That is a
 client-side sort, not a re-query, so the grid says as much whenever the result
