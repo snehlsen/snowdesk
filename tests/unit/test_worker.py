@@ -6,7 +6,14 @@ import pytest
 
 from snowdesk.db.session import ConnectParams, SnowflakeSession
 from snowdesk.db.splitter import split_sql
-from snowdesk.db.worker import BrowseJob, ConnectJob, FetchMoreJob, RunScriptJob, SnowflakeWorker
+from snowdesk.db.worker import (
+    BrowseJob,
+    ConnectJob,
+    FetchMoreJob,
+    ProfileJob,
+    RunScriptJob,
+    SnowflakeWorker,
+)
 from snowdesk.model import RunStatus
 from tests.fakes import FakeConnection, FakeProgrammingError, FakeStatement
 
@@ -62,7 +69,7 @@ def test_run_emits_first_page_then_fetches_more(worker_and_conn) -> None:
     appended = collect(worker.rows_appended)
 
     worker._dispatch(RunScriptJob(statements=split_sql("select * from t"), page_size=500))
-    result_id, columns, rows, exhausted, total = results[0]
+    result_id, columns, rows, exhausted, total, _qid, _label = results[0]
     assert len(rows) == 500
     assert not exhausted
     assert [c.name for c in columns] == ["N"]
@@ -129,7 +136,7 @@ def test_select_opens_a_result_tab(worker_and_conn) -> None:
     results = collect(worker.result_ready)
     worker._dispatch(RunScriptJob(statements=split_sql("select 1 as n")))
     assert len(results) == 1
-    result_id, columns, rows, exhausted, _total = results[0]
+    result_id, columns, rows, exhausted, _total, _qid, _label = results[0]
     assert [c.name for c in columns] == ["N"]
     assert rows == [(1,)]
     assert exhausted
@@ -245,3 +252,93 @@ def test_run_without_connection_is_reported(qapp) -> None:
     errors = collect(worker.worker_error)
     worker._dispatch(RunScriptJob(statements=split_sql("select 1")))
     assert errors == ["Not connected."]
+
+
+# --------------------------------------------------------------------------
+# Query profile
+# --------------------------------------------------------------------------
+
+PROFILE_COLS = [
+    ("STEP_ID", 0, None, None, 38, 0, False),
+    ("OPERATOR_ID", 0, None, None, 38, 0, False),
+    ("OPERATOR_TYPE", 2, None, None, None, None, False),
+]
+QID = "01b8e0f5-0000-d7a5-0000-a3bd0003e0ba"
+
+
+@pytest.mark.parametrize(
+    "worker_and_conn",
+    [
+        {
+            "GET_QUERY_OPERATOR_STATS": FakeStatement(
+                columns=PROFILE_COLS, rows=[(1, 0, "Result"), (1, 1, "TableScan")]
+            )
+        }
+    ],
+    indirect=True,
+)
+def test_profile_opens_a_labelled_tab_for_the_profiled_query(worker_and_conn) -> None:
+    worker, conn = worker_and_conn
+    results = collect(worker.result_ready)
+
+    worker._dispatch(ProfileJob(query_id=QID))
+
+    assert f"GET_QUERY_OPERATOR_STATS('{QID}')" in conn.executed[-1]
+    _result_id, columns, rows, exhausted, _total, query_id, label = results[0]
+    assert [c.name for c in columns] == ["STEP_ID", "OPERATOR_ID", "OPERATOR_TYPE"]
+    assert len(rows) == 2
+    assert exhausted
+    # The tab carries the profiled query, not the stats call that filled it.
+    assert query_id == QID
+    assert label == "Profile · 01b8e0f5"
+
+
+@pytest.mark.parametrize(
+    "worker_and_conn",
+    [{"GET_QUERY_OPERATOR_STATS": FakeStatement(columns=PROFILE_COLS, rows=[])}],
+    indirect=True,
+)
+def test_profile_without_operator_stats_explains_itself(worker_and_conn) -> None:
+    worker, _conn = worker_and_conn
+    results = collect(worker.result_ready)
+    empty = collect(worker.profile_empty)
+
+    worker._dispatch(ProfileJob(query_id=QID))
+
+    assert empty == [QID]
+    assert results == []  # an empty grid would say nothing about why
+    assert len(worker.results) == 0  # and its cursor is not left open
+
+
+@pytest.mark.parametrize(
+    "worker_and_conn",
+    [
+        {
+            "GET_QUERY_OPERATOR_STATS": FakeStatement(
+                error=FakeProgrammingError("Query not found", errno=709)
+            )
+        }
+    ],
+    indirect=True,
+)
+def test_profile_failure_is_reported_against_the_query_id(worker_and_conn) -> None:
+    worker, _conn = worker_and_conn
+    failures = collect(worker.profile_failed)
+    worker._dispatch(ProfileJob(query_id=QID))
+    assert failures[0][0] == QID
+    assert "Query not found" in failures[0][1]
+
+
+def test_profile_rejects_a_value_that_is_not_a_query_id(worker_and_conn) -> None:
+    worker, conn = worker_and_conn
+    failures = collect(worker.profile_failed)
+    worker._dispatch(ProfileJob(query_id="select 1"))
+    assert "not a Snowflake query id" in failures[0][1]
+    assert not any("GET_QUERY_OPERATOR_STATS" in sql for sql in conn.executed)
+
+
+def test_profile_without_a_connection_says_so(qapp) -> None:
+    worker = SnowflakeWorker(session=SnowflakeSession(connect_fn=lambda _p: FakeConnection()))
+    failures = collect(worker.profile_failed)
+    worker._dispatch(ProfileJob(query_id=QID))
+    assert failures[0] == (QID, "Not connected.")

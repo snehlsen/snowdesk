@@ -44,7 +44,7 @@ integration tests, and signing and notarization are not.
 | Area | Done | Not yet |
 |------|------|---------|
 | Connections | C1-C6 | C7 role/warehouse override, C8 edit connections |
-| Query execution | Q1-Q6, Q7 (`QUERY_TAG`), Q8 (tab per result) | Q9 Snowsight link |
+| Query execution | Q1-Q6, Q7 (`QUERY_TAG`), Q8 (tab per result), query profile | Q9 Snowsight link |
 | Results | R1-R6, R7 sort, R8 | R7 filtering, R9 Parquet/XLSX |
 | Object browser | B1-B5 | — |
 | Editor | E1, E2, E3 | E4 autocompletion |
@@ -62,8 +62,31 @@ integration tests, and signing and notarization are not.
 | ⌘C / ⌘⇧C | copy selected cells / copy with headers |
 | ⌘E | export the full result to CSV |
 | ⌘I | show or hide the cell detail pane |
+| ⌘⇧P | query profile for the focused result |
 | ⌘, | settings |
 | ⌘R | reconnect |
+
+### Query profiles
+
+⌘⇧P opens `GET_QUERY_OPERATOR_STATS` for the focused result in its own tab,
+and Query ▸ Copy Query ID copies that result's query ID. The History tab's
+context menu offers both for any statement it has recorded, which is where to
+go once a run has closed the result tabs.
+
+Both work from the query ID SnowDesk recorded when it ran the statement, and
+that matters: statements go through `execute_async`, and the connector reads
+their results back with `select * from table(result_scan('<id>'))` on the same
+session. That wrapper is the session's *last* query, so `LAST_QUERY_ID()` and
+the newest row of `QUERY_HISTORY` both point at it rather than at the statement
+you ran, and profiling it shows a single RESULT_SCAN over a cached result. Use
+the recorded ID — from the status bar, these menu items, or the `query_id`
+column in `history.db` — not `LAST_QUERY_ID()`.
+
+A query can also legitimately have no profile at all: Snowflake keeps operator
+statistics only for queries that did work on a warehouse, so result-cache hits,
+metadata-only queries, `SHOW`, DDL and statements that failed before execution
+have none, and statistics are dropped after 14 days. SnowDesk says so in
+Messages rather than opening an empty grid.
 
 Clicking a column header sorts the rows currently loaded. That is a
 client-side sort, not a re-query, so the grid says as much whenever the result

@@ -316,6 +316,7 @@ class ResultView(QWidget):
     """A result tab: the grid plus its footer notice."""
 
     more_requested = Signal(str)  # result id
+    profile_requested = Signal(str)  # query id
 
     def __init__(
         self,
@@ -323,11 +324,16 @@ class ResultView(QWidget):
         model: ResultModel,
         parent: QWidget | None = None,
         escape_formulas: bool = True,
+        query_id: str = "",
     ) -> None:
         super().__init__(parent)
         self.result_id = result_id
         self.model = model
         self._escape_formulas = escape_formulas
+        #: The query that produced these rows, kept because it is the only
+        #: reliable way back to this result's profile: the session's last query
+        #: is the connector's RESULT_SCAN, not this one (see snowdesk.db.profile).
+        self.query_id = query_id or ""
 
         self.table = QTableView(self)
         self.table.setModel(model)
@@ -413,11 +419,45 @@ class ResultView(QWidget):
         self._copy_action = copy
         self._copy_headers_action = copy_headers
 
+        # No shortcuts of their own: the window carries those, so pressing one
+        # over the grid is not an ambiguous overload.
+        self._copy_qid_action = QAction("Copy Query ID", self)
+        self._copy_qid_action.triggered.connect(lambda: self.copy_query_id())
+        self._profile_action = QAction("Query Profile", self)
+        self._profile_action.triggered.connect(lambda: self.request_profile())
+        self._refresh_query_actions()
+
     def _show_context_menu(self, pos: Any) -> None:
         menu = QMenu(self)
         menu.addAction(self._copy_action)
         menu.addAction(self._copy_headers_action)
+        menu.addSeparator()
+        menu.addAction(self._copy_qid_action)
+        menu.addAction(self._profile_action)
         menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    # -- the query behind the grid ----------------------------------------
+
+    def set_query_id(self, query_id: str) -> None:
+        self.query_id = query_id or ""
+        self._refresh_query_actions()
+
+    def _refresh_query_actions(self) -> None:
+        for action in (self._copy_qid_action, self._profile_action):
+            action.setEnabled(bool(self.query_id))
+
+    def copy_query_id(self) -> bool:
+        """Put this result's query id on the clipboard; False if there is none."""
+        if not self.query_id:
+            return False
+        QGuiApplication.clipboard().setText(self.query_id)
+        return True
+
+    def request_profile(self) -> bool:
+        if not self.query_id:
+            return False
+        self.profile_requested.emit(self.query_id)
+        return True
 
     # -- cell detail (R8) --------------------------------------------------
 

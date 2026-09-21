@@ -22,6 +22,7 @@ from PySide6.QtCore import QObject, Signal
 from snowdesk.config import DEFAULT_PAGE_SIZE
 from snowdesk.db import browser as browse
 from snowdesk.db import export as csv_export
+from snowdesk.db import profile
 from snowdesk.db.errors import (
     is_bad_private_key_passphrase,
     is_session_lost,
@@ -74,6 +75,14 @@ class CloseResultJob:
 
 
 @dataclass(slots=True)
+class ProfileJob:
+    """Read the operator statistics for one query id (spec 7.4)."""
+
+    query_id: str
+    page_size: int = DEFAULT_PAGE_SIZE
+
+
+@dataclass(slots=True)
 class BrowseJob:
     #: Path into the tree: () = databases, (db,) = schemas,
     #: (db, schema) = objects, (db, schema, table) = columns.
@@ -92,6 +101,7 @@ Job = (
     | RunScriptJob
     | FetchMoreJob
     | CloseResultJob
+    | ProfileJob
     | BrowseJob
     | ShutdownJob
 )
@@ -121,9 +131,14 @@ class SnowflakeWorker(QObject):
     statement_finished = Signal(object)  # StatementOutcome
     script_finished = Signal(object)  # list[StatementOutcome]
 
-    result_ready = Signal(str, object, object, bool, object)  # id, cols, rows, done, total
+    # id, cols, rows, done, total, query id, tab label ('' = number it)
+    result_ready = Signal(str, object, object, bool, object, str, str)
     rows_appended = Signal(str, object, bool)  # id, rows, exhausted
     fetch_failed = Signal(str, str)  # result id, message
+
+    #: The profiled query ran but Snowflake kept no operator stats for it.
+    profile_empty = Signal(str)  # query id
+    profile_failed = Signal(str, str)  # query id, message
 
     export_progress = Signal(str, int)  # result id, rows written
     export_finished = Signal(str, str, int)  # result id, path, rows
@@ -281,6 +296,8 @@ class SnowflakeWorker(QObject):
             self._fetch_more(job)
         elif isinstance(job, CloseResultJob):
             self.results.close(job.result_id)
+        elif isinstance(job, ProfileJob):
+            self._profile(job)
         elif isinstance(job, BrowseJob):
             self._browse(job)
 
@@ -474,7 +491,7 @@ class SnowflakeWorker(QObject):
             )
 
         self.result_ready.emit(
-            handle.result_id, handle.columns, rows, handle.exhausted, handle.total
+            handle.result_id, handle.columns, rows, handle.exhausted, handle.total, qid or "", ""
         )
         return StatementOutcome(
             index=index,
@@ -504,6 +521,57 @@ class SnowflakeWorker(QObject):
             self.fetch_failed.emit(job.result_id, to_query_error(exc).formatted())
             return
         self.rows_appended.emit(job.result_id, rows, handle.exhausted)
+
+    # -- query profile ----------------------------------------------------
+
+    def _profile(self, job: ProfileJob) -> None:
+        """Open the operator statistics for ``job.query_id`` as a result tab.
+
+        Run synchronously, like the browser's ``SHOW``: a profile is a few
+        dozen rows and putting it through the async path would take over the
+        runner that the statement being profiled may still be using.
+        """
+        qid = job.query_id.strip()
+        if not self.session.is_connected:
+            self.profile_failed.emit(qid, "Not connected.")
+            return
+        if not profile.is_query_id(qid):
+            self.profile_failed.emit(qid, f"{qid or '(empty)'} is not a Snowflake query id.")
+            return
+        try:
+            cursor = self.session.connection.cursor()
+            cursor.execute(profile.profile_sql(qid))
+        except Exception as exc:
+            self._note_failure(exc)
+            log.warning("Could not read the profile for %s", qid, exc_info=True)
+            self.profile_failed.emit(qid, to_query_error(exc).formatted())
+            return
+
+        handle = self.results.register(cursor)
+        try:
+            rows = handle.fetch(job.page_size)
+        except Exception as exc:
+            self.results.close(handle.result_id)
+            self._note_failure(exc)
+            self.profile_failed.emit(qid, to_query_error(exc).formatted())
+            return
+        if not rows:
+            self.results.close(handle.result_id)
+            self.profile_empty.emit(qid)
+            return
+
+        # The tab carries the *profiled* query's id, not the id of the
+        # GET_QUERY_OPERATOR_STATS call that filled it: the profiled query is
+        # the one worth copying out of here.
+        self.result_ready.emit(
+            handle.result_id,
+            handle.columns,
+            rows,
+            handle.exhausted,
+            handle.total,
+            qid,
+            f"Profile · {profile.short_id(qid)}",
+        )
 
     # -- object browser ---------------------------------------------------
 

@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import datetime as dt
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QPoint, Qt, Signal
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QHBoxLayout,
     QHeaderView,
     QLineEdit,
+    QMenu,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -24,9 +26,15 @@ _COLUMNS = ["When", "Status", "Duration", "Rows", "Statement"]
 
 
 class HistoryPanel(QWidget):
-    """Searchable list of executed statements; double-click loads one."""
+    """Searchable list of executed statements; double-click loads one.
+
+    It is also where a query id outlives its result tab, which the next run
+    closes -- so profiling a query you ran a while ago starts here.
+    """
 
     statement_chosen = Signal(str)
+    profile_requested = Signal(str)  # query id
+    status_message = Signal(str)
 
     def __init__(self, store: HistoryStore, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -49,6 +57,8 @@ class HistoryPanel(QWidget):
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(len(_COLUMNS) - 1, QHeaderView.ResizeMode.Stretch)
         self.table.cellDoubleClicked.connect(self._on_double_click)
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._show_context_menu)
 
         top = QHBoxLayout()
         top.setContentsMargins(6, 6, 6, 0)
@@ -89,5 +99,35 @@ class HistoryPanel(QWidget):
         header.setSectionResizeMode(len(_COLUMNS) - 1, QHeaderView.ResizeMode.Stretch)
 
     def _on_double_click(self, row: int, _col: int) -> None:
+        entry = self.entry_at(row)
+        if entry is not None:
+            self.statement_chosen.emit(entry.sql)
+
+    # -- per-row actions ---------------------------------------------------
+
+    def entry_at(self, row: int) -> HistoryEntry | None:
         if 0 <= row < len(self._entries):
-            self.statement_chosen.emit(self._entries[row].sql)
+            return self._entries[row]
+        return None
+
+    def _show_context_menu(self, pos: QPoint) -> None:
+        index = self.table.indexAt(pos)
+        entry = self.entry_at(index.row()) if index.isValid() else None
+        if entry is None:
+            return
+        menu = QMenu(self)
+        load = menu.addAction("Load Statement")
+        menu.addSeparator()
+        copy_qid = menu.addAction("Copy Query ID")
+        profile = menu.addAction("Query Profile")
+        # A cancelled statement, or one that never reached Snowflake, has no id.
+        for act in (copy_qid, profile):
+            act.setEnabled(bool(entry.query_id))
+        chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
+        if chosen is load:
+            self.statement_chosen.emit(entry.sql)
+        elif chosen is copy_qid and entry.query_id:
+            QGuiApplication.clipboard().setText(entry.query_id)
+            self.status_message.emit(f"Copied query ID {entry.query_id}")
+        elif chosen is profile and entry.query_id:
+            self.profile_requested.emit(entry.query_id)
