@@ -951,3 +951,154 @@ def test_the_detail_pane_toggles_across_result_tabs(harness: Harness) -> None:
 
     window.toggle_cell_detail()
     assert not view.detail_is_visible()
+
+
+# -- query profile ----------------------------------------------------------
+
+PROFILE_COLS = [
+    ("STEP_ID", 0, None, None, 38, 0, False),
+    ("OPERATOR_ID", 0, None, None, 38, 0, False),
+    ("OPERATOR_TYPE", 2, None, None, None, None, False),
+]
+
+
+def run_a_query(harness: Harness, sql: str = "select * from orders") -> ResultView:
+    connect(harness)
+    harness.window.editor.setPlainText(sql)
+    harness.window.run_all()
+    harness.drain()
+    return harness.window.result_tabs.currentWidget()
+
+
+def plan_profile(harness: Harness, rows: list[tuple]) -> None:
+    harness.conn.plan["GET_QUERY_OPERATOR_STATS"] = FakeStatement(columns=PROFILE_COLS, rows=rows)
+
+
+def test_a_result_tab_remembers_the_query_that_filled_it(harness: Harness) -> None:
+    view = run_a_query(harness)
+    assert view.query_id == "01b0-0001"
+
+
+def test_copy_query_id_puts_the_real_id_on_the_clipboard(harness: Harness) -> None:
+    from PySide6.QtGui import QGuiApplication
+
+    run_a_query(harness)
+    harness.window.copy_current_query_id()
+    assert QGuiApplication.clipboard().text() == "01b0-0001"
+    assert "01b0-0001" in harness.window.statusBar().currentMessage()
+
+
+def test_profile_asks_for_the_statements_own_id_not_the_last_query(harness: Harness) -> None:
+    """The connector's RESULT_SCAN wrapper is the session's last query.
+
+    Profiling by LAST_QUERY_ID() would land on that wrapper, so the statement's
+    own id has to be the one that goes into GET_QUERY_OPERATOR_STATS.
+    """
+    view = run_a_query(harness)
+    plan_profile(harness, [(1, 0, "Result"), (1, 1, "TableScan")])
+
+    harness.window.profile_current_query()
+    harness.drain()
+
+    assert f"GET_QUERY_OPERATOR_STATS('{view.query_id}')" in harness.conn.executed[-1]
+    assert "LAST_QUERY_ID" not in " ".join(harness.conn.executed)
+
+    profile_tab = harness.window.result_tabs.currentWidget()
+    assert isinstance(profile_tab, ResultView)
+    assert profile_tab.model.rowCount() == 2
+    index = harness.window.result_tabs.indexOf(profile_tab)
+    assert harness.window.result_tabs.tabText(index) == "Profile · 01b0"
+    # The profiled query stays copyable from its own profile tab.
+    assert profile_tab.query_id == view.query_id
+
+
+def test_a_profile_tab_does_not_renumber_the_result_tabs(harness: Harness) -> None:
+    run_a_query(harness)
+    plan_profile(harness, [(1, 0, "Result")])
+    harness.window.profile_current_query()
+    harness.drain()
+
+    tabs = harness.window.result_tabs
+    titles = [tabs.tabText(i) for i in range(tabs.count())]
+    assert titles.count("Result 1") == 1
+    assert "Result 2" not in titles
+
+
+def test_an_empty_profile_says_why_instead_of_showing_a_blank_grid(harness: Harness) -> None:
+    run_a_query(harness)
+    plan_profile(harness, [])
+
+    harness.window.profile_current_query()
+    harness.drain()
+
+    messages = harness.window.messages.toPlainText()
+    assert "No operator statistics for 01b0-0001" in messages
+    assert "result-cache hit" in messages
+    assert harness.window.result_tabs.currentWidget() is harness.window.messages
+
+
+def test_a_failed_profile_is_reported_in_messages(harness: Harness) -> None:
+    run_a_query(harness)
+    harness.conn.plan["GET_QUERY_OPERATOR_STATS"] = FakeStatement(
+        error=FakeProgrammingError("Query not found", errno=709)
+    )
+
+    harness.window.profile_current_query()
+    harness.drain()
+
+    assert "Could not read the profile for 01b0-0001" in harness.window.messages.toPlainText()
+
+
+def test_a_statement_with_no_grid_is_still_profilable(harness: Harness) -> None:
+    """DDL and DML get a status line, not a result tab -- and still a query id."""
+    connect(harness)
+    harness.conn.plan["create table"] = FakeStatement(
+        columns=[("status", 2, None, None, None, None, True)],
+        rows=[("Table T successfully created.",)],
+    )
+    harness.window.editor.setPlainText("create table t (a int)")
+    harness.window.run_all()
+    harness.drain()
+    assert not isinstance(harness.window.result_tabs.currentWidget(), ResultView)
+
+    plan_profile(harness, [(1, 0, "DDL")])
+    harness.window.profile_current_query()
+    harness.drain()
+    assert "GET_QUERY_OPERATOR_STATS('01b0-0001')" in harness.conn.executed[-1]
+
+
+def test_profiling_with_nothing_to_profile_just_says_so(harness: Harness) -> None:
+    connect(harness)
+    harness.window.profile_current_query()
+    harness.drain()
+    assert "No query to profile yet" in harness.window.statusBar().currentMessage()
+    assert not any("GET_QUERY_OPERATOR_STATS" in sql for sql in harness.conn.executed)
+
+
+def test_history_can_profile_a_query_whose_tab_is_gone(harness: Harness) -> None:
+    """The next run closes every result tab; history is what outlives it."""
+    run_a_query(harness)
+    harness.window.editor.setPlainText("select 1")
+    harness.window.run_all()
+    harness.drain()
+
+    entry = next(e for e in harness.window.history_panel._entries if "orders" in e.sql)
+    plan_profile(harness, [(1, 0, "Result")])
+    harness.window.history_panel.profile_requested.emit(entry.query_id)
+    harness.drain()
+
+    assert f"GET_QUERY_OPERATOR_STATS('{entry.query_id}')" in harness.conn.executed[-1]
+
+
+def test_the_profile_shortcut_is_bound_exactly_once(harness: Harness) -> None:
+    """Only the window carries ⌘⇧P.
+
+    A second action on the result grid with the same key would make Qt refuse
+    both as an ambiguous overload, so the grid's copies are menu-only.
+    """
+    view = run_a_query(harness)
+    window_bound = [
+        a for a in harness.window.actions() if a.shortcut().toString() == "Ctrl+Shift+P"
+    ]
+    assert [a.text() for a in window_bound] == ["Query Profile"]
+    assert all(a.shortcut().isEmpty() for a in (view._profile_action, view._copy_qid_action))

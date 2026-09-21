@@ -101,3 +101,24 @@ def test_view_forwards_fetch_requests_with_its_id(qtbot) -> None:
     with qtbot.waitSignal(view.more_requested, timeout=500) as blocker:
         m.fetchMore(QModelIndex())
     assert blocker.args == ["r42"]
+
+
+def test_query_actions_are_off_until_the_view_has_a_query_id(qtbot) -> None:
+    view = ResultView("r1", model())
+    qtbot.addWidget(view)
+    assert not view._copy_qid_action.isEnabled()
+    assert not view._profile_action.isEnabled()
+    assert view.copy_query_id() is False
+    assert view.request_profile() is False
+
+    view.set_query_id("01b0-0001")
+    assert view._copy_qid_action.isEnabled()
+    assert view._profile_action.isEnabled()
+
+
+def test_view_asks_for_the_profile_of_its_own_query(qtbot) -> None:
+    view = ResultView("r1", model(), query_id="01b0-0007")
+    qtbot.addWidget(view)
+    with qtbot.waitSignal(view.profile_requested, timeout=500) as blocker:
+        view.request_profile()
+    assert blocker.args == ["01b0-0007"]

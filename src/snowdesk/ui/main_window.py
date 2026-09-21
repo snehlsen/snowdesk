@@ -32,8 +32,15 @@ from PySide6.QtWidgets import (
 from snowdesk import __version__, config
 from snowdesk.controllers.browser import BrowserController
 from snowdesk.controllers.query import QueryController
+from snowdesk.db import profile
 from snowdesk.db.session import ConnectionState, ConnectParams
-from snowdesk.db.worker import ConnectJob, DisconnectJob, ReconnectJob, SnowflakeWorker
+from snowdesk.db.worker import (
+    ConnectJob,
+    DisconnectJob,
+    ProfileJob,
+    ReconnectJob,
+    SnowflakeWorker,
+)
 from snowdesk.model import ColumnInfo, QueryError, RunStatus, SessionContext, StatementOutcome
 from snowdesk.storage.history import HistoryStore
 from snowdesk.storage.session import SessionStore
@@ -89,6 +96,12 @@ class MainWindow(QMainWindow):
         self.resize(1280, 820)
 
         self._results: dict[str, ResultView] = {}
+        #: Numbers the "Result N" tabs; profile tabs carry their own label and
+        #: are left out of the count.
+        self._result_seq = 0
+        #: The last statement's query id, so Query Profile still has a target
+        #: when the statement produced no grid -- DDL, DML, or an error.
+        self._last_query_id = ""
         self._export_dialog: QProgressDialog | None = None
         self._context = SessionContext()
         self._connections: dict[str, config.ConnectionInfo] = {}
@@ -298,6 +311,7 @@ class MainWindow(QMainWindow):
         self.rows_label = QLabel("", self)
         self.time_label = QLabel("", self)
         self.qid_label = QLabel("", self)
+        self.qid_label.setToolTip("Query ID of the last statement")
 
         # Separated, or the segments read as one run-on string
         # ("RAW.PUBLIC 0 rows 0 ms 01b0-0001").  Each divider belongs to the
@@ -367,6 +381,9 @@ class MainWindow(QMainWindow):
         action("Run All", "Ctrl+Shift+Return", self.run_all, "&Query")
         self.cancel_action = action("Cancel", "Ctrl+.", self.query.cancel, "&Query")
         self.cancel_action.setEnabled(False)
+        self._menu("&Query").addSeparator()
+        action("Query Profile", "Ctrl+Shift+P", self.profile_current_query, "&Query")
+        action("Copy Query ID", "", self.copy_current_query_id, "&Query")
         self._menu("&Query").addSeparator()
         action("Reconnect", "Ctrl+R", self._reconnect, "&Query")
 
@@ -499,6 +516,8 @@ class MainWindow(QMainWindow):
         w.result_ready.connect(self._on_result_ready)
         w.rows_appended.connect(self._on_rows_appended)
         w.fetch_failed.connect(self._on_fetch_failed)
+        w.profile_empty.connect(self._on_profile_empty)
+        w.profile_failed.connect(self._on_profile_failed)
         w.worker_error.connect(self._on_worker_error)
         w.export_progress.connect(self._on_export_progress)
         w.export_finished.connect(self._on_export_finished)
@@ -514,6 +533,11 @@ class MainWindow(QMainWindow):
             # Fires for an explicit switch and for the system appearance
             # changing while SnowDesk is running.
             app.styleHints().colorSchemeChanged.connect(lambda _scheme: self.refresh_theme())
+
+        self.history_panel.profile_requested.connect(self.show_query_profile)
+        self.history_panel.status_message.connect(
+            lambda msg: self.statusBar().showMessage(msg, 3000)
+        )
 
         self.object_tree.insert_requested.connect(self._insert_into_editor)
         self.object_tree.run_requested.connect(self._run_browser_sql)
@@ -661,6 +685,7 @@ class MainWindow(QMainWindow):
         label = f"[{index + 1}] running"
         if query_id:
             label += f" · {query_id}"
+            self._last_query_id = query_id
             self._set_status_segment(self.qid_label, query_id)
         self.statusBar().showMessage(label)
 
@@ -678,6 +703,7 @@ class MainWindow(QMainWindow):
         if outcome.duration_s:
             self._set_status_segment(self.time_label, format_duration(outcome.duration_s))
         if outcome.query_id:
+            self._last_query_id = outcome.query_id
             self._set_status_segment(self.qid_label, outcome.query_id)
 
     def _on_run_finished(self, outcomes: list[StatementOutcome]) -> None:
@@ -704,6 +730,8 @@ class MainWindow(QMainWindow):
         rows: list,
         exhausted: bool,
         total: int | None,
+        query_id: str = "",
+        label: str = "",
     ) -> None:
         model = ResultModel(
             columns=columns,
@@ -712,16 +740,24 @@ class MainWindow(QMainWindow):
             row_cap=self.query.row_cap,
             total=total,
         )
-        view = ResultView(result_id, model, self, escape_formulas=self._escape_formulas)
+        view = ResultView(
+            result_id,
+            model,
+            self,
+            escape_formulas=self._escape_formulas,
+            query_id=query_id,
+        )
         view.more_requested.connect(self.query.fetch_more)
+        view.profile_requested.connect(self.show_query_profile)
         model.cap_reached.connect(
             lambda: self._set_status_segment(self.rows_label, model.status_text())
         )
         view.set_detail_visible(getattr(self, "_show_detail", False))
         self._results[result_id] = view
-        index = self.result_tabs.insertTab(
-            max(0, self.result_tabs.count() - 2), view, f"Result {len(self._results)}"
-        )
+        if not label:
+            self._result_seq += 1
+            label = f"Result {self._result_seq}"
+        index = self.result_tabs.insertTab(max(0, self.result_tabs.count() - 2), view, label)
         self.result_tabs.setCurrentIndex(index)
         self._set_status_segment(self.rows_label, model.status_text())
 
@@ -759,9 +795,63 @@ class MainWindow(QMainWindow):
                 self.result_tabs.removeTab(index)
             view.deleteLater()
         self._results.clear()
+        self._result_seq = 0
+        self._last_query_id = ""
         self._set_status_segment(self.rows_label, "")
         self._set_status_segment(self.time_label, "")
         self._set_status_segment(self.qid_label, "")
+
+    # -- query profile -----------------------------------------------------
+
+    def target_query_id(self) -> str:
+        """The query the profile actions act on.
+
+        The focused result tab first, so profiling the tab you are reading
+        works while older tabs are still open; otherwise the last statement
+        that ran, which is the only handle left when it produced no grid.
+        """
+        view = self.result_tabs.currentWidget()
+        if isinstance(view, ResultView) and view.query_id:
+            return view.query_id
+        return self._last_query_id
+
+    def profile_current_query(self) -> None:
+        """Open the operator statistics for the focused result.
+
+        The rows Snowflake builds its profile from, not Snowsight's diagram;
+        the spec rules out drawing the plan, not reading the numbers.
+        """
+        query_id = self.target_query_id()
+        if not query_id:
+            self.statusBar().showMessage("No query to profile yet.", 4000)
+            return
+        self.show_query_profile(query_id)
+
+    def show_query_profile(self, query_id: str) -> None:
+        if not self.worker.session.is_connected:
+            self.statusBar().showMessage("Not connected.", 4000)
+            return
+        self.statusBar().showMessage(f"Reading the profile for {query_id}…", 4000)
+        self.worker.submit(ProfileJob(query_id=query_id, page_size=self.query.page_size))
+
+    def copy_current_query_id(self) -> None:
+        query_id = self.target_query_id()
+        if not query_id:
+            self.statusBar().showMessage("No query ID yet.", 4000)
+            return
+        QApplication.clipboard().setText(query_id)
+        self.statusBar().showMessage(f"Copied query ID {query_id}", 3000)
+
+    def _on_profile_empty(self, query_id: str) -> None:
+        """Say why a query that clearly ran has no operator statistics."""
+        self._log_message(profile.empty_hint(query_id))
+        self.result_tabs.setCurrentWidget(self.messages)
+        self.statusBar().showMessage("No query profile — see Messages", 6000)
+
+    def _on_profile_failed(self, query_id: str, message: str) -> None:
+        self._log_message(f"Could not read the profile for {query_id}: {message}")
+        self.result_tabs.setCurrentWidget(self.messages)
+        self.statusBar().showMessage("Could not read the query profile", 6000)
 
     # -- export (R6) -------------------------------------------------------
 
