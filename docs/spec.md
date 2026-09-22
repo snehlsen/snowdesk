@@ -100,7 +100,7 @@ Priority: **P0** is required for v1, **P1** is expected for v1 but can slip, **P
 | E3 | Open / save `.sql` files. | P1 |
 | E4 | Keyword and object-name autocompletion from the browser cache. | P2 |
 | H1 | Persist every executed statement with timestamp, connection, duration, status, row count, query ID. | P0 |
-| H2 | Searchable history panel; double-click loads a statement into the editor. | P1 |
+| H2 | Searchable history panel; right-click copies a statement to the clipboard. | P1 |
 | S1 | Preferences: page size, row cap, font size, light/dark following system. | P1 |
 
 ## 5. Non-functional requirements
