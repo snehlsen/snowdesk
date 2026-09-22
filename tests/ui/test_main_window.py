@@ -175,18 +175,6 @@ def test_history_records_each_executed_statement(harness: Harness) -> None:
     assert window.history_panel.table.rowCount() == 2
 
 
-def test_history_double_click_loads_the_statement(harness: Harness) -> None:
-    connect(harness)
-    window = harness.window
-    window.editor.setPlainText("select * from orders")
-    window.run_all()
-    harness.drain()
-
-    window.editor.clear()
-    window.history_panel._on_double_click(0, 0)
-    assert window.editor.toPlainText() == "select * from orders"
-
-
 def test_closing_a_result_tab_releases_the_cursor(harness: Harness) -> None:
     connect(harness)
     window = harness.window
@@ -370,19 +358,6 @@ def test_the_title_follows_the_open_file(harness: Harness, tmp_path) -> None:
     path.write_text("select 1")
     harness.window.editors.open_file(path)
     assert "report.sql" in harness.window.windowTitle()
-
-
-def test_history_loads_into_the_focused_tab(harness: Harness) -> None:
-    connect(harness)
-    window = harness.window
-    window.editor.setPlainText("select * from orders")
-    window.run_all()
-    harness.drain()
-
-    window.editors.new_tab()
-    window.history_panel._on_double_click(0, 0)
-    assert window.editor.toPlainText() == "select * from orders"
-    assert window.editors.count() == 2
 
 
 def test_closing_the_window_saves_the_session(harness: Harness) -> None:

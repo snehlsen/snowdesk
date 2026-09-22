@@ -26,13 +26,12 @@ _COLUMNS = ["When", "Status", "Duration", "Rows", "Statement"]
 
 
 class HistoryPanel(QWidget):
-    """Searchable list of executed statements; double-click loads one.
+    """Searchable list of executed statements.
 
     It is also where a query id outlives its result tab, which the next run
     closes -- so profiling a query you ran a while ago starts here.
     """
 
-    statement_chosen = Signal(str)
     profile_requested = Signal(str)  # query id
     status_message = Signal(str)
 
@@ -56,7 +55,6 @@ class HistoryPanel(QWidget):
         self.table.setWordWrap(False)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(len(_COLUMNS) - 1, QHeaderView.ResizeMode.Stretch)
-        self.table.cellDoubleClicked.connect(self._on_double_click)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_context_menu)
 
@@ -98,11 +96,6 @@ class HistoryPanel(QWidget):
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(len(_COLUMNS) - 1, QHeaderView.ResizeMode.Stretch)
 
-    def _on_double_click(self, row: int, _col: int) -> None:
-        entry = self.entry_at(row)
-        if entry is not None:
-            self.statement_chosen.emit(entry.sql)
-
     # -- per-row actions ---------------------------------------------------
 
     def entry_at(self, row: int) -> HistoryEntry | None:
@@ -116,7 +109,7 @@ class HistoryPanel(QWidget):
         if entry is None:
             return
         menu = QMenu(self)
-        load = menu.addAction("Load Statement")
+        copy_sql = menu.addAction("Copy Statement")
         menu.addSeparator()
         copy_qid = menu.addAction("Copy Query ID")
         profile = menu.addAction("Query Profile")
@@ -124,8 +117,9 @@ class HistoryPanel(QWidget):
         for act in (copy_qid, profile):
             act.setEnabled(bool(entry.query_id))
         chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
-        if chosen is load:
-            self.statement_chosen.emit(entry.sql)
+        if chosen is copy_sql:
+            QGuiApplication.clipboard().setText(entry.sql)
+            self.status_message.emit("Copied statement")
         elif chosen is copy_qid and entry.query_id:
             QGuiApplication.clipboard().setText(entry.query_id)
             self.status_message.emit(f"Copied query ID {entry.query_id}")

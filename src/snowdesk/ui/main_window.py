@@ -275,7 +275,6 @@ class MainWindow(QMainWindow):
         self.result_tabs.addTab(self.messages, "Messages")
 
         self.history_panel = HistoryPanel(self.history, self)
-        self.history_panel.statement_chosen.connect(self._load_from_history)
         self.result_tabs.addTab(self.history_panel, "History")
         self._pin_fixed_tabs()
 
@@ -951,10 +950,6 @@ class MainWindow(QMainWindow):
         else:
             self.setWindowTitle("SnowDesk")
             self.setWindowFilePath("")
-
-    def _load_from_history(self, sql: str) -> None:
-        self.editor.setPlainText(sql)
-        self.editor.setFocus()
 
     def _clear_history(self) -> None:
         if self.confirm_clear_history():
