@@ -185,6 +185,10 @@ throwaway schema per run:
 SNOWDESK_IT_CONNECTION=default uv run pytest -m integration
 ```
 
+If the connection's private key is encrypted, the tests ask for the
+passphrase on the terminal, or take it from `SNOWDESK_IT_PASSPHRASE` when
+there is no terminal to ask on.
+
 ## Packaging
 
 ```

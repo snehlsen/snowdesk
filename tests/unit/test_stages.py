@@ -18,7 +18,7 @@ from snowdesk.model import (
     StageRef,
     TransferKind,
 )
-from tests.fakes import FakeConnection, FakeProgrammingError, FakeStages
+from tests.fakes import STORAGE, FakeConnection, FakeProgrammingError, FakeStages
 
 LANDING = StageRef(kind=StageKind.NAMED, name="LANDING", database="RAW", schema="PUBLIC")
 USER = StageRef(kind=StageKind.USER)
@@ -53,7 +53,7 @@ def conn() -> FakeConnection:
 def regex_of(pattern_literal: str) -> str:
     """The regex a PATTERN literal carries, as Snowflake would read it."""
     assert pattern_literal.startswith("'") and pattern_literal.endswith("'")
-    return pattern_literal[1:-1].replace("''", "'").replace("\\\\", "\\")
+    return pattern_literal[1:-1].replace("''", "'")
 
 
 # -- locations ---------------------------------------------------------------
@@ -94,13 +94,25 @@ def test_a_get_target_is_a_directory_url() -> None:
 # -- patterns and prefixes ----------------------------------------------------
 
 
-def test_exact_pattern_matches_only_the_names_given() -> None:
-    names = ["landing/a.csv", "landing/(b)+[c].csv"]
-    regex = regex_of(stages.exact_pattern(names))
+@pytest.mark.filterwarnings("ignore:Possible nested set:FutureWarning")
+def test_exact_pattern_matches_the_internal_path_it_is_compared_with() -> None:
+    """PATTERN is matched against `<storage>/<path from the stage root>` (§13)."""
+    names = ["p/a.csv", "p/(b)+[c]{2}|$.csv"]
+    literal = stages.exact_pattern(names)
+    assert "\\" not in literal  # bracket escapes only
+    regex = regex_of(literal)
     for name in names:
-        assert re.fullmatch(regex, name)
-    for other in ["landing/a.csv.bak", "landing/aXcsv", "landing/a.csv/x", "xlanding/a.csv"]:
-        assert not re.fullmatch(regex, other), other
+        assert re.fullmatch(regex, f"{STORAGE}/{name}"), name
+    for other in ["p/a.csv.bak", "p/aXcsv", "p/a.csv/x", "q/a.csv", "pp/a.csv"]:
+        assert not re.fullmatch(regex, f"{STORAGE}/{other}"), other
+    # The same path further down still matches, which is why every pattern
+    # is checked with LIST before it is used.
+    assert re.fullmatch(regex, f"{STORAGE}/p/x/p/a.csv")
+
+
+def test_a_caret_cannot_be_matched_exactly_and_is_refused() -> None:
+    with pytest.raises(stages.UnsafeName):
+        stages.exact_pattern(["p/a^b.csv"])
 
 
 def test_removing_a_folder_needs_its_trailing_slash() -> None:
@@ -111,8 +123,8 @@ def test_removing_a_folder_needs_its_trailing_slash() -> None:
 
 
 def test_removing_a_file_names_it_exactly() -> None:
-    sql = stages.remove_sql(LANDING, "a/", ["landing/a/x.csv"])
-    assert sql.startswith("REMOVE @RAW.PUBLIC.LANDING/a/ PATTERN=")
+    sql = stages.remove_sql(LANDING, "a/", ["a/x.csv"])
+    assert sql == "REMOVE @RAW.PUBLIC.LANDING/a/ PATTERN='^.*/(a/x[.]csv)$'"
 
 
 def test_relative_names() -> None:
@@ -176,14 +188,13 @@ def test_copy_into_from_a_table_stage_targets_its_table() -> None:
     assert stages.copy_into_sql(table, "").startswith("COPY INTO RAW.PUBLIC.ORDERS\n")
 
 
-def test_select_from_a_file_uses_an_exact_pattern() -> None:
+def test_select_from_a_file_names_it_by_its_path() -> None:
     file = StageFile(name="2026-09/a.csv.gz", raw="landing/2026-09/a.csv.gz")
     sql = stages.select_file_sql(LANDING, file)
-    assert (
-        "FROM @RAW.PUBLIC.LANDING/2026-09/ (PATTERN => '^(landing/2026-09/a\\\\.csv\\\\.gz)$')"
-        in sql
-    )
-    assert "FILE_FORMAT" not in sql  # CSV needs none
+    assert "FROM @RAW.PUBLIC.LANDING/2026-09/a.csv.gz t" in sql
+    assert "PATTERN" not in sql and "FILE_FORMAT" not in sql  # CSV needs no format
+    json = StageFile(name="b.json", raw="landing/b.json")
+    assert "(FILE_FORMAT => '<file_format>')" in stages.select_file_sql(LANDING, json)
 
 
 # -- names on the way up --------------------------------------------------------
@@ -442,6 +453,60 @@ def test_removing_a_folder_leaves_its_prefix_siblings(conn: FakeConnection) -> N
     assert list(conn.stage.files) == ["landing/ab/3.csv"]
 
 
-def test_a_remove_that_matches_nothing_is_not_reported_as_removed(conn: FakeConnection) -> None:
-    summary, _s = remove(conn, [StageFile(name="gone.csv", raw="landing/gone.csv")])
-    assert summary.counts == {FileStatus.SKIPPED: 1}
+def test_a_remove_of_a_file_already_gone_runs_nothing(conn: FakeConnection) -> None:
+    summary, statements = remove(conn, [StageFile(name="gone.csv", raw="landing/gone.csv")])
+    assert summary.counts == {FileStatus.FAILED: 1}
+    assert statements == []
+
+
+# -- the same path further down (§13) --------------------------------------------
+
+
+def test_removing_a_file_spares_the_same_path_further_down(conn: FakeConnection) -> None:
+    """`.*/(p/a.csv)` also matches p/x/p/a.csv; addressing the file alone does not."""
+    assert conn.stage is not None
+    conn.stage.files.update({"landing/p/a.csv": b"1", "landing/p/x/p/a.csv": b"2"})
+    summary, statements = remove(conn, [StageFile(name="p/a.csv", raw="landing/p/a.csv")])
+    assert summary.counts == {FileStatus.REMOVED: 1}
+    assert [s.statement.sql for s in statements] == [
+        "REMOVE @RAW.PUBLIC.LANDING/p/a.csv PATTERN='^.*/(p/a[.]csv)$'"
+    ]
+    assert list(conn.stage.files) == ["landing/p/x/p/a.csv"]
+
+
+def test_removing_a_root_file_spares_its_namesakes_in_folders(conn: FakeConnection) -> None:
+    assert conn.stage is not None
+    conn.stage.files.update({"landing/data.csv": b"1", "landing/2026/data.csv": b"2"})
+    summary, _s = remove(conn, [StageFile(name="data.csv", raw="landing/data.csv")])
+    assert summary.counts == {FileStatus.REMOVED: 1}
+    assert list(conn.stage.files) == ["landing/2026/data.csv"]
+
+
+def test_a_file_that_cannot_be_matched_alone_is_left_alone(conn: FakeConnection) -> None:
+    """Even its own path as the location still matches a folder named like it."""
+    assert conn.stage is not None
+    conn.stage.files.update(
+        {"landing/p/a.csv": b"1", "landing/p/a.csv/p/a.csv": b"2", "landing/p/b.csv": b"3"}
+    )
+    summary, _s = remove(
+        conn,
+        [
+            StageFile(name="p/a.csv", raw="landing/p/a.csv"),
+            StageFile(name="p/b.csv", raw="landing/p/b.csv"),
+        ],
+    )
+    assert summary.counts == {FileStatus.FAILED: 1, FileStatus.REMOVED: 1}
+    assert sorted(conn.stage.files) == ["landing/p/a.csv", "landing/p/a.csv/p/a.csv"]
+
+
+def test_downloading_a_root_file_does_not_take_its_namesakes(
+    conn: FakeConnection, tmp_path: Path
+) -> None:
+    assert conn.stage is not None
+    conn.stage.files.update({"landing/data.csv": b"root", "landing/2026/data.csv": b"deeper"})
+    _plan, summary, statements = download(conn, ["data.csv"], tmp_path)
+    assert summary.counts == {FileStatus.DOWNLOADED: 1}
+    assert (tmp_path / "data.csv").read_bytes() == b"root"
+    assert [s.statement.sql.split(" PATTERN")[0] for s in statements] == [
+        f"GET @RAW.PUBLIC.LANDING/data.csv 'file://{tmp_path}/'"
+    ]

@@ -10,7 +10,8 @@ Three things about the connector and the server shape what follows:
 
 * Stage paths match by *prefix*.  ``REMOVE @s/data`` also removes
   ``data2.csv``, so folders are always addressed with a trailing ``/`` and
-  single files by their folder plus an exact ``PATTERN``.
+  single files by a ``PATTERN`` -- which Snowflake matches in a way that has
+  to be checked before anything is removed (see :func:`exact_pattern`).
 * GET writes every file under its bare name, whatever folder it came from,
   so ``a/x.csv`` and ``b/x.csv`` overwrite each other.  Downloads are issued
   one stage folder at a time, into a matching local folder.
@@ -70,8 +71,11 @@ PLAN_LIST_CAP = 200_000
 _UNSAFE = re.compile(r"['\\\x00-\x1f\x7f]")
 #: A stage location that can be written without quoting.
 _BARE_LOCATION = re.compile(r"^[A-Za-z0-9_$@~%./=+-]+$")
-#: POSIX ERE metacharacters, which is what Snowflake's PATTERN speaks.
-_ERE_SPECIAL = re.compile(r"([.\[\]{}()*+?^$|])")
+#: Regex metacharacters, each escaped as a one-character bracket expression.
+#: Brackets rather than backslashes: ``[.]`` is what Snowflake's own examples
+#: use and what was measured to work, and it keeps backslashes, which the SQL
+#: literal would have to double, out of the pattern altogether.
+_REGEX_SPECIAL = re.compile(r"([.\[\]{}()*+?$|])")
 
 
 class UnsafeName(ValueError):
@@ -130,19 +134,32 @@ def file_url(path: str | Path, *, directory: bool = False) -> str:
     return quote_literal("file://" + target)
 
 
-def ere_escape(text: str) -> str:
-    return _ERE_SPECIAL.sub(r"\\\1", text)
+def regex_escape(text: str) -> str:
+    """Escape ``text`` for PATTERN.  ``^`` has no bracket form and is refused."""
+    if "^" in text:
+        raise UnsafeName(
+            f"The stage path {text!r} contains '^', which SnowDesk cannot match exactly. Rename it."
+        )
+    return _REGEX_SPECIAL.sub(lambda m: "[]]" if m.group(1) == "]" else f"[{m.group(1)}]", text)
 
 
-def exact_pattern(raw_names: Iterable[str]) -> str:
-    """A PATTERN literal matching exactly these ``LIST`` names and no others."""
-    names = sorted(set(raw_names))
-    if not names:
+def exact_pattern(names: Iterable[str]) -> str:
+    """A PATTERN for these stage-relative paths, e.g. ``'^.*/(p/a[.]csv)$'``.
+
+    Measured against a real account (docs/stage-browser.md §13): PATTERN must
+    match the whole of a string that is *not* the name ``LIST`` shows but a
+    longer internal path ending in ``/<path from the stage root>``.  Hence the
+    leading ``.*/``.  That also matches the same path further down --
+    ``p/x/p/a.csv`` -- so a pattern is never trusted on its own: callers check
+    it with ``LIST`` first (:func:`matching`).
+    """
+    unique = sorted(set(names))
+    if not unique:
         raise ValueError("a pattern needs at least one name")
-    for name in names:
+    for name in unique:
         check_name(name, "stage path")
-    body = "|".join(ere_escape(n) for n in names)
-    return quote_literal(f"^({body})$")
+    body = "|".join(regex_escape(n) for n in unique)
+    return quote_literal(f"^.*/({body})$")
 
 
 def folder_of(name: str) -> str:
@@ -206,24 +223,30 @@ def put_sql(local: str | Path, stage: StageRef, folder: str, *, overwrite: bool)
     )
 
 
-def get_sql(stage: StageRef, folder: str, local_dir: str | Path, raw_names: Sequence[str]) -> str:
+def get_sql(stage: StageRef, where: str, local_dir: str | Path, names: Sequence[str]) -> str:
+    """GET the files ``names`` (stage-relative) from under ``where``."""
     return (
-        f"GET {location(stage, folder)} {file_url(local_dir, directory=True)} "
-        f"PATTERN={exact_pattern(raw_names)}"
+        f"GET {location(stage, where)} {file_url(local_dir, directory=True)} "
+        f"PATTERN={exact_pattern(names)}"
     )
 
 
-def remove_sql(stage: StageRef, folder: str, raw_names: Sequence[str] | None = None) -> str:
-    """Remove a whole folder (``raw_names`` is None) or exactly these files.
+def remove_sql(stage: StageRef, where: str, names: Sequence[str] | None = None) -> str:
+    """Remove a whole folder (``names`` is None) or these files from under ``where``.
 
     A folder must end in ``/`` -- without it, the prefix would also take any
     sibling whose name merely starts the same way.
     """
-    if raw_names is None:
-        if folder and not folder.endswith("/"):
-            raise ValueError(f"folder {folder!r} must end with '/'")
-        return f"REMOVE {location(stage, folder)}"
-    return f"REMOVE {location(stage, folder)} PATTERN={exact_pattern(raw_names)}"
+    if names is None:
+        if where and not where.endswith("/"):
+            raise ValueError(f"folder {where!r} must end with '/'")
+        return f"REMOVE {location(stage, where)}"
+    return f"REMOVE {location(stage, where)} PATTERN={exact_pattern(names)}"
+
+
+def matching_sql(stage: StageRef, where: str, names: Sequence[str]) -> str:
+    """The LIST that shows what a GET or REMOVE with the same pattern would touch."""
+    return f"LIST {location(stage, where)} PATTERN={exact_pattern(names)}"
 
 
 def describe_sql(stage: StageRef) -> str:
@@ -276,16 +299,18 @@ def copy_into_sql(stage: StageRef, name: str) -> str:
 def select_file_sql(stage: StageRef, file: StageFile, limit: int = 100) -> str:
     """Query a staged file in place.
 
-    CSV needs no format to read; anything else needs a named file format,
-    which SnowDesk has no way to pick, so the placeholder says so.
+    Addressed by its own path, which as a prefix could also take a longer
+    name beside it (``a.csv.bak``); METADATA$FILENAME shows if it did.  A
+    query cannot be checked in advance the way a GET or REMOVE is, and its
+    PATTERN is matched differently again, so none is used.  CSV needs no
+    format to read; anything else needs a named file format, which SnowDesk
+    cannot pick, so the placeholder says so.
     """
     fmt = guess_format(file.name)
-    options = [f"PATTERN => {exact_pattern([file.raw])}"]
-    if not fmt.startswith("TYPE = CSV"):
-        options.insert(0, "FILE_FORMAT => '<file_format>'")
+    options = "" if fmt.startswith("TYPE = CSV") else " (FILE_FORMAT => '<file_format>')"
     return (
         "SELECT METADATA$FILENAME, METADATA$FILE_ROW_NUMBER, t.$1, t.$2, t.$3\n"
-        f"FROM {location(stage, folder_of(file.name))} ({', '.join(options)}) t\n"
+        f"FROM {location(stage, file.name)}{options} t\n"
         f"LIMIT {int(limit)}"
     )
 
@@ -815,6 +840,61 @@ def _batches(items: Sequence[Any], size: int) -> Iterable[Sequence[Any]]:
         yield items[start : start + size]
 
 
+def _lookup(run: _Run, where: str, names: Sequence[str], *, stoppable: bool = True) -> set[str]:
+    """What a GET or REMOVE with this location and pattern would touch.
+
+    A LIST with the same location and PATTERN, which the probe in
+    docs/stage-browser.md §13 showed matching exactly as GET and REMOVE do.
+    SnowDesk's own check, so it is not recorded in History.  Not stoppable
+    once the statement it checks has run: that result has to be reported.
+    """
+    if stoppable and run.stop.is_set():
+        raise TransferStopped
+    cur = run.conn.cursor()
+    try:
+        cur.execute(matching_sql(run.plan.stage, where, names))
+        rows, _ = _named_rows(cur)
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            log.debug("Ignoring error closing a lookup cursor", exc_info=True)
+    stage = run.plan.stage
+    return {relative_name(stage, str(r["name"])) for r in rows if r.get("name")}
+
+
+def _resolve(
+    run: _Run, folder: str, names: Sequence[str]
+) -> tuple[list[tuple[str, list[str]]], list[tuple[str, str]]]:
+    """Where to address ``names`` so that each PATTERN touches exactly them.
+
+    Returns ``(location, names)`` steps, and the names refused with a reason.
+    The whole batch from its folder when that is exact; otherwise each file
+    from its own path, whose prefix rules out ``p/x/p/a.csv`` matching
+    ``p/a.csv``.  Anything still not exact is left alone.
+    """
+    wanted = set(names)
+    found = _lookup(run, folder, names)
+    missing = [(n, "No longer on the stage.") for n in names if n not in found]
+    if found <= wanted:
+        present = [n for n in names if n in found]
+        return ([(folder, present)] if present else []), missing
+    steps: list[tuple[str, list[str]]] = []
+    refused = list(missing)
+    for name in names:
+        if name not in found:
+            continue
+        alone = _lookup(run, name, [name])
+        if alone == {name}:
+            steps.append((name, [name]))
+        else:
+            others = ", ".join(sorted(alone - {name})[:3])
+            refused.append(
+                (name, f"Snowflake would also match {others}, so SnowDesk left it alone.")
+            )
+    return steps, refused
+
+
 def _run_download(run: _Run) -> None:
     plan = run.plan
     conflicts = set(plan.conflicts)
@@ -845,22 +925,29 @@ def _run_download(run: _Run) -> None:
             _finish_unstarted(run, _names(groups[position:]))
             raise TransferStopped
         local_dir = Path(batch[0].local).parent
+        by_name = {i.file.name: i for i in batch}
         run.progress(folder or basename(batch[0].file.name))
         try:
             local_dir.mkdir(parents=True, exist_ok=True)
-            sql = get_sql(plan.stage, folder, local_dir, [i.file.raw for i in batch])
-            rows, _ = run.execute(sql)
+            steps, refused = _resolve(run, folder, list(by_name))
+            for name, reason in refused:
+                run.report(name, FileStatus.FAILED, reason, by_name[name].file.size)
+            for where, names in steps:
+                rows, _ = run.execute(get_sql(plan.stage, where, local_dir, names))
+                _report_get(run, [by_name[n] for n in names], rows)
+                for n in names:
+                    by_name.pop(n)
         except TransferStopped:
-            _finish_unstarted(run, _names(groups[position:]))
+            _finish_unstarted(run, _names([(folder, list(by_name.values()))]))
+            _finish_unstarted(run, _names(groups[position + 1 :]))
             raise
         except Exception as exc:
             try:
-                _fail(run, exc, [(i.file.name, i.file.size) for i in batch])
+                _fail(run, exc, [(i.file.name, i.file.size) for i in by_name.values()])
             except _SessionLost:
                 _finish_unstarted(run, _names(groups[position + 1 :]))
                 raise
             continue
-        _report_get(run, batch, rows)
     run.progress("")
 
 
@@ -896,27 +983,60 @@ def _run_remove(run: _Run) -> None:
         for folder, members in by_folder.items()
         for batch in _batches(members, PATTERN_BATCH)
     ]
-    run.files_total = len(steps)
+    run.files_total = len(folders) + len(files)
     for position, (folder, batch) in enumerate(steps):
-        label = folder if batch is None else ", ".join(basename(f.name) for f in batch)
+        pending = [folder or "/"] if batch is None else [f.name for f in batch]
         if run.stop.is_set():
-            _finish_unstarted(run, ((name or "/", 0) for name, _b in steps[position:]))
+            _finish_unstarted(run, ((n, 0) for n in _remove_names(steps[position:])))
             raise TransferStopped
-        run.progress(label)
-        raw = None if batch is None else [f.raw for f in batch]
+        run.progress(folder if batch is None else ", ".join(basename(n) for n in pending))
         try:
-            rows, _ = run.execute(remove_sql(plan.stage, folder, raw))
+            if batch is None:
+                # A folder by its trailing slash: plain prefix, no pattern.
+                rows, _ = run.execute(remove_sql(plan.stage, folder))
+                _report_remove(run, folder or "/", rows)
+                pending = []
+                continue
+            resolved, refused = _resolve(run, folder, pending)
+            for name, reason in refused:
+                run.report(name, FileStatus.FAILED, reason)
+                pending.remove(name)
+            for where, names in resolved:
+                run.execute(remove_sql(plan.stage, where, names))
+                # Confirmed by looking again rather than from REMOVE's rows,
+                # whose naming has not been measured.
+                left = _lookup(run, where, names, stoppable=False)
+                for name in names:
+                    if name not in left:
+                        run.report(name, FileStatus.REMOVED)
+                    else:
+                        run.report(name, FileStatus.FAILED, "Still on the stage after REMOVE.")
+                    pending.remove(name)
         except TransferStopped:
-            _finish_unstarted(run, ((name or "/", 0) for name, _b in steps[position:]))
+            _finish_unstarted(run, ((n, 0) for n in pending))
+            _finish_unstarted(run, ((n, 0) for n in _remove_names(steps[position + 1 :])))
             raise
         except Exception as exc:
-            _fail(run, exc, [(label, 0)])
+            try:
+                _fail(run, exc, [(n, 0) for n in pending])
+            except _SessionLost:
+                _finish_unstarted(run, ((n, 0) for n in _remove_names(steps[position + 1 :])))
+                raise
             continue
-        if not rows:
-            # Not a success to report: the file may already be gone, or the
-            # pattern did not match what the server compares it against.
-            run.report(label or "/", FileStatus.SKIPPED, "Nothing matched on the stage.")
-            continue
-        noun = "file" if len(rows) == 1 else "files"
-        run.report(label or "/", FileStatus.REMOVED, f"{len(rows)} {noun}")
     run.progress("")
+
+
+def _remove_names(steps: Sequence[tuple[str, Sequence[StageFile] | None]]) -> list[str]:
+    return [
+        name
+        for folder, batch in steps
+        for name in ([folder or "/"] if batch is None else [f.name for f in batch])
+    ]
+
+
+def _report_remove(run: _Run, label: str, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        run.report(label, FileStatus.SKIPPED, "Nothing matched on the stage.")
+        return
+    noun = "file" if len(rows) == 1 else "files"
+    run.report(label, FileStatus.REMOVED, f"{len(rows)} {noun}")

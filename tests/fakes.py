@@ -248,6 +248,20 @@ class FakeConnection:
 # --------------------------------------------------------------------------
 
 
+#: Where a stage's files really live; PATTERN is matched against
+#: ``STORAGE/<path from the stage root>``, never against the LIST name.
+STORAGE = "sfc-stages/a1b2c3/stages/9f8e7d"
+
+
+class FakeOperationalError(Exception):
+    """The connector's OperationalError, which PUT and GET also raise."""
+
+    def __init__(self, msg: str, errno: int | None = None) -> None:
+        super().__init__(msg)
+        self.msg = msg
+        self.errno = errno
+
+
 class FakeResultStatus(Enum):
     """The connector reports PUT and GET statuses as its own enum, not text."""
 
@@ -279,6 +293,11 @@ class FakeStages:
     Files are held by their raw ``LIST`` name: a named stage prefixes its own
     lower-cased name, the user and table stages do not.  The shapes of the PUT
     and GET results follow ``file_transfer_agent.result()`` in connector 4.7.
+
+    PATTERN behaves as measured against a real account: it must match the
+    whole of an internal path, ``<storage prefix>/<path from the stage root>``,
+    not the name LIST shows.  A GET that matches nothing raises, as the
+    connector does.
     """
 
     #: SHOW STAGES rows: name, database_name, schema_name, type, url.
@@ -306,8 +325,12 @@ class FakeStages:
                 for s in self.stages
             ]
             return columns, rows
+        pattern = None
+        for token in tokens:
+            if token.upper().startswith("PATTERN="):
+                pattern = _unquote(token.split("=", 1)[1])
         if verb == "LIST":
-            return self._list(self._prefix(tokens[1]))
+            return self._list(self._prefix(tokens[1]), self._root(tokens[1]), pattern)
         if verb in ("PUT", "GET", "REMOVE"):
             self.transfers += 1
             if self.before_transfer is not None:
@@ -316,15 +339,13 @@ class FakeStages:
             if error is not None:
                 raise error
             options = dict(t.split("=", 1) for t in tokens if "=" in t and not t.startswith("'"))
-            pattern = None
-            for token in tokens:
-                if token.upper().startswith("PATTERN="):
-                    pattern = _unquote(token.split("=", 1)[1])
             if verb == "PUT":
                 return self._put(_unquote(tokens[1]), self._prefix(tokens[2]), options)
             if verb == "GET":
-                return self._get(self._prefix(tokens[1]), _unquote(tokens[2]), pattern)
-            return self._remove(self._prefix(tokens[1]), pattern)
+                return self._get(
+                    self._prefix(tokens[1]), self._root(tokens[1]), _unquote(tokens[2]), pattern
+                )
+            return self._remove(self._prefix(tokens[1]), self._root(tokens[1]), pattern)
         return None
 
     # -- locations ---------------------------------------------------------
@@ -339,14 +360,27 @@ class FakeStages:
         name = stage.rpartition(".")[2].strip('"').lower()
         return f"{name}/{path}"
 
+    def _root(self, token: str) -> str:
+        """The part of a raw name that is the stage's own: ``landing/`` or nothing."""
+        stage = _unquote(token)[1:].partition("/")[0]
+        if stage == "~" or stage.rpartition(".")[2].startswith("%"):
+            return ""
+        return stage.rpartition(".")[2].strip('"').lower() + "/"
+
     # -- statements --------------------------------------------------------
 
-    def _list(self, prefix: str) -> tuple[list[tuple], list[tuple]]:
+    def _list(
+        self, prefix: str, root: str = "", pattern: str | None = None
+    ) -> tuple[list[tuple], list[tuple]]:
         columns = [_col("name"), _col("size", 0), _col("md5"), _col("last_modified")]
         rows = [
-            (name, len(data), hashlib.md5(data).hexdigest(), "Wed, 24 Sep 2026 09:12:00 GMT")
-            for name, data in sorted(self.files.items())
-            if name.startswith(prefix)
+            (
+                name,
+                len(self.files[name]),
+                hashlib.md5(self.files[name]).hexdigest(),
+                "Wed, 24 Sep 2026 09:12:00 GMT",
+            )
+            for name in self._matching(prefix, root, pattern)
         ]
         return columns, rows
 
@@ -391,20 +425,25 @@ class FakeStages:
         )
         return columns, [row]
 
-    def _matching(self, prefix: str, pattern: str | None) -> list[str]:
+    def _matching(self, prefix: str, root: str, pattern: str | None) -> list[str]:
         names = [n for n in sorted(self.files) if n.startswith(prefix)]
         if pattern is not None:
-            names = [n for n in names if re.fullmatch(pattern, n)]
+            names = [n for n in names if re.fullmatch(pattern, f"{STORAGE}/{n[len(root) :]}")]
         return names
 
     def _get(
-        self, prefix: str, target: str, pattern: str | None
+        self, prefix: str, root: str, target: str, pattern: str | None
     ) -> tuple[list[tuple], list[tuple]]:
         assert target.startswith("file://") and target.endswith("/"), target
         directory = Path(target[len("file://") :])
         assert directory.is_dir(), f"GET target {directory} does not exist"
+        matched = self._matching(prefix, root, pattern)
+        if not matched:
+            raise FakeOperationalError(
+                "While getting file(s) there was an error: the file does not exist.", errno=253006
+            )
         rows = []
-        for name in self._matching(prefix, pattern):
+        for name in matched:
             # Flattened to the bare name, as the real connector does.
             (directory / os.path.basename(name)).write_bytes(self.files[name])
             rows.append(
@@ -412,8 +451,10 @@ class FakeStages:
             )
         return [_col("file"), _col("size", 0), _col("status"), _col("message")], rows
 
-    def _remove(self, prefix: str, pattern: str | None) -> tuple[list[tuple], list[tuple]]:
-        removed = self._matching(prefix, pattern)
+    def _remove(
+        self, prefix: str, root: str, pattern: str | None
+    ) -> tuple[list[tuple], list[tuple]]:
+        removed = self._matching(prefix, root, pattern)
         for name in removed:
             del self.files[name]
         return [_col("name"), _col("result")], [(n, "removed") for n in removed]

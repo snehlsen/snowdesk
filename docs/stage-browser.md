@@ -122,18 +122,46 @@ document is that v2 item.
 | All stages | `SHOW STAGES IN ACCOUNT` (columns `name`, `database_name`, `schema_name`, `type` starting `INTERNAL` or `EXTERNAL`, `url`) |
 | Listing | `LIST @db.schema.stage/prefix/`, or `LIST @~/prefix/` / `LIST @%t/prefix/` |
 | Upload one file | `PUT 'file:///abs/path/f.csv' @stage/prefix/ AUTO_COMPRESS=TRUE OVERWRITE=… PARALLEL=4` |
-| Download one folder | `GET @stage/prefix/sub/ 'file:///local/sub/' PATTERN='^(…)$'`, naming up to 50 files exactly (see §7.4) |
+| Download one folder | `GET @stage/sub/ 'file:///local/sub/' PATTERN='^.*/(sub/a[.]csv\|…)$'`, naming up to 50 files (see §7.4) |
+| Check a pattern | `LIST` with the same location and `PATTERN`, before every GET or REMOVE that uses one |
 | Describe | `DESCRIBE STAGE db.schema.stage` |
-| Delete | `REMOVE @stage/prefix/ PATTERN='…'` for a file, `REMOVE @stage/prefix/folder/` for a folder |
+| Delete | `REMOVE @stage/sub/ PATTERN='^.*/(sub/a[.]csv)$'` for files, `REMOVE @stage/sub/folder/` for a folder |
 
 **Stage paths match by prefix, not by name.** `LIST`, `GET` and `REMOVE`
 given `@s/data` also hit `data2.csv` and `data_old/…`. That is harmless for a
 listing but destructive for `REMOVE`. So folders are always addressed with a
-trailing `/`, and single files are addressed by their parent folder plus a
-fully anchored `PATTERN` (`'^(…)$'`) naming the file's raw `LIST` name,
-escaped for POSIX ERE. The confirmation for ST13 names each file, and says a
-folder means everything in it along with how many files the tree has listed
-there.
+trailing `/`, and single files by a `PATTERN`. The confirmation for ST13
+names each file, and says a folder means everything in it along with how
+many files the tree has listed there.
+
+**How `PATTERN` matches was measured, not assumed.** The first integration
+run showed that a pattern built from the `LIST` name matches nothing. A probe
+against a real account (2026-09-24) tried seven forms with LIST, GET and
+REMOVE, which all behaved identically:
+
+- The pattern must match the **whole** of a string. `.*data[.]csv[.]gz` did
+  not match `data.csv.bak.gz`.
+- That string is **not** the `LIST` name (`probe/p/data.csv.gz`). It is a
+  longer internal path ending in `/<path from the stage root>`. The full
+  `LIST` name, the path from the stage root and the path from the location
+  all matched nothing. `.*/p/data[.]csv[.]gz` matched exactly the target.
+- Bracket escapes (`[.]`) work. Backslash escapes were not shown to work, so
+  none are used, and a name containing `^`, which has no bracket form, is
+  refused.
+
+So a pattern is `'^.*/(<path from stage root>|…)$'`. The leading `.*/` means
+it also matches the same path repeated further down: `.*/(a.csv)` for a root
+file matches every `a.csv` in the stage. **No pattern is used without first
+running `LIST` with the same location and pattern** and checking that it
+matches exactly the intended files. If more match, each file is addressed
+from its own path instead (`@stage/a.csv`, whose prefix excludes
+`deep/a.csv`), and checked again. A file that still cannot be isolated is
+reported and left alone. A REMOVE is confirmed by listing again afterwards,
+not from its result rows, whose naming has not been measured.
+
+`SELECT … FROM @stage/path` uses no pattern, since a query cannot be checked
+first. It reads from the file's own path, and `METADATA$FILENAME` shows if a
+longer name beside it came along too.
 
 All of these are built by one tested module, `db/stages.py`, never by string
 formatting in the UI. PUT and GET do not accept bind parameters, so paths are
@@ -210,7 +238,8 @@ The connector's GET flattens everything to basenames. This is a documented
 TODO in `file_transfer_agent.py`: `a/x.csv` and `b/x.csv` land on the same
 local path and overwrite each other, with only a log warning. So one GET is
 issued **per stage folder**, into a matching local subfolder, with a
-`PATTERN` naming that folder's files exactly (at most 50 per GET). Each
+`PATTERN` naming that folder's files, checked as §6 describes (at most 50
+per GET). Each
 selected file or folder is listed again when the download is planned: the
 tree may be stale or capped, and the download should take what is on the
 stage now. Local collisions are checked before the first GET, so the
@@ -258,7 +287,7 @@ for it, can be added later if needed.
 
 | Situation | Behaviour |
 |-----------|-----------|
-| No privilege to `LIST` | The node shows the error as a red child row, the same as Objects does. A failed PUT, GET or REMOVE goes to Messages and History with its code and query ID. |
+| No privilege to `LIST` | The node shows the error's first line as a red child row, with the whole error (code, SQL state, query ID) in its tooltip and in Messages. A failed PUT, GET or REMOVE goes to Messages and History with its code and query ID. |
 | External stage | Listing works. The menu has no transfer or delete items, Upload… is disabled, and drops are refused. |
 | One file fails mid-batch | That file is marked failed and the rest continue. The summary line reads "3 uploaded, 1 failed". |
 | Stop pressed | The current file finishes. Remaining files are marked "not started". This is a neutral status, not an error. |
@@ -327,18 +356,27 @@ Settled on 2026-09-24.
 Built on the `stage-browser` branch. ST1 to ST14 are done. ST15 (resolving
 relative `file://` paths typed in the editor) is not.
 
-**Assumptions only the integration tests can confirm.** Nothing here has met
-a real account yet. The fake encodes what the documentation and the connector
-source say, which is exactly how it was wrong before:
+**First run against a real account (2026-09-24).** The original integration
+tests passed. Three failures followed, all since fixed:
 
+- `PATTERN` was built on the wrong assumption. It failed safely, matching
+  nothing, and was replaced by the measured rule in §6.
+- A GET that matched nothing raised `OperationalError`, which SnowDesk took
+  for a lost connection. PUT and GET errors (253001–253008) are no longer
+  treated that way. This also affected a PUT typed in the editor on `main`.
+- One older integration test was out of date.
+
+**Confirmed by that run:**
 - `LIST` on a named stage returns names prefixed with the stage's name in
-  lower case (`landing/…`), while `@~` and `@%t` return bare paths.
-  `relative_name` depends on this.
-- `GET` and `REMOVE` match `PATTERN` against the same full name `LIST`
-  shows, and treat it as an anchored POSIX regex.
-- A whole location in single quotes (`'@DB.S."My Stage"/my folder/'`) is
-  accepted by LIST, PUT, GET and REMOVE.
-- `SHOW STAGES IN ACCOUNT` reports `type` starting `INTERNAL` or `EXTERNAL`.
-- `DESCRIBE STAGE` works for any stage the role can list.
-- A transfer on the side thread does not disturb a statement the worker is
-  running at the same time (REMAINING §2.3).
+  lower case (`it_stage/…`).
+- A whole location in single quotes (`'@…/my folder/'`) works for PUT.
+- `SHOW STAGES IN ACCOUNT` reports internal stages as internal.
+
+**Still unconfirmed:**
+- The pattern rule and the LIST check, end to end. The integration tests
+  cover both, including a root file with namesakes and a path repeated
+  further down, and need a second run.
+- That `@~` and `@%t` list bare paths and match `PATTERN` the same way.
+- That `DESCRIBE STAGE` works for any stage the role can list.
+- That a transfer on the side thread does not disturb a statement the worker
+  is running at the same time (REMAINING §2.3).

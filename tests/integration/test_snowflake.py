@@ -4,6 +4,10 @@ Run with::
 
     SNOWDESK_IT_CONNECTION=default uv run pytest -m integration
 
+If the connection's private key is encrypted, the passphrase comes from
+``SNOWDESK_IT_PASSPHRASE``, or is asked for on the terminal when there is one.
+It is never written anywhere.
+
 They create and drop a throwaway schema per run and are excluded from the
 default test run.
 """
@@ -38,11 +42,53 @@ if not CONNECTION:
     pytest.skip("SNOWDESK_IT_CONNECTION is not set", allow_module_level=True)
 
 
+PASSPHRASE_ENV = "SNOWDESK_IT_PASSPHRASE"
+
+
+def _connect(worker: SnowflakeWorker) -> None:
+    """Connect the way the app does, answering the passphrase prompt if asked.
+
+    The worker does not fail on an encrypted key: it asks the UI for the
+    passphrase and waits.  Without an answer these tests would only ever
+    see "not connected", so the prompt is answered here, and a failure says
+    which of the two things went wrong.
+    """
+    from snowdesk.selftest import _prompt_passphrase
+
+    failures: list = []
+    asked: list[bool] = []
+    worker.connect_failed.connect(failures.append)
+    worker.passphrase_required.connect(lambda _name, rejected: asked.append(rejected))
+
+    passphrase = os.environ.get(PASSPHRASE_ENV) or None
+    worker._dispatch(
+        ConnectJob(params=ConnectParams(name=CONNECTION, private_key_passphrase=passphrase))
+    )
+    if not worker.session.is_connected and asked and passphrase is None:
+        # getpass reads the terminal itself, so this works under pytest's
+        # capture; with no terminal it returns None and we report instead.
+        passphrase = _prompt_passphrase(CONNECTION, retry=False)
+        if passphrase:
+            worker._dispatch(
+                ConnectJob(params=ConnectParams(name=CONNECTION, private_key_passphrase=passphrase))
+            )
+    if worker.session.is_connected:
+        return
+    if failures:
+        reason = failures[-1].formatted()
+    elif asked and asked[-1]:
+        reason = "the private key passphrase was rejected"
+    elif asked:
+        reason = f"the private key is encrypted; set {PASSPHRASE_ENV} or run from a terminal"
+    else:
+        reason = "no error was reported"
+    pytest.fail(f"Could not connect to {CONNECTION!r}: {reason}", pytrace=False)
+
+
 @pytest.fixture(scope="module")
 def worker(qapp):
     worker = SnowflakeWorker(session=SnowflakeSession())
-    worker._dispatch(ConnectJob(params=ConnectParams(name=CONNECTION)))
-    assert worker.session.is_connected, "could not connect"
+    _connect(worker)
     yield worker
     worker.results.close_all()
     worker.session.close()
@@ -86,7 +132,7 @@ def test_large_result_spans_multiple_chunks(worker) -> None:
     finally:
         worker.result_ready.disconnect()
 
-    result_id, _columns, rows, exhausted, _total = results[0]
+    result_id, _columns, rows, exhausted, _total, _query_id, _label = results[0]
     assert len(rows) == 500
     assert not exhausted
 
@@ -256,3 +302,33 @@ def test_select_from_a_staged_file(worker, stage, tmp_path) -> None:
     files, _ = stage_ops.list_files(conn, stage, "q/")
     outcomes = run(worker, stage_ops.select_file_sql(stage, files[0]))
     assert outcomes[0].status is RunStatus.SUCCESS, outcomes[0].message
+    assert outcomes[0].row_count == 1  # it read the file, not an empty match
+
+
+def test_the_same_path_further_down_is_left_alone(worker, stage, tmp_path) -> None:
+    """PATTERN `.*/(a.csv.gz)` for a root file matches every a.csv.gz, and
+    `.*/(deep/a.csv.gz)` matches deep/x/deep/a.csv.gz too; the LIST check
+    must catch both and address each file by its own path instead."""
+    from snowdesk.db import stages as stage_ops
+    from snowdesk.model import FileStatus
+
+    conn = worker.session.connection
+    (tmp_path / "a.csv").write_text("a\n")
+    for folder in ("", "deep/", "deep/x/deep/"):
+        plan = stage_ops.plan_upload(conn, "it6", stage, folder, [str(tmp_path / "a.csv")])
+        transfer(worker, plan)
+    files, _ = stage_ops.list_files(conn, stage)
+    by_name = {f.name: f for f in files if f.name.endswith("a.csv.gz")}
+    assert set(by_name) == {"a.csv.gz", "deep/a.csv.gz", "deep/x/deep/a.csv.gz"}
+
+    down = tmp_path / "down"
+    down.mkdir()
+    summary = transfer(worker, stage_ops.plan_download(conn, "it7", stage, ["a.csv.gz"], down))
+    assert summary.counts == {FileStatus.DOWNLOADED: 1}, summary
+    assert [p.name for p in down.iterdir()] == ["a.csv.gz"]
+
+    targets = [by_name["a.csv.gz"], by_name["deep/a.csv.gz"]]
+    summary = transfer(worker, stage_ops.plan_remove("it8", stage, targets))
+    assert summary.counts == {FileStatus.REMOVED: 2}, summary
+    files, _ = stage_ops.list_files(conn, stage)
+    assert [f.name for f in files if f.name.endswith("a.csv.gz")] == ["deep/x/deep/a.csv.gz"]
