@@ -532,12 +532,7 @@ def plan_upload(
             plan.refused.append((local, str(exc)))
             continue
         plan.uploads.append(
-            UploadItem(
-                local=local,
-                folder=target_folder,
-                target=predicted_target(local),
-                size=os.path.getsize(local),
-            )
+            UploadItem(local=local, folder=target_folder, target=predicted_target(local))
         )
     if plan.uploads:
         existing, _ = list_files(conn, stage, folder, cap=PLAN_LIST_CAP)
@@ -635,7 +630,7 @@ def _status(value: Any) -> str:
 
 
 class _Run:
-    """One transfer's bookkeeping: counts, progress, History entries."""
+    """One transfer's bookkeeping: counts, what it is on now, History entries."""
 
     def __init__(
         self, conn: Connection, plan: TransferPlan, stop: threading.Event, cb: Callbacks
@@ -645,30 +640,14 @@ class _Run:
         self.stop = stop
         self.cb = cb
         self.counts: dict[FileStatus, int] = {}
-        self.files_done = 0
-        self.bytes_done = 0
-        self.files_total = 0
-        self.bytes_total = 0
         self.index = 0
 
-    def report(self, name: str, status: FileStatus, detail: str = "", size: int = 0) -> None:
+    def report(self, name: str, status: FileStatus, detail: str = "") -> None:
         self.counts[status] = self.counts.get(status, 0) + 1
-        self.files_done += 1
-        self.bytes_done += size
         self.cb.file_done(FileResult(self.plan.transfer_id, name, status, detail))
 
     def progress(self, current: str) -> None:
-        self.cb.progress(
-            TransferProgress(
-                transfer_id=self.plan.transfer_id,
-                kind=self.plan.kind,
-                files_done=self.files_done,
-                files_total=self.files_total,
-                bytes_done=self.bytes_done,
-                bytes_total=self.bytes_total,
-                current=current,
-            )
-        )
+        self.cb.progress(TransferProgress(self.plan.transfer_id, self.plan.kind, current))
 
     def execute(self, sql: str) -> tuple[list[dict[str, Any]], StatementOutcome]:
         """Run one statement; always records it, then re-raises a failure."""
@@ -748,17 +727,17 @@ class _SessionLost(Exception):
     """The connection went away mid-transfer; nothing more can run."""
 
 
-def _fail(run: _Run, exc: Exception, names: Sequence[tuple[str, int]]) -> None:
+def _fail(run: _Run, exc: Exception, names: Sequence[str]) -> None:
     """Mark ``names`` failed, and give up on the rest if the session is gone."""
     message = to_query_error(exc).message
-    for name, size in names:
-        run.report(name, FileStatus.FAILED, message, size)
+    for name in names:
+        run.report(name, FileStatus.FAILED, message)
     if is_session_lost(exc):
         raise _SessionLost(message) from exc
 
 
-def _finish_unstarted(run: _Run, names: Iterable[tuple[str, int]]) -> None:
-    for name, _size in names:
+def _finish_unstarted(run: _Run, names: Iterable[str]) -> None:
+    for name in names:
         run.report(name, FileStatus.NOT_STARTED)
 
 
@@ -766,38 +745,35 @@ def _run_upload(run: _Run) -> None:
     plan = run.plan
     conflicts = set(plan.conflicts)
     items = list(plan.uploads)
-    run.files_total = len(items) + len(plan.refused)
-    run.bytes_total = sum(i.size for i in items)
     for position, item in enumerate(items):
         target = item.folder + item.target
         if target in conflicts and not plan.replace:
-            run.report(target, FileStatus.SKIPPED, "Already on the stage.", item.size)
+            run.report(target, FileStatus.SKIPPED, "Already on the stage.")
             continue
         if run.stop.is_set():
-            _finish_unstarted(run, ((i.folder + i.target, 0) for i in items[position:]))
+            _finish_unstarted(run, (i.folder + i.target for i in items[position:]))
             raise TransferStopped
         run.progress(os.path.basename(item.local))
         if not os.path.isfile(item.local):
-            run.report(target, FileStatus.FAILED, f"{item.local} no longer exists.", item.size)
+            run.report(target, FileStatus.FAILED, f"{item.local} no longer exists.")
             continue
         try:
             sql = put_sql(item.local, plan.stage, item.folder, overwrite=target in conflicts)
             rows, _ = run.execute(sql)
         except UnsafeName as exc:
-            run.report(target, FileStatus.FAILED, str(exc), item.size)
+            run.report(target, FileStatus.FAILED, str(exc))
             continue
         except TransferStopped:
-            _finish_unstarted(run, ((i.folder + i.target, 0) for i in items[position:]))
+            _finish_unstarted(run, (i.folder + i.target for i in items[position:]))
             raise
         except Exception as exc:
             try:
-                _fail(run, exc, [(target, item.size)])
+                _fail(run, exc, [target])
             except _SessionLost:
-                _finish_unstarted(run, ((i.folder + i.target, 0) for i in items[position + 1 :]))
+                _finish_unstarted(run, (i.folder + i.target for i in items[position + 1 :]))
                 raise
             continue
         _report_put(run, item, rows)
-    run.progress("")
 
 
 def _report_put(run: _Run, item: UploadItem, rows: list[dict[str, Any]]) -> None:
@@ -815,11 +791,11 @@ def _report_put(run: _Run, item: UploadItem, rows: list[dict[str, Any]]) -> None
         log.info("Predicted %s for %s, but PUT wrote %s", item.target, item.local, target)
     if status == "UPLOADED":
         detail = _sizes(row)
-        run.report(name, FileStatus.UPLOADED, detail, item.size)
+        run.report(name, FileStatus.UPLOADED, detail)
     elif status == "SKIPPED":
-        run.report(name, FileStatus.SKIPPED, "Already on the stage.", item.size)
+        run.report(name, FileStatus.SKIPPED, "Already on the stage.")
     else:
-        run.report(name, FileStatus.FAILED, str(row.get("message") or status), item.size)
+        run.report(name, FileStatus.FAILED, str(row.get("message") or status))
 
 
 def _sizes(row: dict[str, Any]) -> str:
@@ -899,15 +875,11 @@ def _run_download(run: _Run) -> None:
     plan = run.plan
     conflicts = set(plan.conflicts)
     items = list(plan.downloads)
-    run.files_total = len(items) + len(plan.refused)
-    run.bytes_total = sum(i.file.size for i in items)
 
     wanted: list[DownloadItem] = []
     for item in items:
         if item.local in conflicts and not plan.replace:
-            run.report(
-                item.file.name, FileStatus.SKIPPED, "Already exists locally.", item.file.size
-            )
+            run.report(item.file.name, FileStatus.SKIPPED, "Already exists locally.")
         else:
             wanted.append(item)
 
@@ -931,7 +903,7 @@ def _run_download(run: _Run) -> None:
             local_dir.mkdir(parents=True, exist_ok=True)
             steps, refused = _resolve(run, folder, list(by_name))
             for name, reason in refused:
-                run.report(name, FileStatus.FAILED, reason, by_name[name].file.size)
+                run.report(name, FileStatus.FAILED, reason)
             for where, names in steps:
                 rows, _ = run.execute(get_sql(plan.stage, where, local_dir, names))
                 _report_get(run, [by_name[n] for n in names], rows)
@@ -943,16 +915,15 @@ def _run_download(run: _Run) -> None:
             raise
         except Exception as exc:
             try:
-                _fail(run, exc, [(i.file.name, i.file.size) for i in by_name.values()])
+                _fail(run, exc, [i.file.name for i in by_name.values()])
             except _SessionLost:
                 _finish_unstarted(run, _names(groups[position + 1 :]))
                 raise
             continue
-    run.progress("")
 
 
-def _names(groups: Sequence[tuple[str, Sequence[DownloadItem]]]) -> list[tuple[str, int]]:
-    return [(i.file.name, 0) for _folder, batch in groups for i in batch]
+def _names(groups: Sequence[tuple[str, Sequence[DownloadItem]]]) -> list[str]:
+    return [i.file.name for _folder, batch in groups for i in batch]
 
 
 def _report_get(run: _Run, batch: Sequence[DownloadItem], rows: list[dict[str, Any]]) -> None:
@@ -960,12 +931,12 @@ def _report_get(run: _Run, batch: Sequence[DownloadItem], rows: list[dict[str, A
     for item in batch:
         row = by_name.get(basename(item.file.name))
         if row is None:
-            run.report(item.file.name, FileStatus.FAILED, "Not downloaded.", item.file.size)
+            run.report(item.file.name, FileStatus.FAILED, "Not downloaded.")
         elif _status(row.get("status")) == "DOWNLOADED":
-            run.report(item.file.name, FileStatus.DOWNLOADED, item.local, item.file.size)
+            run.report(item.file.name, FileStatus.DOWNLOADED, item.local)
         else:
             message = str(row.get("message") or _status(row.get("status")))
-            run.report(item.file.name, FileStatus.FAILED, message, item.file.size)
+            run.report(item.file.name, FileStatus.FAILED, message)
 
 
 def _run_remove(run: _Run) -> None:
@@ -983,11 +954,10 @@ def _run_remove(run: _Run) -> None:
         for folder, members in by_folder.items()
         for batch in _batches(members, PATTERN_BATCH)
     ]
-    run.files_total = len(folders) + len(files)
     for position, (folder, batch) in enumerate(steps):
         pending = [folder or "/"] if batch is None else [f.name for f in batch]
         if run.stop.is_set():
-            _finish_unstarted(run, ((n, 0) for n in _remove_names(steps[position:])))
+            _finish_unstarted(run, _remove_names(steps[position:]))
             raise TransferStopped
         run.progress(folder if batch is None else ", ".join(basename(n) for n in pending))
         try:
@@ -1013,17 +983,16 @@ def _run_remove(run: _Run) -> None:
                         run.report(name, FileStatus.FAILED, "Still on the stage after REMOVE.")
                     pending.remove(name)
         except TransferStopped:
-            _finish_unstarted(run, ((n, 0) for n in pending))
-            _finish_unstarted(run, ((n, 0) for n in _remove_names(steps[position + 1 :])))
+            _finish_unstarted(run, pending)
+            _finish_unstarted(run, _remove_names(steps[position + 1 :]))
             raise
         except Exception as exc:
             try:
-                _fail(run, exc, [(n, 0) for n in pending])
+                _fail(run, exc, pending)
             except _SessionLost:
-                _finish_unstarted(run, ((n, 0) for n in _remove_names(steps[position + 1 :])))
+                _finish_unstarted(run, _remove_names(steps[position + 1 :]))
                 raise
             continue
-    run.progress("")
 
 
 def _remove_names(steps: Sequence[tuple[str, Sequence[StageFile] | None]]) -> list[str]:

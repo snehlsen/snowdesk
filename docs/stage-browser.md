@@ -60,7 +60,7 @@ document is that v2 item.
 | ST4 | Cap the listing at the row cap (R4), and say so when the cap is hit, the same way the grid does. | P0 |
 | ST5 | Upload from an Upload… button (file picker) or by dropping files or folders from Finder. Dropped folders keep their structure under the current prefix. | P0 |
 | ST6 | Download the selected files or folders to a chosen local folder, keeping stage folder structure (see §7.4). | P0 |
-| ST7 | Show per-file and total progress for transfers in a strip at the bottom of the Stages tab, and one line per file in Messages (uploaded, skipped, failed). | P0 |
+| ST7 | Show that a transfer is running, and the file it is on, in a strip at the bottom of the Stages tab, and one line per file in Messages (uploaded, skipped, failed). | P0 |
 | ST8 | Stop a transfer. It stops between files, not mid-file (§7.3). | P0 |
 | ST9 | Ask Replace / Skip / Cancel before overwriting, both when an upload would replace a stage file and when a download would replace a local one. | P0 |
 | ST10 | Disable transfers on external stages, with the reason shown. Listing still works. | P0 |
@@ -217,9 +217,12 @@ fixes both export and transfers.
 **Progress is per file, not per byte.** `cursor.execute` accepts
 `_put_callback` / `_get_callback`, and the file transfer agent copies them
 onto each file's metadata. In connector 4.7.5 no storage client ever calls
-them. The strip therefore shows "Uploading 2 of 3 · orders_03.csv" and a bar
-that advances by the bytes of each file as it completes. A single large file
-shows no movement until it is done.
+them. The strip therefore shows a busy bar and what is under way
+("Uploading orders_03.csv…"), with no count or percentage. An earlier bar
+filled by the bytes of files already finished, so it only moved when the
+next file began. It sat empty through a single-file upload and any delete
+done in one statement, so it was dropped. Messages lists each file as it
+finishes, which is the running count.
 
 The connector cannot cancel a transfer that is under way, and there is no
 callback to raise from. So SnowDesk issues **one PUT per file** and one GET

@@ -280,10 +280,18 @@ def test_dropping_files_on_a_folder_uploads_them_there(
     new.write_text("a,b\n")
     asked: list = []
     monkeypatch.setattr(harness.panel, "ask_replace", lambda plan: asked.append(plan))
+    strip: list[tuple[str, int]] = []
+    harness.panel.controller.progress.connect(
+        lambda _p: strip.append(
+            (harness.panel.progress_label.text(), harness.panel.progress_bar.maximum())
+        )
+    )
 
     drop(harness, folder, [new])
 
     assert asked == []  # nothing in the way
+    # A busy bar and the file under way; no count or fraction to get wrong.
+    assert strip == [("Uploading orders_03.csv…", 0)]
     assert "landing/2026-09/orders_03.csv.gz" in harness.stage.files
     log = harness.messages()
     assert "Uploading 1 file to @RAW.PUBLIC.LANDING…" in log
