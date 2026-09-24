@@ -487,3 +487,50 @@ def test_disconnect_clears_the_transaction_state(worker_and_conn) -> None:
     states = collect(worker.transaction_changed)
     worker._dispatch(DisconnectJob())
     assert states[-1] == TransactionState()
+
+
+def _size_lookups(conn: FakeConnection) -> list[str]:
+    return [q for q in conn.status_queries if q.startswith("SHOW WAREHOUSES")]
+
+
+def test_connect_reads_the_warehouse_size(qapp) -> None:
+    conn = FakeConnection()
+    worker = SnowflakeWorker(session=SnowflakeSession(connect_fn=lambda _p: conn))
+    contexts = collect(worker.context_changed)
+    worker._dispatch(ConnectJob(params=ConnectParams(name="dev")))
+    assert contexts[-1].warehouse_size == "X-Small"
+    assert str(contexts[-1]) == "ANALYST · COMPUTE_WH (X-Small) · RAW.PUBLIC"
+
+
+def test_the_warehouse_size_is_only_re_read_when_it_may_have_changed(worker_and_conn) -> None:
+    worker, conn = worker_and_conn
+    contexts = collect(worker.context_changed)
+    before = len(_size_lookups(conn))
+    run_sql(worker, "select 1")
+    assert len(_size_lookups(conn)) == before
+
+    conn.warehouses["COMPUTE_WH"] = "Large"
+    run_sql(worker, "alter warehouse compute_wh set warehouse_size = large")
+    assert contexts[-1].warehouse_size == "Large"
+
+    conn.warehouses["BIG_WH"] = "4X-Large"
+    conn.warehouse = "BIG_WH"
+    run_sql(worker, "select 1")
+    assert contexts[-1].warehouse_size == "4X-Large"
+
+
+def test_a_warehouse_the_role_cannot_see_has_no_size(worker_and_conn) -> None:
+    worker, conn = worker_and_conn
+    contexts = collect(worker.context_changed)
+    conn.warehouse = "HIDDEN_WH"
+    run_sql(worker, "select 1")
+    assert contexts[-1].warehouse_size is None
+    assert str(contexts[-1]) == "ANALYST · HIDDEN_WH · RAW.PUBLIC"
+
+
+def test_the_size_matches_a_warehouse_named_in_lower_case(worker_and_conn) -> None:
+    worker, conn = worker_and_conn
+    contexts = collect(worker.context_changed)
+    conn.warehouse = "compute_wh"
+    run_sql(worker, "select 1")
+    assert contexts[-1].warehouse_size == "X-Small"
