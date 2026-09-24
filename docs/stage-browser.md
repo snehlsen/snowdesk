@@ -1,7 +1,7 @@
 # Stage browser with PUT / GET
 
 **Feature specification, extends [spec.md](spec.md)**
-Status: Implemented; integration tests not yet run against a real account (§13)
+Status: Implemented; integration tests pass against a real account (§13)
 
 ---
 
@@ -372,10 +372,16 @@ tests passed. Three failures followed, all since fixed:
 - A whole location in single quotes (`'@…/my folder/'`) works for PUT.
 - `SHOW STAGES IN ACCOUNT` reports internal stages as internal.
 
+**Second run (2026-09-24): all integration tests pass.** This confirms end
+to end:
+- the measured pattern rule and the LIST check before each GET and REMOVE;
+- a root file with namesakes in folders, and a path repeated further down,
+  each downloaded and removed alone;
+- a download keeping `a/x.csv` and `b/x.csv` apart;
+- a single-file REMOVE sparing its prefix sibling;
+- a `SELECT` from a staged file returning its row.
+
 **Still unconfirmed:**
-- The pattern rule and the LIST check, end to end. The integration tests
-  cover both, including a root file with namesakes and a path repeated
-  further down, and need a second run.
 - That `@~` and `@%t` list bare paths and match `PATTERN` the same way.
 - That `DESCRIBE STAGE` works for any stage the role can list.
 - That a transfer on the side thread does not disturb a statement the worker
