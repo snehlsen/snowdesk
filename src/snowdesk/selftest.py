@@ -66,6 +66,23 @@ def _check_arrow() -> str:
     return f"{PyArrowRowIterator.__module__} loaded"
 
 
+def _check_transfer() -> str:
+    """What PUT and GET load only once a file moves: the storage clients for
+    each cloud and the client-side encryption for internal stages."""
+    import importlib
+
+    modules = [
+        "snowflake.connector.file_transfer_agent",
+        "snowflake.connector.encryption_util",
+        "snowflake.connector.s3_storage_client",
+        "snowflake.connector.azure_storage_client",
+        "snowflake.connector.gcs_storage_client",
+    ]
+    for module in modules:
+        importlib.import_module(module)
+    return f"{len(modules)} modules loaded"
+
+
 def _check_crypto() -> str:
     """Round-trip an encrypted key, as key-pair auth does at connect time."""
     from cryptography.hazmat.primitives import serialization
@@ -119,6 +136,7 @@ CHECKS: list[tuple[str, Callable[[], str]]] = [
     ("Snowflake connector", _check_connector),
     ("Arrow result reader", _check_arrow),
     ("Crypto (key-pair auth)", _check_crypto),
+    ("Stage transfers (PUT/GET)", _check_transfer),
     ("TLS trust store", _check_tls),
     ("SQLite history", _check_sqlite),
     ("Connection config", _check_config),

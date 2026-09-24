@@ -65,6 +65,7 @@ integration tests, and signing and notarization are not.
 | ⌘⇧P | query profile for the focused result |
 | ⌘, | settings |
 | ⌘R | reconnect |
+| ⌘D | download the selected stage files (in the Stages sidebar) |
 
 ### Query profiles
 
@@ -119,6 +120,36 @@ Right-click a node in the object browser to preview 100 rows, generate a
 `SELECT` (with the column list, once columns have been loaded), copy or insert
 the qualified name, show `GET_DDL`, or refresh that node. Preview and DDL open
 a result tab and leave the editor alone.
+
+### Stages
+
+The sidebar's **Stages** tab lists every stage your role can see, grouped by
+database and schema, with your user stage (`@~`) first. Expand a stage to see
+its files, grouped into folders by `/`. To upload, drag files or folders onto
+a stage or folder from Finder, or use Upload…. To download, right-click, or
+press ⌘D, and pick a local folder. Delete is in the same menu and always
+asks first. Right-clicking a table in Objects offers **Show Table Stage** for
+its `@%table` stage. See [docs/stage-browser.md](docs/stage-browser.md).
+
+A few things behave in ways worth knowing:
+
+* **Uploads are gzipped**, as a plain `PUT` does. `orders.csv` lands as
+  `orders.csv.gz`, files that are already compressed go up unchanged, and
+  downloads come back exactly as stored.
+* **Downloads keep folder structure.** GET on its own flattens everything
+  into one directory, so `a/x.csv` and `b/x.csv` would overwrite each other.
+  SnowDesk issues one GET per stage folder instead.
+* **Stop takes effect between files.** The connector cannot interrupt a file
+  mid-transfer, and progress advances a file at a time for the same reason.
+* **Transfers run beside queries**, on their own thread, so the editor and
+  browser keep working. One transfer runs at a time.
+* **External stages can be browsed, not transferred.** PUT and GET only work
+  on internal stages.
+* **Some file names are refused.** A name containing `'`, `\` or a control
+  character is reported as failed rather than passed to Snowflake. Rename
+  the file.
+
+Every PUT, GET and REMOVE is logged in Messages and recorded in History.
 
 Editor tabs are autosaved every few seconds to
 `~/Library/Application Support/SnowDesk/session.json`, so unsaved work survives

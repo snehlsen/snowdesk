@@ -1,7 +1,7 @@
 # Stage browser with PUT / GET
 
 **Feature specification, extends [spec.md](spec.md)**
-Status: Draft, decisions settled (§11)
+Status: Implemented; integration tests not yet run against a real account (§13)
 
 ---
 
@@ -54,7 +54,7 @@ document is that v2 item.
 
 | ID | Requirement | Pri |
 |----|-------------|-----|
-| ST1 | A **Stages** sidebar tab beside Objects. Its tree has the user stage `@~` first, then databases, schemas (these two levels share the object browser's cache) and stages (`SHOW STAGES IN SCHEMA`), each level loaded when expanded. | P0 |
+| ST1 | A **Stages** sidebar tab beside Objects. Its tree has the user stage `@~` first, then every stage the role can see, grouped by database and schema, from one `SHOW STAGES IN ACCOUNT` sent the first time the tab is shown. Databases and schemas without stages do not appear. | P0 |
 | ST2 | Expanding a stage lists its files (`LIST @stage`) as tree children. Columns are Name and Size. Last modified and MD5 go in the tooltip. | P0 |
 | ST3 | Show virtual folders by splitting paths on `/`, as expandable tree nodes. | P0 |
 | ST4 | Cap the listing at the row cap (R4), and say so when the cap is hit, the same way the grid does. | P0 |
@@ -64,7 +64,7 @@ document is that v2 item.
 | ST8 | Stop a transfer. It stops between files, not mid-file (§7.3). | P0 |
 | ST9 | Ask Replace / Skip / Cancel before overwriting, both when an upload would replace a stage file and when a download would replace a local one. | P0 |
 | ST10 | Disable transfers on external stages, with the reason shown. Listing still works. | P0 |
-| ST11 | Context menu: copy stage path, insert `@db.schema.stage/path` into the editor, generate `COPY INTO`, generate `SELECT $1 … FROM @stage/file`, show DDL. | P1 |
+| ST11 | Context menu: copy stage path, insert `@db.schema.stage/path` into the editor, generate `COPY INTO`, generate `SELECT $1 … FROM @stage/file`, and `DESCRIBE STAGE` (`GET_DDL` has no stage object type). | P1 |
 | ST12 | Table stages: **Show Table Stage** in the Objects tree's table context menu switches to the Stages tab and adds and expands an `@%table` node. | P1 |
 | ST13 | Delete the selected files or folders (`REMOVE`) after a confirmation that lists what will go. | P0 |
 | ST14 | A filter box over the Stages tree, like the Objects filter (B5), applied to loaded nodes. | P1 |
@@ -79,7 +79,7 @@ document is that v2 item.
 │ ▸ @~  (user stage)           │                                            │
 │ ▾ RAW                        │                                            │
 │   ▾ PUBLIC                   │ ────────────────────────────────────────── │
-│     ▾ LANDING        Internal│  Result 1 │ Messages │ History             │
+│     ▾ LANDING                │  Result 1 │ Messages │ History             │
 │       ▾ 2026-09/     3 files │                                            │
 │           orders_01.csv.gz 12.4 MB                                        │
 │           orders_02.csv.gz 11.9 MB                                        │
@@ -100,40 +100,52 @@ document is that v2 item.
 - Dropping onto a stage or folder uploads into it. Dropping onto a file
   uploads into that file's folder. While dragging, the drop target is
   highlighted.
-- Context menu on a file or folder: Download… (⌘D), Delete…, Copy Stage Path,
-  Insert Stage Path, Generate COPY INTO, Generate SELECT $1, and Refresh. On
-  a stage, also Show DDL. Items that generate SQL go to the editor, and Show
-  DDL opens a result tab, the same as the Objects menu.
+- Context menu, on an internal stage: Upload Files…, Download… (⌘D), Copy
+  Stage Path, Insert Stage Path, Generate COPY INTO, Describe Stage and
+  Refresh. A folder adds Delete… and drops Describe Stage. A file has
+  Download…, Delete…, the path items, Generate COPY INTO and Generate SELECT.
+  An external stage has no transfer or delete items at all. Items that
+  generate SQL go to the editor. Describe Stage runs in a result tab, the
+  same way Show DDL does in the Objects menu.
 - The progress strip at the bottom of the panel appears only while a
   transfer runs. When a transfer finishes, the affected stage node refreshes
   on its own.
-- The sidebar is narrow, so sizes are compact (`12.4 MB`). Folders show a
-  file count. Everything else goes in the tooltip.
+- The sidebar is narrow, so sizes are compact (`12.4 MB`) and always shown
+  in full. Long names are shortened in the middle, as Finder does. Folders
+  show a file count. Only external stages get a label ("External"). The full
+  path, byte count, modified time and MD5 go in the tooltip.
 
 ## 6. SQL issued
 
 | Purpose | Statement |
 |---------|-----------|
-| Stages in a schema | `SHOW STAGES IN SCHEMA db.schema` (columns `name`, `type` = `INTERNAL`/`EXTERNAL`, `url`) |
+| All stages | `SHOW STAGES IN ACCOUNT` (columns `name`, `database_name`, `schema_name`, `type` starting `INTERNAL` or `EXTERNAL`, `url`) |
 | Listing | `LIST @db.schema.stage/prefix/`, or `LIST @~/prefix/` / `LIST @%t/prefix/` |
 | Upload one file | `PUT 'file:///abs/path/f.csv' @stage/prefix/ AUTO_COMPRESS=TRUE OVERWRITE=… PARALLEL=4` |
-| Download one folder | `GET @stage/prefix/sub/ 'file:///local/sub/' PATTERN='…'` (see §7.4) |
+| Download one folder | `GET @stage/prefix/sub/ 'file:///local/sub/' PATTERN='^(…)$'`, naming up to 50 files exactly (see §7.4) |
+| Describe | `DESCRIBE STAGE db.schema.stage` |
 | Delete | `REMOVE @stage/prefix/ PATTERN='…'` for a file, `REMOVE @stage/prefix/folder/` for a folder |
 
 **Stage paths match by prefix, not by name.** `LIST`, `GET` and `REMOVE`
 given `@s/data` also hit `data2.csv` and `data_old/…`. That is harmless for a
 listing but destructive for `REMOVE`. So folders are always addressed with a
 trailing `/`, and single files are addressed by their parent folder plus a
-fully anchored `PATTERN` (`'^…$'`, regex-escaped). The confirmation for ST13
-lists the files the statement will actually match, taken from the current
-listing, not just the names that were clicked.
+fully anchored `PATTERN` (`'^(…)$'`) naming the file's raw `LIST` name,
+escaped for POSIX ERE. The confirmation for ST13 names each file, and says a
+folder means everything in it along with how many files the tree has listed
+there.
 
 All of these are built by one tested module, `db/stages.py`, never by string
 formatting in the UI. PUT and GET do not accept bind parameters, so paths are
-quoted as literals: `'` and `\` are escaped, spaces are allowed, and the
-`file://` URL is built from an absolute `Path`. Stage names use the existing
-`qualify` helper. Prefixes are percent-free literal paths. A name containing
-`'` or a newline is refused before anything runs.
+quoted as literals. A location is left bare when it can be, and otherwise
+quoted whole, which is how spaces and quoted identifiers get through. The
+`file://` URL is built from an absolute path and escaped for `glob`, because
+the connector globs a PUT source: `data[1].csv` would otherwise match
+nothing, or the wrong file. A local or stage path containing `'`, `\` or a
+control character is **refused**, not escaped. It would have to survive both
+the SQL literal and the path the server hands back to the connector, and
+nothing checks that round trip. The file is reported as failed, with a
+reason, and the rest of the transfer goes ahead.
 
 ## 7. Design
 
@@ -141,12 +153,13 @@ quoted as literals: `'` and `\` are escaped, spaces are allowed, and the
 
 `LIST` returns every file under the prefix, however deep, and has no
 pagination. Expanding a stage runs it once as an ordinary worker job
-(`ListStageJob`) through `execute_async`, fetches pages up to the row cap,
-and builds the whole folder subtree on the client from the paths. Expanding
-folders inside it needs no further query. If the cap was hit, the stage node
-says so. A folder whose contents were cut off by the cap runs its own
-`LIST @stage/folder/` when expanded. Refresh on any node re-lists from that
-node's prefix.
+(`ListStageJob`), synchronously like the browser's `SHOW`. It reads up to the
+row cap and groups the paths into folders on the client. A folder's rows are
+built only when it is opened, so a stage with a hundred thousand files does
+not build a hundred thousand tree rows up front. Expanding folders needs no
+further query. If the cap was hit, the stage says so in a notice row and
+suggests refreshing a folder. Refresh on any stage or folder re-lists just
+that prefix.
 
 The cap is what keeps a stage with a million files from taking down the app.
 If this turns out too crude, the server can do the grouping instead:
@@ -158,11 +171,13 @@ one row per folder. That needs a warehouse, so it is not the default.
 PUT and GET are synchronous in the connector (spec.md §7.3). The connector
 fetches short-lived cloud credentials from Snowflake and then moves the bytes
 itself, straight to or from S3, Azure or GCS. A large transfer holds its
-thread for minutes, for the same reason CSV export does. **Where that thread
-lives is open decision D2.** The recommendation is the export model: a
-one-thread `ThreadPoolExecutor` on the worker, with its own cursor on the
-shared connection. The job queue keeps serving queries and the browser while
-the transfer runs.
+thread for minutes, for the same reason CSV export does. Per D2, it follows
+the export model: a one-thread `ThreadPoolExecutor` on the worker
+(`snowdesk-transfer`), with its own cursor on the shared connection. Planning
+runs there too, so a plan and the transfer after it stay in order. The job
+queue keeps serving queries and the browser while the transfer runs. The
+controller allows one transfer at a time, from planning through to the
+finish.
 
 This also puts a second side-thread on the one connection, which
 REMAINING.md §2.3 already flags as untested. That question needs an answer
@@ -171,17 +186,17 @@ fixes both export and transfers.
 
 ### 7.3 Progress and cancellation
 
-`cursor.execute` accepts `_put_callback` / `_get_callback`: a
-`SnowflakeProgressPercentage` subclass that the connector creates per file
-and calls with byte counts. A `QtProgress` subclass forwards
-`(transfer_id, file, seen, size)` to a worker signal. Updates are throttled
-to about 10 per second, as export does with its row counts.
+**Progress is per file, not per byte.** `cursor.execute` accepts
+`_put_callback` / `_get_callback`, and the file transfer agent copies them
+onto each file's metadata. In connector 4.7.5 no storage client ever calls
+them. The strip therefore shows "Uploading 2 of 3 · orders_03.csv" and a bar
+that advances by the bytes of each file as it completes. A single large file
+shows no movement until it is done.
 
-The connector cannot cancel a transfer that is under way. So SnowDesk issues
-**one PUT per file** and one GET per folder. Stop sets an event, and the
-loop checks it between statements. Raising from the progress callback to
-abort mid-file is possible, but it runs inside the cloud SDK's threads and
-could leave partial uploads behind. Spike it before relying on it.
+The connector cannot cancel a transfer that is under way, and there is no
+callback to raise from. So SnowDesk issues **one PUT per file** and one GET
+per folder. Stop sets an event, and the loop checks it between statements.
+Files not reached are reported as "not started".
 
 One PUT per file gives up the connector's own parallelism across files.
 `PARALLEL=4` still applies to the chunks of a single large file. Uploading
@@ -195,9 +210,15 @@ The connector's GET flattens everything to basenames. This is a documented
 TODO in `file_transfer_agent.py`: `a/x.csv` and `b/x.csv` land on the same
 local path and overwrite each other, with only a log warning. So one GET is
 issued **per stage folder**, into a matching local subfolder, with a
-`PATTERN` that matches only that folder's direct children. Local collisions
-are checked before the first GET, so the Replace/Skip prompt (ST9) comes up
-front, not halfway through.
+`PATTERN` naming that folder's files exactly (at most 50 per GET). Each
+selected file or folder is listed again when the download is planned: the
+tree may be stale or capped, and the download should take what is on the
+stage now. Local collisions are checked before the first GET, so the
+Replace/Skip prompt (ST9) comes up front, not halfway through.
+
+**Server paths are not trusted as local paths.** An object store will
+happily hold a key like `../../.zshrc`. Every download target is resolved and
+refused unless it stays inside the chosen folder.
 
 ### 7.5 Upload options
 
@@ -212,8 +233,8 @@ the like) is uploaded as it is. This has three consequences:
   compression detection, and a PUT result whose `target` differs from the
   prediction is logged, so a wrong guess shows up.
 - **Downloads come back compressed.** GET does not decompress, so
-  `orders.csv.gz` arrives as `orders.csv.gz`. That is correct, but the
-  download sheet says it once, so nobody expects `orders.csv`.
+  `orders.csv.gz` arrives as `orders.csv.gz`. That is correct, but Messages
+  says it once per download, so nobody expects `orders.csv`.
 - The Messages line shows `orders.csv → orders.csv.gz (12.4 MB → 3.1 MB)`
   using the PUT result's `source_size` and `target_size`.
 
@@ -226,24 +247,24 @@ for it, can be added later if needed.
 
 | Where | What |
 |-------|------|
-| `db/stages.py` | `list_stages`, `list_files`, and the `put_sql` / `get_sql` / `remove_sql` / `copy_into_sql` builders with quoting; `QtProgress` |
-| `db/worker.py` | `ListStagesJob` (via BrowseJob path), `ListStageJob`, `TransferJob` on the transfer pool; signals `stage_listed`, `transfer_progress`, `transfer_file_done`, `transfer_finished`, `transfer_failed` |
-| `controllers/stages.py` | Per-stage listing cache and transfers in flight. Maps drops and selections to jobs. Reuses `BrowserController` for the database and schema levels |
-| `ui/stage_tree.py` | The Stages tree, drop target, context menu, and progress strip |
-| `ui/main_window.py` | Sidebar becomes a `QTabWidget` (Objects, Stages). Adds a Show Table Stage hook from `ObjectTree` |
-| `ui/dialogs.py` | `ask_download_folder`, `ask_replace_files`, `confirm_remove`, all behind the existing modal seam |
+| `model.py` | `StageRef`, `StageFile`, `TransferPlan` and the progress, per-file result and summary types that cross the thread boundary |
+| `db/stages.py` | Every statement builder and name check; `list_stages`, `list_files`, `build_tree`; `plan_upload`, `plan_download`, `plan_remove`; `run_transfer` |
+| `db/worker.py` | `StagesJob` and `ListStageJob` on the job queue. `plan_upload`, `plan_download`, `start_transfer` and `stop_transfer` on the transfer pool |
+| `controllers/stages.py` | One transfer at a time, from plan to finish. Records every PUT, GET and REMOVE in History |
+| `ui/stage_tree.py` | `StageTree` (the tree and Finder drops) and `StagePanel` (filter, Upload…, progress strip, context menu). Dialogs are methods tests can replace: `ask_upload_files`, `ask_download_folder`, `ask_replace`, `confirm_remove` |
+| `ui/main_window.py` | Sidebar becomes a `QTabWidget` (Objects, Stages) that remembers its page. `show_table_stage`, and `ask_quit_during_transfer` on close |
 
 ## 8. Error handling
 
 | Situation | Behaviour |
 |-----------|-----------|
-| No privilege to `LIST` / `READ` / `WRITE` | The error goes to Messages (code, message, query ID), and the node shows a disabled "Could not list" child, the same as Objects does. |
-| External stage | Listing works. Upload, Download and drop are disabled, with a tooltip saying transfers need an internal stage. |
+| No privilege to `LIST` | The node shows the error as a red child row, the same as Objects does. A failed PUT, GET or REMOVE goes to Messages and History with its code and query ID. |
+| External stage | Listing works. The menu has no transfer or delete items, Upload… is disabled, and drops are refused. |
 | One file fails mid-batch | That file is marked failed and the rest continue. The summary line reads "3 uploaded, 1 failed". |
 | Stop pressed | The current file finishes. Remaining files are marked "not started". This is a neutral status, not an error. |
-| Session lost during transfer | Same reconnect strip as today. The transfer is reported as interrupted, with which files completed. |
+| Session lost during transfer | The transfer stops and is reported as interrupted, listing which files completed and which were not started. The reconnect strip appears once the worker's next statement notices the session is gone. |
 | Local file unreadable or disappears | Checked before PUT. Reported per file. |
-| Listing hits the cap | The footer says so and suggests narrowing the prefix. |
+| Listing hits the cap | A notice row says so and suggests refreshing a folder on its own. |
 | Quit with a transfer running | Ask: Stop and Quit / Keep Running. Same pattern as an open transaction. |
 
 ## 9. Testing
@@ -252,20 +273,22 @@ for it, can be added later if needed.
 unicode, backslashes, a leading `@`), folder grouping from flat `LIST`
 paths, pattern generation for the per-folder GET, and collision detection.
 
-**Fake connection:** teach it `LIST` and a fake PUT/GET that calls the
-progress callback and writes or reads a temporary directory. **Note:** the
-fake has been wrong before. It populated `description` eagerly, which
-shipped a real bug. Model PUT's actual result shape (`source`, `target`,
-`source_size`, `target_size`, `source_compression`, `target_compression`,
-`status`, `message`) from a real run, not from memory.
+**Fake connection:** `tests/fakes.py` has a `FakeStages` store that answers
+`SHOW STAGES`, `LIST`, PUT, GET and REMOVE against a temporary directory. It
+flattens GET the way the connector does and reports statuses as an enum, not
+text. The PUT and GET result shapes come from `file_transfer_agent.result()`
+in connector 4.7.5. **Note:** the fake has been wrong before, so the
+assumptions in §13 are checked only by the integration tests.
 
 **UI tests:** switch to the Stages tab, expand a stage and folders, drop files using a
 `QMimeData` with URLs, stop mid-batch, and the Replace prompt through its
-seam. Also add the new actions to the action sweep.
+seam. The panel's own actions get the same `checked`-argument sweep as the
+window's.
 
 **Integration tests:** create a temporary stage in the throwaway schema,
 then PUT, LIST, GET into a temporary directory, compare bytes, REMOVE, and
-check that `a/x.csv` and `b/x.csv` both survive a download.
+check that `a/x.csv` and `b/x.csv` both survive a download. Written in
+`tests/integration/test_snowflake.py`; not yet run.
 
 ## 10. Plan
 
@@ -297,4 +320,25 @@ Settled on 2026-09-24.
 | The GET flattening fix gets out of step with future connector versions | Integration test for the `a/x.csv` + `b/x.csv` case. Pin the connector. |
 | `LIST` on huge stages is slow even when capped, since the server returns every row | Encourage prefixes. Keep the RESULT_SCAN grouping option in reserve. |
 | Temporary stages are session-scoped | Only visible on the shared connection, which D2 uses. |
-| PyInstaller misses the cloud SDK pieces PUT/GET need (boto3, azure) | Add a PUT/GET round trip to `--selftest`, or at least import checks. |
+| PyInstaller misses the modules PUT/GET load only when a file moves | `--selftest` imports the file transfer agent, the S3, Azure and GCS storage clients and the encryption code; the bundle passes it. They need nothing outside the connector and the standard library. |
+
+## 13. Status
+
+Built on the `stage-browser` branch. ST1 to ST14 are done. ST15 (resolving
+relative `file://` paths typed in the editor) is not.
+
+**Assumptions only the integration tests can confirm.** Nothing here has met
+a real account yet. The fake encodes what the documentation and the connector
+source say, which is exactly how it was wrong before:
+
+- `LIST` on a named stage returns names prefixed with the stage's name in
+  lower case (`landing/…`), while `@~` and `@%t` return bare paths.
+  `relative_name` depends on this.
+- `GET` and `REMOVE` match `PATTERN` against the same full name `LIST`
+  shows, and treat it as an anchored POSIX regex.
+- A whole location in single quotes (`'@DB.S."My Stage"/my folder/'`) is
+  accepted by LIST, PUT, GET and REMOVE.
+- `SHOW STAGES IN ACCOUNT` reports `type` starting `INTERNAL` or `EXTERNAL`.
+- `DESCRIBE STAGE` works for any stage the role can list.
+- A transfer on the side thread does not disturb a statement the worker is
+  running at the same time (REMAINING §2.3).

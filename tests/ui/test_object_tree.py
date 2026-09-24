@@ -92,6 +92,7 @@ def test_table_menu_offers_every_action(tree: ObjectTree) -> None:
     assert menu_for(tree, ("RAW", "PUBLIC", "ORDERS")) == [
         "Preview 100 Rows",
         "Generate SELECT",
+        "Show Table Stage",
         "Insert Name",
         "Copy Name",
         "Show DDL",

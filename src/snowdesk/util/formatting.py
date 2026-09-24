@@ -95,3 +95,16 @@ def format_duration(seconds: float) -> str:
         return f"{seconds:.2f} s"
     minutes, rest = divmod(seconds, 60)
     return f"{int(minutes)}m {rest:.1f}s"
+
+
+def format_bytes(size: int) -> str:
+    """``12.4 MB``: compact enough for the Stages sidebar, in decimal units as
+    Finder shows them."""
+    if size < 1000:
+        return f"{size} B"
+    value = float(size)
+    for unit in ("KB", "MB", "GB", "TB"):
+        value /= 1000
+        if value < 999.95 or unit == "TB":
+            return f"{value:.1f} {unit}"
+    return f"{value:.1f} TB"  # unreachable; keeps the type checker content

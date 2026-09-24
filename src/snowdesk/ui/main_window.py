@@ -6,7 +6,7 @@ import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QSettings, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
     QActionGroup,
@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
 from snowdesk import __version__, config
 from snowdesk.controllers.browser import BrowserController
 from snowdesk.controllers.query import QueryController
+from snowdesk.controllers.stages import StageController
 from snowdesk.db import profile
 from snowdesk.db.session import ConnectionState, ConnectParams
 from snowdesk.db.worker import (
@@ -71,6 +72,7 @@ from snowdesk.ui.editor_tabs import EditorTabs
 from snowdesk.ui.history_panel import HistoryPanel
 from snowdesk.ui.object_tree import ObjectTree
 from snowdesk.ui.result_view import ResultModel, ResultView
+from snowdesk.ui.stage_tree import StagePanel
 from snowdesk.util.formatting import format_duration
 
 log = logging.getLogger(__name__)
@@ -96,6 +98,8 @@ TRANSACTION_COLOR = "#d29922"
 TRANSACTION_TICK_MS = 30_000
 #: Says the commit-mode segment opens a menu, in place of Qt's own arrow.
 MENU_MARK = "▾"
+#: Which sidebar page was showing, so it comes back that way.
+SIDEBAR_KEY = "window/sidebar"
 
 
 class MainWindow(QMainWindow):
@@ -111,12 +115,14 @@ class MainWindow(QMainWindow):
         history: HistoryStore,
         session: SessionStore | None = None,
         dark: bool = False,
+        stages: StageController | None = None,
     ) -> None:
         super().__init__()
         self.worker = worker
         self.query = query
         self.browser = browser
         self.history = history
+        self.stages = stages or StageController(worker, history=history)
         self.session = session or SessionStore(config.session_path())
 
         self.setWindowTitle("SnowDesk")
@@ -283,12 +289,23 @@ class MainWindow(QMainWindow):
         tree_top.addWidget(self.tree_filter, 1)
         tree_top.addWidget(refresh)
 
-        left = QWidget(self)
-        left_layout = QVBoxLayout(left)
+        objects = QWidget(self)
+        left_layout = QVBoxLayout(objects)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(4)
         left_layout.addLayout(tree_top)
         left_layout.addWidget(self.object_tree)
+
+        # Stages get a page of their own beside Objects (docs/stage-browser.md).
+        self.stage_panel = StagePanel(self.stages, self)
+        self.sidebar = QTabWidget(self)
+        self.sidebar.setDocumentMode(True)
+        self.sidebar.addTab(objects, "Objects")
+        self.sidebar.addTab(self.stage_panel, "Stages")
+        saved = str(QSettings().value(SIDEBAR_KEY, 0))
+        self.sidebar.setCurrentIndex(int(saved) if saved.isdigit() else 0)
+        self.sidebar.currentChanged.connect(self._on_sidebar_changed)
+        left = self.sidebar
 
         # Right: editor tabs over results
         self.editors = EditorTabs(self.session, self, dark=dark)
@@ -572,6 +589,7 @@ class MainWindow(QMainWindow):
         prefs = preferences.load()
         self.query.page_size = prefs.page_size
         self.query.row_cap = prefs.row_cap
+        self.stages.row_cap = prefs.row_cap
         self._set_escape_formulas(prefs.escape_formulas)
         self.editors.set_font_size(prefs.font_size)
 
@@ -595,6 +613,7 @@ class MainWindow(QMainWindow):
         # on the next run without rebuilding anything that already exists.
         self.query.page_size = prefs.page_size
         self.query.row_cap = prefs.row_cap
+        self.stages.row_cap = prefs.row_cap
         self._set_escape_formulas(prefs.escape_formulas)
         self.editors.set_font_size(prefs.font_size)
         self.set_appearance(prefs.appearance)
@@ -673,6 +692,12 @@ class MainWindow(QMainWindow):
         self.object_tree.insert_requested.connect(self._insert_into_editor)
         self.object_tree.run_requested.connect(self._run_browser_sql)
         self.object_tree.status_message.connect(lambda msg: self.statusBar().showMessage(msg, 3000))
+        self.object_tree.table_stage_requested.connect(self.show_table_stage)
+
+        self.stage_panel.insert_requested.connect(self._insert_into_editor)
+        self.stage_panel.run_requested.connect(self._run_browser_sql)
+        self.stage_panel.log_message.connect(self._log_message)
+        self.stage_panel.status_message.connect(lambda msg: self.statusBar().showMessage(msg, 4000))
 
     # -- connections -------------------------------------------------------
 
@@ -726,6 +751,9 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Connected to {name}", 4000)
         self._set_context(ctx)
         self.object_tree.load_roots()
+        self.stage_panel.set_connected(True)
+        if self.sidebar.currentWidget() is self.stage_panel:
+            self.stage_panel.ensure_loaded()
 
     def _on_connect_failed(self, error: QueryError) -> None:
         self._log_message(f"Connection failed: {error.formatted()}")
@@ -793,10 +821,13 @@ class MainWindow(QMainWindow):
         self.run_button.setEnabled(connected)
         if detail and state == ConnectionState.ERROR.value:
             self.statusBar().showMessage(detail, 8000)
+        was_connected = self._connected
         self._connected = connected
         self._render_transaction()
         if not connected:
             self._set_context(SessionContext())
+            if was_connected:
+                self.stage_panel.set_connected(False)
 
     def _set_context(self, ctx: SessionContext) -> None:
         self._context = ctx
@@ -1201,6 +1232,19 @@ class MainWindow(QMainWindow):
         """Run a statement the browser built, without disturbing the editor (B4)."""
         self.query.run_text(sql)
 
+    def _on_sidebar_changed(self, index: int) -> None:
+        QSettings().setValue(SIDEBAR_KEY, index)
+        if self.sidebar.widget(index) is self.stage_panel:
+            self.stage_panel.ensure_loaded()
+
+    def show_table_stage(self, path: tuple[str, ...]) -> None:
+        """Open a table's own stage in the Stages tab (ST12)."""
+        database, schema, table = path[0], path[1], path[2]
+        # Opened before the tab is switched to, so switching does not start a
+        # second load of the stage list behind this one.
+        self.stage_panel.open_table_stage(database, schema, table)
+        self.sidebar.setCurrentWidget(self.stage_panel)
+
     def _close_current_tab(self) -> None:
         self.editors.close_tab(self.editors.currentIndex())
 
@@ -1242,6 +1286,22 @@ class MainWindow(QMainWindow):
         box.exec()
         return box.clickedButton() is delete
 
+    def ask_quit_during_transfer(self) -> bool:
+        """Stop the running transfer and quit (True), or keep running (False)."""
+        box = message_box(self)
+        box.setWindowTitle("Transfer in progress")
+        box.setText("A stage transfer is still running.")
+        box.setInformativeText(
+            "Quitting stops it once the file being transferred now is done. "
+            "Files not yet started are left where they are."
+        )
+        quit_button = box.addButton("Stop and Quit", QMessageBox.ButtonRole.DestructiveRole)
+        keep = box.addButton("Keep Running", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(keep)
+        box.setEscapeButton(keep)
+        box.exec()
+        return box.clickedButton() is quit_button
+
     def _on_worker_error(self, message: str) -> None:
         self._log_message(f"Internal error: {message}")
         self.statusBar().showMessage("An internal error occurred — see Messages", 6000)
@@ -1253,9 +1313,13 @@ class MainWindow(QMainWindow):
         # Tab contents are autosaved, so quitting only has to ask about
         # changes that live in Snowflake: an open transaction (E2, Q10).  The
         # COMMIT or ROLLBACK is queued ahead of the worker's shutdown job.
+        if self.stages.is_busy and not self.ask_quit_during_transfer():
+            event.ignore()
+            return
         if not self._settle_transaction("Quitting ends this session and its open transaction."):
             event.ignore()
             return
+        self.stages.stop()
         self.editors.save_session()
         self.closing.emit()
         super().closeEvent(event)

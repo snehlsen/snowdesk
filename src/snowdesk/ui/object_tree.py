@@ -40,6 +40,8 @@ class ObjectTree(QTreeWidget):
     insert_requested = Signal(str)  # text to drop into the editor
     run_requested = Signal(str)  # SQL to run in a result tab
     status_message = Signal(str)
+    #: Open a table's own stage in the Stages tab (ST12).
+    table_stage_requested = Signal(object)  # (database, schema, table)
 
     def __init__(self, controller: BrowserController, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -223,6 +225,8 @@ class ObjectTree(QTreeWidget):
         if kind in (browse.TABLE, browse.VIEW):
             menu.addAction("Preview 100 Rows", lambda: self._preview(path))
             menu.addAction("Generate SELECT", lambda: self._generate_select(path))
+            if kind == browse.TABLE:
+                menu.addAction("Show Table Stage", lambda: self.table_stage_requested.emit(path))
             menu.addSeparator()
         if kind == browse.COLUMN:
             menu.addAction("Insert Name", lambda: self.insert_requested.emit(qualify(path[-1])))
@@ -261,15 +265,15 @@ class ObjectTree(QTreeWidget):
         for i in range(self.topLevelItemCount()):
             item = self.topLevelItem(i)
             if item is not None:
-                _apply_filter(item, needle)
+                apply_filter(item, needle)
 
 
-def _apply_filter(item: QTreeWidgetItem, needle: str) -> bool:
+def apply_filter(item: QTreeWidgetItem, needle: str) -> bool:
     """Show ``item`` if it or any descendant matches; returns whether it is visible."""
     visible = not needle or needle in item.text(0).lower()
     for i in range(item.childCount()):
         child = item.child(i)
-        if child is not None and _apply_filter(child, needle):
+        if child is not None and apply_filter(child, needle):
             visible = True
     item.setHidden(not visible)
     return visible

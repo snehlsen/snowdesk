@@ -20,7 +20,7 @@ The app should let a user pick a connection from `~/.snowflake/connections.toml`
 
 ### Non-goals (v1)
 
-SnowDesk v1 does not try to replace Snowsight. It will not include dashboards, charts, query profiles, cost monitoring, worksheet sharing, Snowpark or notebook support, visual query building, data editing in the grid, or `PUT`/`GET` file transfer UI. It targets macOS only, although nothing in the design should make Linux or Windows ports hard later.
+SnowDesk v1 does not try to replace Snowsight. It will not include dashboards, charts, query profiles, cost monitoring, worksheet sharing, Snowpark or notebook support, visual query building, data editing in the grid, or `PUT`/`GET` file transfer UI (since added as a v2 feature: see [stage-browser.md](stage-browser.md)). It targets macOS only, although nothing in the design should make Linux or Windows ports hard later.
 
 ## 3. Users and core scenarios
 
@@ -499,4 +499,4 @@ A usable personal tool exists after M3 (about a week). M4 onward is polish and c
 
 ## 15. Future ideas (v2+)
 
-Autocompletion, charts for simple result shapes, a query profile link and basic cost display per query (from `QUERY_HISTORY`), saved snippets, Parquet/XLSX export, a stage browser with `PUT`/`GET`, and optional Linux/Windows builds.
+Autocompletion, charts for simple result shapes, a query profile link and basic cost display per query (from `QUERY_HISTORY`), saved snippets, Parquet/XLSX export, a stage browser with `PUT`/`GET` (specified in [stage-browser.md](stage-browser.md)), and optional Linux/Windows builds.
