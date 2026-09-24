@@ -20,7 +20,14 @@ import pytest
 
 from snowdesk.db.session import ConnectParams, SnowflakeSession
 from snowdesk.db.splitter import split_sql
-from snowdesk.db.worker import ConnectJob, FetchMoreJob, RunScriptJob, SnowflakeWorker
+from snowdesk.db.worker import (
+    ConnectJob,
+    EndTransactionJob,
+    FetchMoreJob,
+    RunScriptJob,
+    SetAutocommitJob,
+    SnowflakeWorker,
+)
 from snowdesk.model import RunStatus
 
 pytestmark = pytest.mark.integration
@@ -130,3 +137,38 @@ def test_cancellation_is_server_side(worker) -> None:
 
 def test_worker_queue_drains_in_order(worker) -> None:
     assert isinstance(worker._queue, queue.Queue)
+
+
+def test_manual_commit_round_trip(worker, schema) -> None:
+    """Q10 against the real thing: the reads, the refusal and the mode switch."""
+    table = f"{schema}.SNOWDESK_TXN"
+    run(worker, f"CREATE OR REPLACE TABLE {table} (N INT)")
+    assert worker._transaction.autocommit is True
+    worker._dispatch(SetAutocommitJob(enabled=False))
+    try:
+        assert worker._transaction.autocommit is False
+
+        run(worker, f"INSERT INTO {table} VALUES (1)")
+        assert worker._transaction.in_transaction
+        refused: list = []
+        worker.autocommit_failed.connect(refused.append)
+        try:
+            worker._dispatch(SetAutocommitJob(enabled=True))
+        finally:
+            worker.autocommit_failed.disconnect(refused.append)
+        assert refused and worker.session.read_autocommit() is False
+
+        worker._dispatch(EndTransactionJob(commit=False))
+        assert not worker._transaction.in_transaction
+
+        run(worker, f"INSERT INTO {table} VALUES (2)")
+        worker._dispatch(EndTransactionJob(commit=True))
+        assert not worker._transaction.in_transaction
+    finally:
+        worker._dispatch(EndTransactionJob(commit=False))
+        worker._dispatch(SetAutocommitJob(enabled=True))
+    assert worker._transaction.autocommit is True
+
+    outcomes = run(worker, f"SELECT N FROM {table}")
+    worker.results.close(outcomes[0].result_id)
+    assert outcomes[0].row_count == 1  # the rolled-back row is gone

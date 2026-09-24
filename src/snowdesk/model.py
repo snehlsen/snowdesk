@@ -129,6 +129,25 @@ class SessionContext:
 
 
 @dataclass(frozen=True, slots=True)
+class TransactionState:
+    """Commit mode and any open transaction, for the status bar (Q10).
+
+    Read back from the session rather than tracked from what SnowDesk sent:
+    a script can ``ALTER SESSION SET AUTOCOMMIT`` or ``BEGIN`` on its own, and
+    DDL commits implicitly.
+    """
+
+    #: ``None`` while disconnected, or when the session could not be asked.
+    autocommit: bool | None = None
+    #: What ``CURRENT_TRANSACTION()`` returned; ``None`` when none is open.
+    transaction_id: str | None = None
+
+    @property
+    def in_transaction(self) -> bool:
+        return self.transaction_id is not None
+
+
+@dataclass(frozen=True, slots=True)
 class QueryError:
     """A Snowflake error, with everything needed for the Messages tab (Q5)."""
 

@@ -70,6 +70,10 @@ def harness(qtbot, tmp_path, monkeypatch):
         session=SessionStore(tmp_path / "session.json"),
     )
     qtbot.addWidget(window)
+    # pytest-qt closes the window before fixtures are torn down, so a
+    # transaction a test left open would put up the real Commit / Roll Back
+    # prompt and hang.  Tests that care about the answer use `ask`.
+    monkeypatch.setattr(window, "ask_open_transaction", lambda _reason: False)
     yield Harness(window, worker, conn)
     history.close()
 
@@ -698,7 +702,7 @@ def test_status_bar_segments_are_separated(harness: Harness) -> None:
     dividers = [
         label for label in harness.window.statusBar().findChildren(QLabel) if label.text() == "│"
     ]
-    assert len(dividers) == 3  # between four segments
+    assert len(dividers) == 4  # between five segments
 
 
 def test_toolbar_content_is_inset_from_both_window_edges(harness: Harness) -> None:
@@ -808,7 +812,10 @@ def test_status_dividers_hide_with_their_segment(harness: Harness) -> None:
         assert window._status_dividers[window.rows_label].isVisible()
 
         window._clear_result_tabs()
-        assert not any(d.isVisible() for d in window._status_dividers.values())
+        # The commit mode is a property of the session, not of the last run.
+        assert [w for w, d in window._status_dividers.items() if d.isVisible()] == [
+            window.commit_button
+        ]
     finally:
         window.hide()
 
@@ -1079,3 +1086,191 @@ def test_the_profile_shortcut_is_bound_exactly_once(harness: Harness) -> None:
     ]
     assert [a.text() for a in window_bound] == ["Query Profile"]
     assert all(a.shortcut().isEmpty() for a in (view._profile_action, view._copy_qid_action))
+
+
+# -- commit mode indicator (Q10) ----------------------------------------------
+
+
+def open_transaction(harness: Harness) -> None:
+    harness.window.editor.setPlainText("begin; insert into t values (1)")
+    harness.window.run_all()
+    harness.drain()
+
+
+@pytest.fixture
+def ask(harness: Harness, monkeypatch):
+    """Answers the open-transaction prompt; records each reason it was given.
+
+    Returns a setter for the answer (True commit, False roll back, None
+    cancel) and the list of reasons asked with.
+    """
+    asked: list[str] = []
+    answer: dict[str, bool | None] = {"value": None}
+
+    def fake_ask(reason: str) -> bool | None:
+        asked.append(reason)
+        return answer["value"]
+
+    monkeypatch.setattr(harness.window, "ask_open_transaction", fake_ask)
+    yield (lambda value: answer.__setitem__("value", value)), asked
+    answer["value"] = False  # let the window close at teardown
+
+
+def test_commit_mode_is_hidden_until_connected(harness: Harness) -> None:
+    window = harness.window
+    window.show()
+    try:
+        assert not window.commit_button.isVisible()
+        connect(harness)
+        assert window.commit_button.isVisible()
+        assert window.commit_button.text() == "Auto-commit ▾"
+        assert window.autocommit_action.isChecked()
+        assert not window.commit_action.isEnabled()
+        assert not window.rollback_action.isEnabled()
+    finally:
+        window.hide()
+
+
+def test_choosing_manual_commit_switches_the_session(harness: Harness) -> None:
+    connect(harness)
+    window = harness.window
+    window.manual_commit_action.trigger()
+    # Until the session confirms it, the check mark stays where the mode is.
+    assert window.autocommit_action.isChecked()
+
+    harness.drain()
+    assert harness.conn.autocommit is False
+    assert window.commit_button.text() == "Manual commit ▾"
+    assert window.manual_commit_action.isChecked()
+
+
+def test_an_open_transaction_is_shown_and_can_be_committed(harness: Harness) -> None:
+    connect(harness)
+    window = harness.window
+    window.editor.setPlainText("begin")
+    window.run_all()
+    harness.drain()
+    assert window.commit_button.text() == "Transaction open ▾"
+    assert harness.conn.transaction_id in window.commit_button.toolTip()
+    assert window.commit_action.isEnabled()
+    assert window.rollback_action.isEnabled()
+
+    window.editor.setPlainText("select * from orders")
+    window.run_all()
+    harness.drain()
+    result_tab = window.result_tabs.currentWidget()
+
+    window.commit_action.trigger()
+    harness.drain()
+    assert harness.conn.executed[-1] == "COMMIT"
+    assert window.commit_button.text() == "Auto-commit ▾"
+    assert not window.commit_action.isEnabled()
+    assert "COMMIT: Committed" in window.messages.toPlainText()
+    # Committing is not a run: the grid checked before it stays put.
+    assert window.result_tabs.indexOf(result_tab) >= 0
+    assert window.history.recent()[0].sql == "COMMIT"
+
+
+def test_transaction_actions_wait_for_a_running_query(harness: Harness) -> None:
+    connect(harness)
+    open_transaction(harness)
+    window = harness.window
+    window.editor.setPlainText("select 1")
+    window.run_all()  # queued, not drained: still running
+    assert not window.commit_action.isEnabled()
+    assert not window.manual_commit_action.isEnabled()
+    harness.drain()
+    assert window.commit_action.isEnabled()
+
+
+def test_the_open_transaction_counts_its_minutes(harness: Harness) -> None:
+    from datetime import datetime, timedelta
+
+    connect(harness)
+    open_transaction(harness)
+    window = harness.window
+    window._transaction_since = datetime.now() - timedelta(minutes=4, seconds=10)
+    window._render_transaction()
+    assert window.commit_button.text() == "Transaction open · 4m ▾"
+    assert window._transaction_timer.isActive()
+
+    window.commit_action.trigger()
+    harness.drain()
+    assert not window._transaction_timer.isActive()
+
+
+def test_switching_mode_mid_transaction_asks_first(harness: Harness, ask) -> None:
+    answer, asked = ask
+    connect(harness)
+    open_transaction(harness)
+    window = harness.window
+
+    answer(None)
+    window.manual_commit_action.trigger()
+    harness.drain()
+    assert asked
+    assert harness.conn.autocommit is True
+    assert harness.conn.transaction_id is not None
+
+    answer(True)
+    window.manual_commit_action.trigger()
+    harness.drain()
+    assert harness.conn.executed[-2:] == ["COMMIT", "ALTER SESSION SET AUTOCOMMIT = FALSE"]
+    assert window.commit_button.text() == "Manual commit ▾"
+
+
+def test_disconnecting_mid_transaction_asks_first(harness: Harness, ask) -> None:
+    answer, asked = ask
+    connect(harness)
+    open_transaction(harness)
+    window = harness.window
+
+    answer(None)
+    window._on_connect_clicked()
+    harness.drain()
+    assert harness.worker.session.is_connected
+
+    answer(False)
+    window._on_connect_clicked()
+    harness.drain()
+    assert harness.conn.executed[-1] == "ROLLBACK"
+    assert not harness.worker.session.is_connected
+    assert len(asked) == 2
+
+
+def test_disconnecting_without_a_transaction_does_not_ask(harness: Harness, ask) -> None:
+    _answer, asked = ask
+    connect(harness)
+    harness.window._on_connect_clicked()
+    harness.drain()
+    assert not asked
+    assert not harness.worker.session.is_connected
+
+
+def test_quitting_mid_transaction_can_be_called_off(harness: Harness, ask) -> None:
+    answer, asked = ask
+    connect(harness)
+    open_transaction(harness)
+    window = harness.window
+    window.show()
+
+    answer(None)
+    assert not window.close()
+    assert window.isVisible()
+
+    answer(True)
+    assert window.close()
+    harness.drain()
+    assert harness.conn.executed[-1] == "COMMIT"
+    assert len(asked) == 2
+
+
+def test_a_lost_session_says_the_transaction_went_with_it(harness: Harness) -> None:
+    connect(harness)
+    open_transaction(harness)
+    harness.conn.status_error = FakeProgrammingError("Session no longer exists", errno=390104)
+    harness.window.editor.setPlainText("select 1")
+    harness.window.run_all()
+    harness.drain()
+    assert "not committed" in harness.window.banner_label.text()
+    assert not harness.window.commit_button.isVisibleTo(harness.window)

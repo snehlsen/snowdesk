@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import queue
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -32,9 +33,20 @@ from snowdesk.db.errors import (
 from snowdesk.db.results import ResultRegistry, summarize_status
 from snowdesk.db.runner import Cancelled, StatementRunner
 from snowdesk.db.session import ConnectionState, ConnectParams, SnowflakeSession
-from snowdesk.model import QueryError, RunStatus, SessionContext, Statement, StatementOutcome
+from snowdesk.model import (
+    QueryError,
+    RunStatus,
+    SessionContext,
+    Statement,
+    StatementOutcome,
+    TransactionState,
+)
 
 log = logging.getLogger(__name__)
+
+#: A statement that may have changed the session's AUTOCOMMIT, so it is worth
+#: asking the server again.  Loose on purpose: a false positive costs one SHOW.
+_MENTIONS_AUTOCOMMIT = re.compile(r"\bautocommit\b", re.IGNORECASE)
 
 
 # --------------------------------------------------------------------------
@@ -90,6 +102,20 @@ class BrowseJob:
 
 
 @dataclass(slots=True)
+class EndTransactionJob:
+    """``COMMIT`` or ``ROLLBACK`` the open transaction (Q10)."""
+
+    commit: bool
+
+
+@dataclass(slots=True)
+class SetAutocommitJob:
+    """Switch the session's AUTOCOMMIT (Q10).  Refused mid-transaction."""
+
+    enabled: bool
+
+
+@dataclass(slots=True)
 class ShutdownJob:
     pass
 
@@ -103,6 +129,8 @@ Job = (
     | CloseResultJob
     | ProfileJob
     | BrowseJob
+    | EndTransactionJob
+    | SetAutocommitJob
     | ShutdownJob
 )
 
@@ -145,6 +173,13 @@ class SnowflakeWorker(QObject):
     export_failed = Signal(str, str)  # result id, message
     export_cancelled = Signal(str)
 
+    #: Commit mode or open transaction, re-read after anything that could
+    #: have changed either.
+    transaction_changed = Signal(object)  # TransactionState
+    #: A Commit or Roll back from the status bar finished, either way.
+    transaction_ended = Signal(object)  # StatementOutcome
+    autocommit_failed = Signal(str)  # message
+
     nodes_ready = Signal(object, object)  # path tuple, list[ObjectNode]
     browse_failed = Signal(object, str)  # path tuple, message
 
@@ -174,6 +209,7 @@ class SnowflakeWorker(QObject):
         self._passphrases: dict[str, str] = {}
         # Survives a lost session, which clears the session's own copy.
         self._last_name: str | None = None
+        self._transaction = TransactionState()
 
     # -- public API (called from the UI thread) ---------------------------
 
@@ -300,6 +336,10 @@ class SnowflakeWorker(QObject):
             self._profile(job)
         elif isinstance(job, BrowseJob):
             self._browse(job)
+        elif isinstance(job, EndTransactionJob):
+            self._end_transaction(job)
+        elif isinstance(job, SetAutocommitJob):
+            self._set_autocommit(job)
 
     # -- connection -------------------------------------------------------
 
@@ -322,6 +362,7 @@ class SnowflakeWorker(QObject):
         self.state_changed.emit(ConnectionState.CONNECTED.value, params.name)
         self.connected.emit(params.name, ctx)
         self.context_changed.emit(ctx)
+        self._refresh_transaction(reread_autocommit=True)
         if self.session.should_hint_id_token():
             self.sso_hint.emit()
 
@@ -358,6 +399,7 @@ class SnowflakeWorker(QObject):
         self.session.close()
         self.state_changed.emit(ConnectionState.DISCONNECTED.value, "")
         self.context_changed.emit(SessionContext())
+        self._set_transaction(TransactionState())
 
     def _note_failure(self, exc: BaseException) -> bool:
         """Mark the session dead if ``exc`` says the connection is gone (spec 9).
@@ -376,6 +418,9 @@ class SnowflakeWorker(QObject):
         self.state_changed.emit(ConnectionState.ERROR.value, message)
         self.connection_lost.emit(name, message)
         self.context_changed.emit(SessionContext())
+        # After connection_lost, so the UI can still tell whether a
+        # transaction went down with the session.
+        self._set_transaction(TransactionState())
         return True
 
     # -- script execution -------------------------------------------------
@@ -398,6 +443,9 @@ class SnowflakeWorker(QObject):
             with self._runner_lock:
                 self._runner = None
             self.context_changed.emit(self.session.read_context())
+            self._refresh_transaction(
+                reread_autocommit=any(_MENTIONS_AUTOCOMMIT.search(s.sql) for s in job.statements)
+            )
             self.script_finished.emit(outcomes)
 
     def _execute_statements(
@@ -504,6 +552,106 @@ class SnowflakeWorker(QObject):
             result_id=handle.result_id,
             columns=list(handle.columns),
         )
+
+    # -- transactions (Q10) -----------------------------------------------
+
+    def _set_transaction(self, state: TransactionState) -> None:
+        self._transaction = state
+        self.transaction_changed.emit(state)
+
+    def _refresh_transaction(self, *, reread_autocommit: bool) -> None:
+        """Ask the session for its commit mode and open transaction.
+
+        ``CURRENT_TRANSACTION()`` is read every time: it is one round trip
+        with no warehouse, and parsing for BEGIN and COMMIT would miss
+        implicit commits by DDL and whatever a procedure does.  AUTOCOMMIT
+        only changes when something sets it, so it is re-read only then.
+        """
+        if not self.session.is_connected:
+            self._set_transaction(TransactionState())
+            return
+        autocommit = (
+            self.session.read_autocommit() if reread_autocommit else self._transaction.autocommit
+        )
+        try:
+            transaction_id = self.session.read_transaction_id()
+        except Exception as exc:
+            if self._note_failure(exc):
+                return
+            log.debug("Could not read the open transaction", exc_info=True)
+            transaction_id = self._transaction.transaction_id
+        self._set_transaction(TransactionState(autocommit, transaction_id))
+
+    def _end_transaction(self, job: EndTransactionJob) -> None:
+        """Run COMMIT or ROLLBACK and report it like any other statement.
+
+        Not a :class:`RunScriptJob`: a run clears the result tabs, and the
+        grid the user checked before committing should still be there after.
+        """
+        sql = "COMMIT" if job.commit else "ROLLBACK"
+        statement = Statement(sql=sql, start=0, end=0)
+        if not self.session.is_connected:
+            self.transaction_ended.emit(
+                StatementOutcome(0, statement, RunStatus.ERROR, message="Not connected.")
+            )
+            return
+        started = time.monotonic()
+        cursor = None
+        try:
+            cursor = self.session.connection.cursor()
+            cursor.execute(sql)
+        except Exception as exc:
+            self._note_failure(exc)
+            error = to_query_error(exc, getattr(cursor, "sfqid", None))
+            outcome = StatementOutcome(
+                0,
+                statement,
+                RunStatus.ERROR,
+                query_id=error.query_id,
+                duration_s=time.monotonic() - started,
+                message=error.formatted(),
+                error=error,
+            )
+        else:
+            elapsed = time.monotonic() - started
+            outcome = StatementOutcome(
+                0,
+                statement,
+                RunStatus.SUCCESS,
+                query_id=getattr(cursor, "sfqid", None),
+                duration_s=elapsed,
+                message=f"{'Committed' if job.commit else 'Rolled back'} ({elapsed:.2f}s)",
+            )
+        finally:
+            if cursor is not None:
+                cursor.close()
+        self._refresh_transaction(reread_autocommit=False)
+        self.transaction_ended.emit(outcome)
+
+    def _set_autocommit(self, job: SetAutocommitJob) -> None:
+        if not self.session.is_connected:
+            self.autocommit_failed.emit("Not connected.")
+            return
+        # Checked here rather than trusted from the UI: the transaction may
+        # have been opened by a statement queued ahead of this job, and a
+        # COMMIT queued ahead of it may have failed.
+        self._refresh_transaction(reread_autocommit=False)
+        if not self.session.is_connected:
+            return
+        if self._transaction.in_transaction:
+            self.autocommit_failed.emit(
+                "A transaction is open. Commit or roll it back before changing the commit mode."
+            )
+            return
+        try:
+            self.session.set_autocommit(job.enabled)
+        except Exception as exc:
+            if not self._note_failure(exc):
+                log.warning("Could not set AUTOCOMMIT", exc_info=True)
+                self.autocommit_failed.emit(to_query_error(exc).formatted())
+                self._refresh_transaction(reread_autocommit=True)
+            return
+        self._refresh_transaction(reread_autocommit=True)
 
     # -- incremental fetching ---------------------------------------------
 

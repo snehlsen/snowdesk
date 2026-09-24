@@ -3,6 +3,7 @@ cancelled statuses (spec 11)."""
 
 from __future__ import annotations
 
+import re
 import threading
 from dataclasses import dataclass, field
 from typing import Any
@@ -53,6 +54,12 @@ class FakeCursor:
     # -- DB-API-ish --------------------------------------------------------
 
     def execute(self, sql: str, params: Any = None) -> FakeCursor:
+        status = self.conn.status_rows(sql)
+        if status is not None:
+            self.description, rows = status
+            self._rows = rows
+            self._pos = 0
+            return self
         self.conn.executed.append(sql)
         if sql.upper().startswith("SELECT SYSTEM$CANCEL_QUERY"):
             self.conn.cancel_requested.set()
@@ -64,11 +71,14 @@ class FakeCursor:
         spec = self.conn.plan_for(sql)
         if spec.error is not None:
             raise spec.error
+        self.conn.track_transaction(sql)
         self._apply(spec)
         return self
 
     def execute_async(self, sql: str) -> FakeCursor:
         self.conn.executed.append(sql)
+        if self.conn.plan_for(sql).error is None:
+            self.conn.track_transaction(sql)
         self.sfqid = self.conn.next_qid()
         self.conn.pending[self.sfqid] = (sql, self.conn.plan_for(sql).polls)
         return self
@@ -110,8 +120,18 @@ class FakeCursor:
         self.closed = True
 
 
+_DML = re.compile(r"^\s*(insert|update|delete|merge)\b", re.IGNORECASE)
+_DDL = re.compile(r"^\s*(create|drop|alter|truncate)\b", re.IGNORECASE)
+_SET_AUTOCOMMIT = re.compile(r"^\s*alter\s+session\s+set\s+autocommit\s*=\s*(\w+)", re.IGNORECASE)
+
+
 class FakeConnection:
-    """Implements the ``Connection`` protocol from :mod:`snowdesk.db.session`."""
+    """Implements the ``Connection`` protocol from :mod:`snowdesk.db.session`.
+
+    Models just enough of Snowflake's transactions for the commit-mode
+    indicator (Q10): AUTOCOMMIT, BEGIN / COMMIT / ROLLBACK, DML opening a
+    transaction when AUTOCOMMIT is off, and DDL committing implicitly.
+    """
 
     def __init__(self, plan: dict[str, FakeStatement] | None = None) -> None:
         self.plan = plan or {}
@@ -127,6 +147,49 @@ class FakeConnection:
         self.schema = "PUBLIC"
         self._qid = 0
         self._polled: dict[str, int] = {}
+        self.autocommit = True
+        self.transaction_id: str | None = None
+        self._txn = 0
+        #: SnowDesk's own reads of the commit mode and open transaction.  Kept
+        #: out of ``executed``, which is what the user ran.
+        self.status_queries: list[str] = []
+        #: Raised by those reads, to simulate them failing.
+        self.status_error: Exception | None = None
+
+    # -- transactions ------------------------------------------------------
+
+    def status_rows(self, sql: str) -> tuple[list[tuple], list[tuple]] | None:
+        upper = " ".join(sql.upper().split())
+        if upper == "SELECT CURRENT_TRANSACTION()":
+            column = [("CURRENT_TRANSACTION()", 2, None, None, None, None, True)]
+            rows = [(self.transaction_id,)]
+        elif upper.startswith("SHOW PARAMETERS LIKE 'AUTOCOMMIT'"):
+            column = [("key", 2, None, None, None, None, False)]
+            rows = [("AUTOCOMMIT", str(self.autocommit).lower(), "true", "SESSION")]
+        else:
+            return None
+        self.status_queries.append(sql)
+        if self.status_error is not None:
+            raise self.status_error
+        return column, rows
+
+    def track_transaction(self, sql: str) -> None:
+        upper = " ".join(sql.upper().split())
+        if upper.startswith(("BEGIN", "START TRANSACTION")):
+            self._open()
+        elif upper.startswith(("COMMIT", "ROLLBACK")):
+            self.transaction_id = None
+        elif match := _SET_AUTOCOMMIT.match(sql):
+            self.autocommit = match.group(1).lower() == "true"
+        elif _DDL.match(sql):
+            self.transaction_id = None
+        elif _DML.match(sql) and not self.autocommit:
+            self._open()
+
+    def _open(self) -> None:
+        if self.transaction_id is None:
+            self._txn += 1
+            self.transaction_id = f"17000000000{self._txn:02d}"
 
     def next_qid(self) -> str:
         self._qid += 1

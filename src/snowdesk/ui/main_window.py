@@ -3,10 +3,20 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QKeySequence
+from PySide6.QtCore import QSize, Qt, QTimer, Signal
+from PySide6.QtGui import (
+    QAction,
+    QActionGroup,
+    QCloseEvent,
+    QColor,
+    QIcon,
+    QKeySequence,
+    QPainter,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -25,6 +35,7 @@ from PySide6.QtWidgets import (
     QStyle,
     QTabWidget,
     QToolBar,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -37,11 +48,20 @@ from snowdesk.db.session import ConnectionState, ConnectParams
 from snowdesk.db.worker import (
     ConnectJob,
     DisconnectJob,
+    EndTransactionJob,
     ProfileJob,
     ReconnectJob,
+    SetAutocommitJob,
     SnowflakeWorker,
 )
-from snowdesk.model import ColumnInfo, QueryError, RunStatus, SessionContext, StatementOutcome
+from snowdesk.model import (
+    ColumnInfo,
+    QueryError,
+    RunStatus,
+    SessionContext,
+    StatementOutcome,
+    TransactionState,
+)
 from snowdesk.storage.history import HistoryStore
 from snowdesk.storage.session import SessionStore
 from snowdesk.ui import preferences, theme
@@ -69,6 +89,13 @@ _STATE_DOT = {
     ConnectionState.CONNECTED.value: ("●", "#1a7f37", "Connected"),
     ConnectionState.ERROR.value: ("●", "#e5534b", "Error"),
 }
+
+#: The open-transaction dot.  Amber that reads on both light and dark bars.
+TRANSACTION_COLOR = "#d29922"
+#: How often "Transaction open · 4m" re-counts its minutes.
+TRANSACTION_TICK_MS = 30_000
+#: Says the commit-mode segment opens a menu, in place of Qt's own arrow.
+MENU_MARK = "▾"
 
 
 class MainWindow(QMainWindow):
@@ -106,6 +133,10 @@ class MainWindow(QMainWindow):
         self._context = SessionContext()
         self._connections: dict[str, config.ConnectionInfo] = {}
         self._escape_formulas = True
+        self._connected = False
+        self._transaction = TransactionState()
+        #: When the open transaction was first seen, for its elapsed time.
+        self._transaction_since: datetime | None = None
 
         self._build_toolbar()
         self._build_banner()
@@ -227,6 +258,8 @@ class MainWindow(QMainWindow):
         self.banner_bar.setVisible(False)
 
     def _reconnect(self) -> None:
+        if not self._settle_transaction("Reconnecting ends this session and its open transaction."):
+            return
         self.hide_banner()
         self.worker.submit(ReconnectJob())
 
@@ -312,13 +345,48 @@ class MainWindow(QMainWindow):
         self.qid_label = QLabel("", self)
         self.qid_label.setToolTip("Query ID of the last statement")
 
+        # Commit mode, and the open transaction when there is one (Q10).  A
+        # button, because clicking it is how the mode is changed; its menu is
+        # filled in with the Query menu's actions in _build_actions.
+        self.commit_button = QToolButton(self)
+        self.commit_button.setAutoRaise(True)
+        self.commit_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.commit_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.commit_button.setAccessibleName("Commit mode")
+        # Styled to read as one more status segment, not a push button: the
+        # macOS bezel and its menu arrow crowd the text, and the platform
+        # gives tool buttons a smaller font than the labels beside it.  The
+        # translucent hover works on light and dark bars alike.
+        font = self.context_label.font()
+        # Marked as set, or Qt resolves it straight back to the button font.
+        font.setPointSizeF(font.pointSizeF())
+        self.commit_button.setFont(font)
+        self.commit_button.setIconSize(QSize(8, 8))
+        self.commit_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.commit_button.setStyleSheet(
+            "QToolButton { border: none; border-radius: 4px; padding: 1px 4px; }"
+            " QToolButton:hover, QToolButton:pressed"
+            " { background: rgba(128, 128, 128, 0.18); }"
+            " QToolButton::menu-indicator { image: none; width: 0; }"
+        )
+        self._transaction_dot = self._dot_icon(TRANSACTION_COLOR)
+        self._transaction_timer = QTimer(self)
+        self._transaction_timer.setInterval(TRANSACTION_TICK_MS)
+        self._transaction_timer.timeout.connect(self._render_transaction)
+
         # Separated, or the segments read as one run-on string
         # ("RAW.PUBLIC 0 rows 0 ms 01b0-0001").  Each divider belongs to the
         # segment after it and hides with it, so an empty segment does not
         # leave a dangling bar.
-        self._status_dividers: dict[QLabel, QLabel] = {}
+        self._status_dividers: dict[QWidget, QLabel] = {}
         for index, widget in enumerate(
-            (self.context_label, self.rows_label, self.time_label, self.qid_label)
+            (
+                self.context_label,
+                self.rows_label,
+                self.time_label,
+                self.qid_label,
+                self.commit_button,
+            )
         ):
             if index:
                 divider = QLabel("│", self)
@@ -327,12 +395,34 @@ class MainWindow(QMainWindow):
                 self.statusBar().addPermanentWidget(divider)
                 self._status_dividers[widget] = divider
             self.statusBar().addPermanentWidget(widget)
+        self._set_status_visible(self.commit_button, False)
 
     def _set_status_segment(self, label: QLabel, text: str) -> None:
         label.setText(text)
         divider = self._status_dividers.get(label)
         if divider is not None:
             divider.setVisible(bool(text))
+
+    def _set_status_visible(self, widget: QWidget, visible: bool) -> None:
+        widget.setVisible(visible)
+        divider = self._status_dividers.get(widget)
+        if divider is not None:
+            divider.setVisible(visible)
+
+    def _dot_icon(self, color: str) -> QIcon:
+        """A small filled circle, drawn at the screen's pixel density."""
+        ratio = max(1.0, self.devicePixelRatioF())
+        size = 8
+        pixmap = QPixmap(round(size * ratio), round(size * ratio))
+        pixmap.setDevicePixelRatio(ratio)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(color))
+        painter.drawEllipse(0, 0, size, size)
+        painter.end()
+        return QIcon(pixmap)
 
     def _build_actions(self) -> None:
         self._menus: dict[str, QMenu] = {}
@@ -384,6 +474,8 @@ class MainWindow(QMainWindow):
         action("Query Profile", "Ctrl+Shift+P", self.profile_current_query, "&Query")
         action("Copy Query ID", "", self.copy_current_query_id, "&Query")
         self._menu("&Query").addSeparator()
+        self._build_transaction_actions(action)
+        self._menu("&Query").addSeparator()
         action("Reconnect", "Ctrl+R", self._reconnect, "&Query")
 
         action(
@@ -407,6 +499,36 @@ class MainWindow(QMainWindow):
             "&Help",
             QAction.MenuRole.AboutRole,
         )
+
+    def _build_transaction_actions(self, action) -> None:
+        """Commit mode and Commit / Roll Back, in the Query menu and behind
+        the status-bar button (Q10).
+
+        No shortcuts: a stray keystroke that commits or throws away someone's
+        changes costs far more than reaching for the menu does.
+        """
+        group = QActionGroup(self)
+        group.setExclusive(True)
+        self.autocommit_action = action(
+            "Auto-Commit", "", lambda: self.set_autocommit(True), "&Query"
+        )
+        self.manual_commit_action = action(
+            "Manual Commit", "", lambda: self.set_autocommit(False), "&Query"
+        )
+        for act in (self.autocommit_action, self.manual_commit_action):
+            act.setCheckable(True)
+            group.addAction(act)
+        self.commit_action = action("Commit", "", self.commit_transaction, "&Query")
+        self.rollback_action = action("Roll Back", "", self.rollback_transaction, "&Query")
+
+        menu = QMenu(self.commit_button)
+        menu.addAction(self.autocommit_action)
+        menu.addAction(self.manual_commit_action)
+        menu.addSeparator()
+        menu.addAction(self.commit_action)
+        menu.addAction(self.rollback_action)
+        self.commit_button.setMenu(menu)
+        self._render_transaction()
 
     def _build_appearance_menu(self) -> None:
         """View ▸ Appearance, as a set of mutually exclusive choices."""
@@ -529,6 +651,9 @@ class MainWindow(QMainWindow):
         w.export_finished.connect(self._on_export_finished)
         w.export_failed.connect(self._on_export_failed)
         w.export_cancelled.connect(self._on_export_cancelled)
+        w.transaction_changed.connect(self._on_transaction_changed)
+        w.transaction_ended.connect(self._on_transaction_ended)
+        w.autocommit_failed.connect(self._on_autocommit_failed)
 
         self.query.run_started.connect(self._on_run_started)
         self.query.run_finished.connect(self._on_run_finished)
@@ -588,6 +713,10 @@ class MainWindow(QMainWindow):
         if not name:
             return
         if self.worker.session.is_connected and self.connect_button.text() == "Disconnect":
+            if not self._settle_transaction(
+                "Disconnecting ends this session and its open transaction."
+            ):
+                return
             self.worker.submit(DisconnectJob())
             return
         self.worker.submit(ConnectJob(params=ConnectParams(name=name)))
@@ -642,8 +771,11 @@ class MainWindow(QMainWindow):
         connection is gone, and one click brings it back.
         """
         where = f" to {name}" if name else ""
-        self._log_message(f"Connection{where} lost: {message}")
-        self.show_banner(f"Connection{where} lost — {message}")
+        lost = (
+            " The open transaction was not committed." if self._transaction.in_transaction else ""
+        )
+        self._log_message(f"Connection{where} lost: {message}{lost}")
+        self.show_banner(f"Connection{where} lost — {message}{lost}")
         self.statusBar().showMessage("Disconnected", 6000)
 
     def _on_sso_hint(self) -> None:
@@ -661,6 +793,8 @@ class MainWindow(QMainWindow):
         self.run_button.setEnabled(connected)
         if detail and state == ConnectionState.ERROR.value:
             self.statusBar().showMessage(detail, 8000)
+        self._connected = connected
+        self._render_transaction()
         if not connected:
             self._set_context(SessionContext())
 
@@ -684,6 +818,7 @@ class MainWindow(QMainWindow):
         self.run_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.cancel_action.setEnabled(True)
+        self._update_transaction_actions()
         count = len(statements)
         self._log_message(f"Running {count} statement{'' if count == 1 else 's'}…")
 
@@ -716,6 +851,7 @@ class MainWindow(QMainWindow):
         self.run_button.setEnabled(self.worker.session.is_connected)
         self.stop_button.setEnabled(False)
         self.cancel_action.setEnabled(False)
+        self._update_transaction_actions()
         self.history_panel.reload()
         failed = [o for o in outcomes if o.status is RunStatus.ERROR]
         cancelled = [o for o in outcomes if o.status is RunStatus.CANCELLED]
@@ -726,6 +862,129 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Cancelled", 4000)
         else:
             self.statusBar().showMessage("Done", 4000)
+
+    # -- transactions (Q10) --------------------------------------------------
+
+    def _on_transaction_changed(self, state: TransactionState) -> None:
+        if state.transaction_id != self._transaction.transaction_id:
+            self._transaction_since = datetime.now() if state.in_transaction else None
+        self._transaction = state
+        self._render_transaction()
+
+    def _render_transaction(self) -> None:
+        """Show the session's commit mode, as last read back from it."""
+        state = self._transaction
+        button = self.commit_button
+        self._set_status_visible(button, self._connected)
+        if state.in_transaction:
+            since = self._transaction_since or datetime.now()
+            elapsed = _elapsed_minutes(datetime.now() - since)
+            text = f"Transaction open · {elapsed}" if elapsed else "Transaction open"
+            button.setIcon(self._transaction_dot)
+            mode = "" if state.autocommit is not False else "Auto-commit is off. "
+            tip = (
+                f"{mode}Transaction {state.transaction_id} has been open since "
+                f"{since:%H:%M}. Click to commit or roll it back."
+            )
+            if not self._transaction_timer.isActive():
+                self._transaction_timer.start()
+        else:
+            self._transaction_timer.stop()
+            button.setIcon(QIcon())
+            if state.autocommit is None:
+                text = "Commit mode ?"
+                tip = "SnowDesk could not read AUTOCOMMIT for this session."
+            elif state.autocommit:
+                text = "Auto-commit"
+                tip = "Each statement commits as it runs. Click to change."
+            else:
+                text = "Manual commit"
+                tip = "Changes stay uncommitted until you commit them. Click to change."
+        button.setText(f"{text} {MENU_MARK}")
+        button.setToolTip(tip)
+        self.autocommit_action.setChecked(state.autocommit is True)
+        self.manual_commit_action.setChecked(state.autocommit is False)
+        self._update_transaction_actions()
+
+    def _update_transaction_actions(self) -> None:
+        ready = self._connected and not self.query.is_running
+        in_transaction = ready and self._transaction.in_transaction
+        self.autocommit_action.setEnabled(ready)
+        self.manual_commit_action.setEnabled(ready)
+        self.commit_action.setEnabled(in_transaction)
+        self.rollback_action.setEnabled(in_transaction)
+
+    def set_autocommit(self, enabled: bool) -> None:
+        """Switch the session's commit mode, ending any open transaction first."""
+        # The click has already moved the check mark; put it back until the
+        # session says the mode really changed.
+        self._render_transaction()
+        if self._transaction.autocommit is enabled:
+            return
+        if not self._settle_transaction(
+            "The commit mode can only change once the open transaction has ended."
+        ):
+            return
+        self.worker.submit(SetAutocommitJob(enabled=enabled))
+
+    def commit_transaction(self) -> None:
+        self.worker.submit(EndTransactionJob(commit=True))
+        self.statusBar().showMessage("Committing…")
+
+    def rollback_transaction(self) -> None:
+        self.worker.submit(EndTransactionJob(commit=False))
+        self.statusBar().showMessage("Rolling back…")
+
+    def _settle_transaction(self, reason: str) -> bool:
+        """Ask what to do with an open transaction before ending the session.
+
+        Returns False when the user backs out.  Otherwise the COMMIT or
+        ROLLBACK is queued, and runs before whatever the caller queues next.
+        """
+        if not self._transaction.in_transaction:
+            return True
+        commit = self.ask_open_transaction(reason)
+        if commit is None:
+            return False
+        self.worker.submit(EndTransactionJob(commit=commit))
+        return True
+
+    def ask_open_transaction(self, reason: str) -> bool | None:
+        """Commit (True), Roll Back (False), or Cancel (None)."""
+        box = message_box(self)
+        box.setWindowTitle("Open transaction")
+        box.setText("This session has a transaction open.")
+        box.setInformativeText(f"{reason} Commit its changes or roll them back?")
+        commit = box.addButton("Commit", QMessageBox.ButtonRole.AcceptRole)
+        rollback = box.addButton("Roll Back", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(commit)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is commit:
+            return True
+        if clicked is rollback:
+            return False
+        return None
+
+    def _on_transaction_ended(self, outcome: StatementOutcome) -> None:
+        sql = outcome.statement.sql
+        if outcome.status is RunStatus.ERROR:
+            detail = outcome.error.formatted() if outcome.error else outcome.message
+            self._log_message(f"{sql} failed\n{detail}")
+            self.statusBar().showMessage(f"{sql} failed — see Messages", 6000)
+            self.result_tabs.setCurrentWidget(self.messages)
+        else:
+            self._log_message(f"{sql}: {outcome.message}")
+            self.statusBar().showMessage("Committed" if sql == "COMMIT" else "Rolled back", 4000)
+        if outcome.query_id:
+            self._last_query_id = outcome.query_id
+            self._set_status_segment(self.qid_label, outcome.query_id)
+        self.history_panel.reload()
+
+    def _on_autocommit_failed(self, message: str) -> None:
+        self._log_message(f"Could not change the commit mode: {message}")
+        self.statusBar().showMessage("Commit mode unchanged — see Messages", 6000)
 
     # -- results -----------------------------------------------------------
 
@@ -991,7 +1250,22 @@ class MainWindow(QMainWindow):
         self.messages.appendPlainText(text)
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        # Tab contents are autosaved, so quitting never has to ask (E2).
+        # Tab contents are autosaved, so quitting only has to ask about
+        # changes that live in Snowflake: an open transaction (E2, Q10).  The
+        # COMMIT or ROLLBACK is queued ahead of the worker's shutdown job.
+        if not self._settle_transaction("Quitting ends this session and its open transaction."):
+            event.ignore()
+            return
         self.editors.save_session()
         self.closing.emit()
         super().closeEvent(event)
+
+
+def _elapsed_minutes(delta: timedelta) -> str:
+    """``4m`` or ``1h 12m``; empty under a minute, where a count is noise."""
+    minutes = int(delta.total_seconds() // 60)
+    if minutes < 1:
+        return ""
+    if minutes < 60:
+        return f"{minutes}m"
+    return f"{minutes // 60}h {minutes % 60}m"
