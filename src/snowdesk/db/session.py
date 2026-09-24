@@ -191,6 +191,54 @@ class SnowflakeSession:
             return SessionContext()
         return SessionContext(*(str(v) if v else None for v in row[:4]))
 
+    # -- transactions (Q10) ------------------------------------------------
+
+    def read_autocommit(self) -> bool | None:
+        """The session's AUTOCOMMIT, or ``None`` if it could not be read.
+
+        Asked of the server, because ``connections.toml`` can set it and a
+        script can change it, and the connector only learns of either
+        sometimes.
+        """
+        row = self._fetch_one("SHOW PARAMETERS LIKE 'AUTOCOMMIT' IN SESSION")
+        if not row or len(row) < 2:
+            return None
+        return str(row[1]).strip().lower() == "true"
+
+    def read_transaction_id(self) -> str | None:
+        """The open transaction's id, or ``None`` when there is none.
+
+        Raises when the session could not be asked, so a failed read is not
+        mistaken for "nothing open".
+        """
+        cur = self.connection.cursor()
+        try:
+            cur.execute("SELECT CURRENT_TRANSACTION()")
+            row = cur.fetchone()
+        finally:
+            cur.close()
+        value = row[0] if row else None
+        return str(value) if value else None
+
+    def set_autocommit(self, enabled: bool) -> None:
+        cur = self.connection.cursor()
+        try:
+            cur.execute(f"ALTER SESSION SET AUTOCOMMIT = {'TRUE' if enabled else 'FALSE'}")
+        finally:
+            cur.close()
+
+    def _fetch_one(self, sql: str) -> Any:
+        try:
+            cur = self.connection.cursor()
+            try:
+                cur.execute(sql)
+                return cur.fetchone()
+            finally:
+                cur.close()
+        except Exception:
+            log.debug("Could not run %s", sql, exc_info=True)
+            return None
+
     # -- SSO hint ----------------------------------------------------------
 
     def should_hint_id_token(self) -> bool:

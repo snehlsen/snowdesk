@@ -83,6 +83,8 @@ class QueryController(QObject):
         self._running = False
         self._connection_name = ""
         worker.statement_finished.connect(self._on_statement_finished)
+        # Commit and Roll back from the status bar belong in History too.
+        worker.transaction_ended.connect(self._on_statement_finished)
         worker.script_finished.connect(self._on_script_finished)
         worker.connected.connect(self._on_connected)
 

@@ -66,6 +66,7 @@ Priority: **P0** is required for v1, **P1** is expected for v1 but can slip, **P
 | Q7 | Tag all queries with a `QUERY_TAG` so they are easy to find in Snowflake query history. | P1 |
 | Q8 | Show the result of each statement in a multi-statement run as a separate result tab. | P1 |
 | Q9 | Link out to the query in Snowsight for profiling. | P2 |
+| Q10 | Show the session's commit mode and any open transaction in the status bar; switch between auto-commit and manual commit, and commit or roll back, from there. Ask before disconnecting, reconnecting or quitting with a transaction open. | P1 |
 
 ### 4.3 Results
 
@@ -304,6 +305,14 @@ The worker keeps the live cursor in a registry keyed by a result ID and closes i
 
 After each statement the worker reads `conn.role`, `conn.warehouse`, `conn.database`, and `conn.schema`, which the connector updates from Snowflake's responses, and emits a `context_changed` signal for the status bar. If any value looks stale in testing, fall back to `SELECT CURRENT_ROLE(), CURRENT_WAREHOUSE(), CURRENT_DATABASE(), CURRENT_SCHEMA()`.
 
+### 7.6.1 Commit mode
+
+The status bar's last segment shows `Auto-commit`, `Manual commit`, or `● Transaction open · 4m`, and opens a menu (also under Query) to switch mode, commit, or roll back. It reflects what the session reports, not what SnowDesk last asked for: a script can `ALTER SESSION SET AUTOCOMMIT` or `BEGIN` on its own, `connections.toml` can set `autocommit`, and DDL commits implicitly. So the worker reads `SELECT CURRENT_TRANSACTION()` after connecting, after every run, and after a Commit or Roll back, and reads `SHOW PARAMETERS LIKE 'AUTOCOMMIT' IN SESSION` after connecting, after a mode switch, and after any script that mentions `autocommit`.
+
+Commit and Roll back run as their own worker job rather than as a script, so they do not clear the result tabs the user was checking; they are still logged in Messages and recorded in History. The mode is never changed while a transaction is open: the UI asks to commit or roll back first, and the worker re-checks and refuses if one is still open. The choice lasts for the session only.
+
+Disconnect, Reconnect and quitting ask Commit / Roll Back / Cancel when a transaction is open, and queue the answer ahead of the disconnect or shutdown job. A lost connection cannot ask, so its banner says the transaction was not committed.
+
 ### 7.7 Object browser queries
 
 The browser uses `SHOW DATABASES`, `SHOW SCHEMAS IN DATABASE <db>`, `SHOW OBJECTS IN SCHEMA <db>.<schema>`, and `SHOW COLUMNS IN TABLE <fqn>`, one level at a time on expand. Results are cached per node with a manual refresh. Identifiers are quoted only when needed (not all-uppercase alphanumeric/underscore), using a single `quote_ident` helper that is unit-tested.
@@ -333,7 +342,7 @@ History lives in SQLite at `~/Library/Application Support/SnowDesk/history.db`. 
 │               │ │ 1001     │ 2026-09-10   │ 42.50     │ {"sku":"A1"}  │   │
 │               │ └──────────┴──────────────┴───────────┴───────────────┘   │
 ├───────────────┴───────────────────────────────────────────────────────────┤
-│ ANALYST_ROLE · COMPUTE_WH · RAW.PUBLIC │ 500 of ? rows │ 1.84 s │ 01b2…c9 │
+│ ANALYST · WH_XS · RAW.PUBLIC │ 500 of ? │ 1.84 s │ 01b2…c9 │ Auto-commit  │
 └───────────────────────────────────────────────────────────────────────────┘
 ```
 

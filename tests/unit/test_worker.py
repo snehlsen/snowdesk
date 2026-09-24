@@ -9,12 +9,15 @@ from snowdesk.db.splitter import split_sql
 from snowdesk.db.worker import (
     BrowseJob,
     ConnectJob,
+    DisconnectJob,
+    EndTransactionJob,
     FetchMoreJob,
     ProfileJob,
     RunScriptJob,
+    SetAutocommitJob,
     SnowflakeWorker,
 )
-from snowdesk.model import RunStatus
+from snowdesk.model import RunStatus, TransactionState
 from tests.fakes import FakeConnection, FakeProgrammingError, FakeStatement
 
 COLS = [("N", 0, None, None, 38, 0, False)]
@@ -342,3 +345,145 @@ def test_profile_without_a_connection_says_so(qapp) -> None:
     failures = collect(worker.profile_failed)
     worker._dispatch(ProfileJob(query_id=QID))
     assert failures[0] == (QID, "Not connected.")
+
+
+# -- commit mode and transactions (Q10) ---------------------------------------
+
+
+def run_sql(worker: SnowflakeWorker, sql: str) -> None:
+    worker._dispatch(RunScriptJob(statements=split_sql(sql)))
+
+
+def test_connect_reads_the_commit_mode(qapp) -> None:
+    conn = FakeConnection()
+    conn.autocommit = False  # as connections.toml can set it
+    worker = SnowflakeWorker(session=SnowflakeSession(connect_fn=lambda _p: conn))
+    states = collect(worker.transaction_changed)
+    worker._dispatch(ConnectJob(params=ConnectParams(name="dev")))
+    assert states[-1] == TransactionState(autocommit=False, transaction_id=None)
+
+
+def test_switching_to_manual_commit(worker_and_conn) -> None:
+    worker, conn = worker_and_conn
+    states = collect(worker.transaction_changed)
+    worker._dispatch(SetAutocommitJob(enabled=False))
+    assert conn.executed[-1] == "ALTER SESSION SET AUTOCOMMIT = FALSE"
+    assert states[-1].autocommit is False
+
+
+def test_dml_in_manual_mode_opens_a_transaction_and_commit_ends_it(worker_and_conn) -> None:
+    worker, conn = worker_and_conn
+    worker._dispatch(SetAutocommitJob(enabled=False))
+    states = collect(worker.transaction_changed)
+    ended = collect(worker.transaction_ended)
+
+    run_sql(worker, "insert into t values (1)")
+    assert states[-1].in_transaction
+    assert states[-1].transaction_id == conn.transaction_id
+
+    worker._dispatch(EndTransactionJob(commit=True))
+    assert conn.executed[-1] == "COMMIT"
+    assert ended[-1].status is RunStatus.SUCCESS
+    assert ended[-1].statement.sql == "COMMIT"
+    assert not states[-1].in_transaction
+    assert states[-1].autocommit is False
+
+
+def test_rollback_ends_the_transaction(worker_and_conn) -> None:
+    worker, conn = worker_and_conn
+    run_sql(worker, "begin")
+    ended = collect(worker.transaction_ended)
+    worker._dispatch(EndTransactionJob(commit=False))
+    assert conn.executed[-1] == "ROLLBACK"
+    assert ended[-1].message.startswith("Rolled back")
+    assert conn.transaction_id is None
+
+
+def test_an_explicit_begin_shows_even_with_autocommit_on(worker_and_conn) -> None:
+    worker, _conn = worker_and_conn
+    states = collect(worker.transaction_changed)
+    run_sql(worker, "begin; insert into t values (1)")
+    assert states[-1].autocommit is True
+    assert states[-1].in_transaction
+
+
+def test_ddl_commits_implicitly(worker_and_conn) -> None:
+    worker, _conn = worker_and_conn
+    worker._dispatch(SetAutocommitJob(enabled=False))
+    states = collect(worker.transaction_changed)
+    run_sql(worker, "insert into t values (1)")
+    assert states[-1].in_transaction
+    run_sql(worker, "create table u (n int)")
+    assert not states[-1].in_transaction
+
+
+def test_the_mode_does_not_change_mid_transaction(worker_and_conn) -> None:
+    worker, conn = worker_and_conn
+    worker._dispatch(SetAutocommitJob(enabled=False))
+    run_sql(worker, "insert into t values (1)")
+    failures = collect(worker.autocommit_failed)
+
+    worker._dispatch(SetAutocommitJob(enabled=True))
+    assert "transaction is open" in failures[-1]
+    assert "ALTER SESSION SET AUTOCOMMIT = TRUE" not in conn.executed
+    assert conn.autocommit is False
+
+
+def test_a_script_that_sets_autocommit_is_read_back(worker_and_conn) -> None:
+    worker, conn = worker_and_conn
+    states = collect(worker.transaction_changed)
+    run_sql(worker, "alter session set autocommit = false")
+    assert conn.status_queries[-2].startswith("SHOW PARAMETERS LIKE 'AUTOCOMMIT'")
+    assert states[-1].autocommit is False
+
+
+def test_autocommit_is_only_re_read_when_a_script_mentions_it(worker_and_conn) -> None:
+    worker, conn = worker_and_conn
+    before = len(conn.status_queries)
+    run_sql(worker, "select 1; select 2")
+    asked = conn.status_queries[before:]
+    assert asked == ["SELECT CURRENT_TRANSACTION()"]
+
+
+def test_a_failed_commit_is_reported(qapp) -> None:
+    conn = FakeConnection(
+        {"commit": FakeStatement(error=FakeProgrammingError("Commit refused", errno=1234))}
+    )
+    worker = SnowflakeWorker(session=SnowflakeSession(connect_fn=lambda _p: conn))
+    worker._dispatch(ConnectJob(params=ConnectParams(name="dev")))
+    run_sql(worker, "begin")
+    ended = collect(worker.transaction_ended)
+    states = collect(worker.transaction_changed)
+    worker._dispatch(EndTransactionJob(commit=True))
+    assert ended[-1].status is RunStatus.ERROR
+    assert "[1234]" in ended[-1].message
+    assert states[-1].in_transaction  # still open, and still shown
+
+
+def test_losing_the_session_while_reading_the_transaction_resets_it(worker_and_conn) -> None:
+    worker, conn = worker_and_conn
+    run_sql(worker, "begin")
+    lost = collect(worker.connection_lost)
+    states = collect(worker.transaction_changed)
+    conn.status_error = FakeProgrammingError("Session no longer exists", errno=390104)
+    run_sql(worker, "select 1")
+    assert lost
+    assert states[-1] == TransactionState()
+    assert not worker.session.is_connected
+
+
+def test_an_unreadable_transaction_keeps_what_was_last_known(worker_and_conn) -> None:
+    worker, conn = worker_and_conn
+    run_sql(worker, "begin")
+    states = collect(worker.transaction_changed)
+    conn.status_error = FakeProgrammingError("SQL compilation error", errno=1003)
+    run_sql(worker, "select 1")
+    assert states[-1].in_transaction
+    assert worker.session.is_connected
+
+
+def test_disconnect_clears_the_transaction_state(worker_and_conn) -> None:
+    worker, _conn = worker_and_conn
+    states = collect(worker.transaction_changed)
+    worker._dispatch(DisconnectJob())
+    assert states[-1] == TransactionState()
