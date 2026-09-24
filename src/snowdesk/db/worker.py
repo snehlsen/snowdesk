@@ -849,7 +849,7 @@ class SnowflakeWorker(QObject):
         except Exception as exc:
             self._note_failure(exc)
             error: QueryError = to_query_error(exc)
-            self.browse_failed.emit(path, error.message)
+            self.browse_failed.emit(path, error.formatted())
             return
         self.nodes_ready.emit(path, nodes)
 
@@ -863,7 +863,7 @@ class SnowflakeWorker(QObject):
             found = stage_ops.list_stages(self.session.connection)
         except Exception as exc:
             self._note_failure(exc)
-            self.stages_failed.emit(to_query_error(exc).message)
+            self.stages_failed.emit(to_query_error(exc).formatted())
             return
         self.stages_ready.emit(found)
 
@@ -880,7 +880,7 @@ class SnowflakeWorker(QObject):
             return
         except Exception as exc:
             self._note_failure(exc)
-            self.stage_list_failed.emit(job.stage, job.prefix, to_query_error(exc).message)
+            self.stage_list_failed.emit(job.stage, job.prefix, to_query_error(exc).formatted())
             return
         self.stage_listed.emit(job.stage, job.prefix, files, truncated)
 

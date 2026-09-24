@@ -99,6 +99,11 @@ class ObjectTree(QTreeWidget):
 
     def _on_failed(self, path: tuple[str, ...], message: str) -> None:
         parent = self._item_for_path(path)
+        if path and parent is None:
+            # Collapsed or refreshed away before the answer came.  A None
+            # parent means the root, and the error would replace every
+            # database in the tree.
+            return
         self._set_placeholder(parent, message or "Could not load", error=True)
 
     def _replace_children(self, parent: QTreeWidgetItem | None, nodes: list[ObjectNode]) -> None:
@@ -133,7 +138,11 @@ class ObjectTree(QTreeWidget):
     def _set_placeholder(
         self, parent: QTreeWidgetItem | None, text: str, error: bool = False
     ) -> None:
-        item = QTreeWidgetItem([text, ""])
+        # The first line in the row; all of an error, code and query ID
+        # included, in the tooltip, since a narrow sidebar cuts the row short.
+        first = text.strip().splitlines()[0] if text.strip() else text
+        item = QTreeWidgetItem([first, ""])
+        item.setToolTip(0, text)
         item.setDisabled(True)
         if error:
             item.setForeground(0, QColor("#e5534b"))

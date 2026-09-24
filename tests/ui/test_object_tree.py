@@ -204,3 +204,24 @@ def test_each_level_carries_an_icon(tree: ObjectTree) -> None:
 def test_columns_have_no_icon_of_their_own(tree: ObjectTree) -> None:
     tree.controller._on_nodes(("RAW", "PUBLIC", "ORDERS"), COLUMNS)
     assert item_for(tree, ("RAW", "PUBLIC", "ORDERS", "ORDER_ID")).icon(0).isNull()
+
+
+# -- errors ------------------------------------------------------------------
+
+
+def test_a_failed_expand_shows_the_first_line_and_the_rest_in_a_tooltip(tree: ObjectTree) -> None:
+    message = (
+        "[2003] (SQLSTATE 02000) SQL compilation error:\n"
+        "Schema 'RAW.PUBLIC' does not exist or not authorized.\n"
+        "Query ID: 01b0-0042"
+    )
+    tree.controller._on_failed(("RAW", "PUBLIC"), message)
+    notice = item_for(tree, ("RAW", "PUBLIC")).child(0)
+    assert notice.text(0) == "[2003] (SQLSTATE 02000) SQL compilation error:"
+    assert notice.toolTip(0) == message
+
+
+def test_a_failure_for_a_node_no_longer_there_leaves_the_tree_alone(tree: ObjectTree) -> None:
+    """A missing node is not the root: the error must not replace every database."""
+    tree.controller._on_failed(("GONE", "AWAY"), "Could not load")
+    assert [tree.topLevelItem(i).text(0) for i in range(tree.topLevelItemCount())] == ["RAW"]

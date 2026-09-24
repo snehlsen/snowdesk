@@ -69,7 +69,7 @@ def test_a_failed_listing_is_reported_against_its_node(worker_and_conn) -> None:
 
     conn.stage.handle = refuse  # type: ignore[method-assign]
     worker._dispatch(ListStageJob(stage=LANDING, prefix="b/"))
-    assert failures == [(LANDING, "b/", "Insufficient privileges to operate on stage")]
+    assert failures == [(LANDING, "b/", "[3001] Insufficient privileges to operate on stage")]
 
 
 def test_an_unsafe_prefix_is_refused_without_a_query(worker_and_conn) -> None:

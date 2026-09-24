@@ -29,7 +29,7 @@ from snowdesk.ui.stage_tree import (
     STAGE_ROLE,
     StagePanel,
 )
-from tests.fakes import FakeConnection, FakeStages
+from tests.fakes import FakeConnection, FakeProgrammingError, FakeStages
 
 
 class Immediately:
@@ -476,3 +476,29 @@ def test_the_sidebar_remembers_its_page(harness: Harness, qtbot, tmp_path) -> No
     )
     qtbot.addWidget(again)
     assert again.sidebar.currentWidget() is again.stage_panel
+
+
+def test_a_listing_error_is_readable_in_full(harness: Harness, monkeypatch) -> None:
+    """The sidebar cuts the row short; the tooltip and Messages do not."""
+    harness.show_stages()
+    error = FakeProgrammingError(
+        "SQL compilation error:\nStage 'RAW.PUBLIC.ARCHIVE' does not exist or not authorized.",
+        errno=2003,
+        sqlstate="02000",
+        sfqid="01b0-9999",
+    )
+
+    def refuse(sql: str):
+        if sql.startswith("LIST"):
+            raise error
+        return None
+
+    monkeypatch.setattr(harness.stage, "handle", refuse)
+    stage = harness.item("RAW", "PUBLIC", "ARCHIVE")
+    notice = stage.child(0)
+    assert notice.text(0) == "[2003] (SQLSTATE 02000) SQL compilation error:"
+    tip = notice.toolTip(0)
+    assert "does not exist or not authorized" in tip and "Query ID: 01b0-9999" in tip
+    log = harness.messages()
+    assert "Could not list @RAW.PUBLIC.ARCHIVE: [2003]" in log
+    assert "does not exist or not authorized" in log

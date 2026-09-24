@@ -1274,3 +1274,20 @@ def test_a_lost_session_says_the_transaction_went_with_it(harness: Harness) -> N
     harness.drain()
     assert "not committed" in harness.window.banner_label.text()
     assert not harness.window.commit_button.isVisibleTo(harness.window)
+
+
+def test_a_failed_browse_is_logged_in_full(harness: Harness) -> None:
+    connect(harness)
+    harness.conn.plan["SHOW SCHEMAS"] = FakeStatement(
+        error=FakeProgrammingError(
+            "SQL compilation error:\nDatabase 'RAW' does not exist or not authorized.",
+            errno=2003,
+            sqlstate="02000",
+            sfqid="01b0-0042",
+        )
+    )
+    harness.window.browser.load(("RAW",))
+    harness.drain()
+    log = harness.window.messages.toPlainText()
+    assert "Could not load RAW: [2003] (SQLSTATE 02000) SQL compilation error:" in log
+    assert "Query ID: 01b0-0042" in log

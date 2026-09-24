@@ -45,6 +45,7 @@ from snowdesk.controllers.browser import BrowserController
 from snowdesk.controllers.query import QueryController
 from snowdesk.controllers.stages import StageController
 from snowdesk.db import profile
+from snowdesk.db.identifiers import qualify
 from snowdesk.db.session import ConnectionState, ConnectParams
 from snowdesk.db.worker import (
     ConnectJob,
@@ -693,6 +694,7 @@ class MainWindow(QMainWindow):
         self.object_tree.run_requested.connect(self._run_browser_sql)
         self.object_tree.status_message.connect(lambda msg: self.statusBar().showMessage(msg, 3000))
         self.object_tree.table_stage_requested.connect(self.show_table_stage)
+        self.browser.failed.connect(self._on_browse_failed)
 
         self.stage_panel.insert_requested.connect(self._insert_into_editor)
         self.stage_panel.run_requested.connect(self._run_browser_sql)
@@ -1231,6 +1233,11 @@ class MainWindow(QMainWindow):
     def _run_browser_sql(self, sql: str) -> None:
         """Run a statement the browser built, without disturbing the editor (B4)."""
         self.query.run_text(sql)
+
+    def _on_browse_failed(self, path: tuple[str, ...], message: str) -> None:
+        """The tree row is cut short by the sidebar; Messages has it in full."""
+        where = qualify(*path) if path else "databases"
+        self._log_message(f"Could not load {where}: {message}")
 
     def _on_sidebar_changed(self, index: int) -> None:
         QSettings().setValue(SIDEBAR_KEY, index)

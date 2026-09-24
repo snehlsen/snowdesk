@@ -238,7 +238,12 @@ class StageTree(QTreeWidget):
         return item
 
     def _notice(self, text: str, *, error: bool = False) -> QTreeWidgetItem:
-        item = QTreeWidgetItem([text, ""])
+        """A greyed-out row.  An error shows its first line; the whole of it,
+        code and query ID included, is in the tooltip, since a narrow sidebar
+        cuts the row short."""
+        first = text.strip().splitlines()[0] if text.strip() else text
+        item = QTreeWidgetItem([first, ""])
+        item.setToolTip(0, text)
         item.setDisabled(True)
         font = QFont()
         font.setItalic(True)
@@ -525,6 +530,7 @@ class StagePanel(QWidget):
 
         controller.stages_ready.connect(self._on_stages)
         controller.stages_failed.connect(self._on_stages_failed)
+        controller.list_failed.connect(self._on_list_failed)
         controller.plan_ready.connect(self._on_plan_ready)
         controller.transfer_started.connect(self._on_transfer_started)
         controller.progress.connect(self._on_progress)
@@ -571,6 +577,13 @@ class StagePanel(QWidget):
     def _on_stages_failed(self, message: str) -> None:
         self._listing = False
         self.tree.show_message(message, error=True)
+        self.log_message.emit(f"Could not list stages: {message}")
+
+    def _on_list_failed(self, stage: StageRef, prefix: str, message: str) -> None:
+        # Plain text, not location(): the prefix may be the unsafe name that
+        # caused the failure.
+        where = stage_ops.stage_name(stage) + (f"/{prefix}" if prefix else "")
+        self.log_message.emit(f"Could not list {where}: {message}")
 
     def _update_buttons(self) -> None:
         item = self.tree.currentItem()
