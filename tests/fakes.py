@@ -3,9 +3,16 @@ cancelled statuses (spec 11)."""
 
 from __future__ import annotations
 
+import glob
+import gzip
+import hashlib
+import mimetypes
+import os
 import re
 import threading
 from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
 from typing import Any
 
 
@@ -60,6 +67,14 @@ class FakeCursor:
             self._rows = rows
             self._pos = 0
             return self
+        if self.conn.stage is not None:
+            answer = self.conn.stage.handle(sql)
+            if answer is not None:
+                self.conn.executed.append(sql)
+                self.sfqid = self.conn.next_qid()
+                self.description, self._rows = answer
+                self._pos = 0
+                return self
         self.conn.executed.append(sql)
         if sql.upper().startswith("SELECT SYSTEM$CANCEL_QUERY"):
             self.conn.cancel_requested.set()
@@ -155,6 +170,8 @@ class FakeConnection:
         self.status_queries: list[str] = []
         #: Raised by those reads, to simulate them failing.
         self.status_error: Exception | None = None
+        #: Stages and their files, when a test wants LIST, PUT, GET and REMOVE.
+        self.stage: FakeStages | None = None
 
     # -- transactions ------------------------------------------------------
 
@@ -224,3 +241,220 @@ class FakeConnection:
 
     def is_still_running(self, status: str) -> bool:
         return status == "RUNNING"
+
+
+# --------------------------------------------------------------------------
+# Stages
+# --------------------------------------------------------------------------
+
+
+#: Where a stage's files really live; PATTERN is matched against
+#: ``STORAGE/<path from the stage root>``, never against the LIST name.
+STORAGE = "sfc-stages/a1b2c3/stages/9f8e7d"
+
+
+class FakeOperationalError(Exception):
+    """The connector's OperationalError, which PUT and GET also raise."""
+
+    def __init__(self, msg: str, errno: int | None = None) -> None:
+        super().__init__(msg)
+        self.msg = msg
+        self.errno = errno
+
+
+class FakeResultStatus(Enum):
+    """The connector reports PUT and GET statuses as its own enum, not text."""
+
+    UPLOADED = "UPLOADED"
+    DOWNLOADED = "DOWNLOADED"
+    SKIPPED = "SKIPPED"
+
+
+def _col(name: str, type_code: int = 2) -> tuple:
+    return (name, type_code, None, None, None, None, True)
+
+
+#: A run of bare characters and quoted literals, so `PATTERN='^(a b)$'` and
+#: `'file:///a b/x.csv'` each stay one token.
+_TOKEN = re.compile(r"(?:[^\s']|'(?:[^']|'')*')+")
+
+
+def _unquote(token: str) -> str:
+    """Undo ``quote_literal``: doubled quotes, then doubled backslashes."""
+    if token.startswith("'") and token.endswith("'"):
+        return token[1:-1].replace("''", "'").replace("\\\\", "\\")
+    return token
+
+
+@dataclass
+class FakeStages:
+    """Just enough of Snowflake's stages to exercise SnowDesk's transfers.
+
+    Files are held by their raw ``LIST`` name: a named stage prefixes its own
+    lower-cased name, the user and table stages do not.  The shapes of the PUT
+    and GET results follow ``file_transfer_agent.result()`` in connector 4.7.
+
+    PATTERN behaves as measured against a real account: it must match the
+    whole of an internal path, ``<storage prefix>/<path from the stage root>``,
+    not the name LIST shows.  A GET that matches nothing raises, as the
+    connector does.
+    """
+
+    #: SHOW STAGES rows: name, database_name, schema_name, type, url.
+    stages: list[dict[str, str]] = field(default_factory=list)
+    files: dict[str, bytes] = field(default_factory=dict)
+    #: Raised by the n-th PUT/GET/REMOVE (1-based), to simulate failures.
+    fail_on: dict[int, Exception] = field(default_factory=dict)
+    #: Called before each transfer statement; lets a test press Stop mid-run.
+    before_transfer: Any = None
+    transfers: int = 0
+
+    def handle(self, sql: str) -> tuple[list[tuple], list[tuple]] | None:
+        tokens = _TOKEN.findall(sql)
+        verb = tokens[0].upper() if tokens else ""
+        if verb == "SHOW" and "STAGES" in sql.upper():
+            columns = [_col(n) for n in ("name", "database_name", "schema_name", "type", "url")]
+            rows = [
+                (
+                    s["name"],
+                    s["database_name"],
+                    s["schema_name"],
+                    s.get("type", "INTERNAL"),
+                    s.get("url", ""),
+                )
+                for s in self.stages
+            ]
+            return columns, rows
+        pattern = None
+        for token in tokens:
+            if token.upper().startswith("PATTERN="):
+                pattern = _unquote(token.split("=", 1)[1])
+        if verb == "LIST":
+            return self._list(self._prefix(tokens[1]), self._root(tokens[1]), pattern)
+        if verb in ("PUT", "GET", "REMOVE"):
+            self.transfers += 1
+            if self.before_transfer is not None:
+                self.before_transfer(self.transfers)
+            error = self.fail_on.get(self.transfers)
+            if error is not None:
+                raise error
+            options = dict(t.split("=", 1) for t in tokens if "=" in t and not t.startswith("'"))
+            if verb == "PUT":
+                return self._put(_unquote(tokens[1]), self._prefix(tokens[2]), options)
+            if verb == "GET":
+                return self._get(
+                    self._prefix(tokens[1]), self._root(tokens[1]), _unquote(tokens[2]), pattern
+                )
+            return self._remove(self._prefix(tokens[1]), self._root(tokens[1]), pattern)
+        return None
+
+    # -- locations ---------------------------------------------------------
+
+    def _prefix(self, token: str) -> str:
+        """``@DB.S.LANDING/a/`` → ``landing/a/``; ``@~/a`` → ``a``."""
+        loc = _unquote(token)
+        assert loc.startswith("@"), loc
+        stage, _sep, path = loc[1:].partition("/")
+        if stage == "~" or stage.rpartition(".")[2].startswith("%"):
+            return path
+        name = stage.rpartition(".")[2].strip('"').lower()
+        return f"{name}/{path}"
+
+    def _root(self, token: str) -> str:
+        """The part of a raw name that is the stage's own: ``landing/`` or nothing."""
+        stage = _unquote(token)[1:].partition("/")[0]
+        if stage == "~" or stage.rpartition(".")[2].startswith("%"):
+            return ""
+        return stage.rpartition(".")[2].strip('"').lower() + "/"
+
+    # -- statements --------------------------------------------------------
+
+    def _list(
+        self, prefix: str, root: str = "", pattern: str | None = None
+    ) -> tuple[list[tuple], list[tuple]]:
+        columns = [_col("name"), _col("size", 0), _col("md5"), _col("last_modified")]
+        rows = [
+            (
+                name,
+                len(self.files[name]),
+                hashlib.md5(self.files[name]).hexdigest(),
+                "Wed, 24 Sep 2026 09:12:00 GMT",
+            )
+            for name in self._matching(prefix, root, pattern)
+        ]
+        return columns, rows
+
+    def _put(
+        self, source: str, prefix: str, options: dict[str, str]
+    ) -> tuple[list[tuple], list[tuple]]:
+        assert source.startswith("file://"), source
+        matches = glob.glob(source[len("file://") :])
+        assert len(matches) == 1, f"{source} matched {matches}"
+        local = matches[0]
+        data = Path(local).read_bytes()
+        name = os.path.basename(local)
+        _type, encoding = mimetypes.guess_type(name)
+        compressed = options.get("AUTO_COMPRESS", "TRUE") == "TRUE" and encoding is None
+        target = name + ".gz" if compressed else name
+        stored = gzip.compress(data) if compressed else data
+        key = prefix + target
+        if key in self.files and options.get("OVERWRITE", "FALSE") != "TRUE":
+            status = FakeResultStatus.SKIPPED
+        else:
+            self.files[key] = stored
+            status = FakeResultStatus.UPLOADED
+        columns = [
+            _col("source"),
+            _col("target"),
+            _col("source_size", 0),
+            _col("target_size", 0),
+            _col("source_compression"),
+            _col("target_compression"),
+            _col("status"),
+            _col("message"),
+        ]
+        row = (
+            name,
+            target,
+            len(data),
+            len(stored),
+            "NONE",
+            "GZIP" if compressed else "NONE",
+            status,
+            "",
+        )
+        return columns, [row]
+
+    def _matching(self, prefix: str, root: str, pattern: str | None) -> list[str]:
+        names = [n for n in sorted(self.files) if n.startswith(prefix)]
+        if pattern is not None:
+            names = [n for n in names if re.fullmatch(pattern, f"{STORAGE}/{n[len(root) :]}")]
+        return names
+
+    def _get(
+        self, prefix: str, root: str, target: str, pattern: str | None
+    ) -> tuple[list[tuple], list[tuple]]:
+        assert target.startswith("file://") and target.endswith("/"), target
+        directory = Path(target[len("file://") :])
+        assert directory.is_dir(), f"GET target {directory} does not exist"
+        matched = self._matching(prefix, root, pattern)
+        if not matched:
+            raise FakeOperationalError(
+                "While getting file(s) there was an error: the file does not exist.", errno=253006
+            )
+        rows = []
+        for name in matched:
+            # Flattened to the bare name, as the real connector does.
+            (directory / os.path.basename(name)).write_bytes(self.files[name])
+            rows.append(
+                (os.path.basename(name), len(self.files[name]), FakeResultStatus.DOWNLOADED, "")
+            )
+        return [_col("file"), _col("size", 0), _col("status"), _col("message")], rows
+
+    def _remove(
+        self, prefix: str, root: str, pattern: str | None
+    ) -> tuple[list[tuple], list[tuple]]:
+        removed = self._matching(prefix, root, pattern)
+        for name in removed:
+            del self.files[name]
+        return [_col("name"), _col("result")], [(n, "removed") for n in removed]

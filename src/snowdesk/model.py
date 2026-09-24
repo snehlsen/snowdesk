@@ -205,3 +205,138 @@ class ObjectNode:
     kind: str  # "database" | "schema" | "table" | "view" | "column"
     detail: str = ""
     path: tuple[str, ...] = ()
+
+
+# --------------------------------------------------------------------------
+# Stages (docs/stage-browser.md)
+# --------------------------------------------------------------------------
+
+
+class StageKind(StrEnum):
+    NAMED = "named"
+    USER = "user"
+    TABLE = "table"
+
+
+@dataclass(frozen=True, slots=True)
+class StageRef:
+    """A stage SnowDesk can list, and -- when internal -- transfer to and from.
+
+    ``name`` is the stage's own name for a named stage and the table's name for
+    a table stage; the user stage has neither database nor schema.
+    """
+
+    kind: StageKind
+    name: str = ""
+    database: str = ""
+    schema: str = ""
+    #: ``PUT`` and ``GET`` only work on internal stages (ST10).
+    internal: bool = True
+    #: Where an external stage points, as ``SHOW STAGES`` reports it.
+    url: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class StageFile:
+    """One ``LIST`` row."""
+
+    #: The path relative to the stage's root, e.g. ``2026-09/orders.csv.gz``.
+    name: str
+    #: The name exactly as ``LIST`` returned it, which is what ``PATTERN``
+    #: is matched against.
+    raw: str
+    size: int = 0
+    md5: str = ""
+    last_modified: str = ""
+
+
+class TransferKind(StrEnum):
+    UPLOAD = "upload"
+    DOWNLOAD = "download"
+    REMOVE = "remove"
+
+
+class FileStatus(StrEnum):
+    """What happened to one file in a transfer."""
+
+    UPLOADED = "uploaded"
+    DOWNLOADED = "downloaded"
+    REMOVED = "removed"
+    SKIPPED = "skipped"
+    FAILED = "failed"
+    NOT_STARTED = "not started"
+
+
+@dataclass(frozen=True, slots=True)
+class UploadItem:
+    local: str
+    #: Stage folder the file goes into: ``""`` for the root, else ``"a/b/"``.
+    folder: str
+    #: The name it is expected to get on the stage, once compressed.
+    target: str
+    size: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class DownloadItem:
+    file: StageFile
+    #: The full local path it will be written to.
+    local: str
+
+
+@dataclass(slots=True)
+class TransferPlan:
+    """What a transfer will do, worked out before anything moves.
+
+    Built off the UI thread, since it needs a ``LIST``; the UI then asks about
+    ``conflicts`` and hands the plan back to be run.
+    """
+
+    transfer_id: str
+    kind: TransferKind
+    stage: StageRef
+    uploads: list[UploadItem] = field(default_factory=list)
+    downloads: list[DownloadItem] = field(default_factory=list)
+    #: Files to ``REMOVE``; a folder is one whose ``name`` ends ``/``.
+    removes: list[StageFile] = field(default_factory=list)
+    #: Where a download is written.
+    local_root: str = ""
+    #: Targets that already exist: stage names for an upload, local paths
+    #: for a download.
+    conflicts: list[str] = field(default_factory=list)
+    #: Whether to replace ``conflicts`` (True) or leave them alone (False).
+    replace: bool = False
+    #: Files refused before anything ran, and why.
+    refused: list[tuple[str, str]] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class FileResult:
+    transfer_id: str
+    name: str
+    status: FileStatus
+    detail: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class TransferProgress:
+    transfer_id: str
+    kind: TransferKind
+    files_done: int
+    files_total: int
+    bytes_done: int
+    bytes_total: int
+    #: The file (or folder, for a download) being transferred now.
+    current: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class TransferSummary:
+    transfer_id: str
+    kind: TransferKind
+    stage: StageRef
+    counts: dict[FileStatus, int] = field(default_factory=dict)
+    #: Stopped by the user between files.
+    stopped: bool = False
+    #: Set when the transfer could not go on at all, e.g. the session died.
+    error: str = ""

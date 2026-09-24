@@ -15,6 +15,10 @@ from tests.fakes import FakeConnection, FakeProgrammingError, FakeStatement
 class OperationalError(Exception):
     """Stands in for the connector's transport-level error."""
 
+    def __init__(self, msg: str, errno: int | None = None) -> None:
+        super().__init__(msg)
+        self.errno = errno
+
 
 def collect(signal) -> list:
     received: list = []
@@ -48,6 +52,11 @@ def test_transport_and_session_failures_are_recognised(exc: BaseException) -> No
         FakeProgrammingError("SQL compilation error", errno=1003),
         FakeProgrammingError("SQL execution canceled", errno=604),
         ValueError("something else entirely"),
+        # PUT and GET errors are OperationalErrors too; the session is fine.
+        OperationalError(
+            "While getting file(s) there was an error: the file does not exist.", errno=253006
+        ),
+        OperationalError("While putting file(s) there was an error: ...", errno=253003),
     ],
 )
 def test_ordinary_failures_are_not_mistaken_for_a_lost_session(exc: BaseException) -> None:

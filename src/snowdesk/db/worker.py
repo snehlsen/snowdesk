@@ -24,6 +24,7 @@ from snowdesk.config import DEFAULT_PAGE_SIZE
 from snowdesk.db import browser as browse
 from snowdesk.db import export as csv_export
 from snowdesk.db import profile
+from snowdesk.db import stages as stage_ops
 from snowdesk.db.errors import (
     is_bad_private_key_passphrase,
     is_session_lost,
@@ -37,9 +38,12 @@ from snowdesk.model import (
     QueryError,
     RunStatus,
     SessionContext,
+    StageRef,
     Statement,
     StatementOutcome,
     TransactionState,
+    TransferPlan,
+    TransferSummary,
 )
 
 log = logging.getLogger(__name__)
@@ -102,6 +106,20 @@ class BrowseJob:
 
 
 @dataclass(slots=True)
+class StagesJob:
+    """Every stage the role can see, for the Stages sidebar (ST1)."""
+
+
+@dataclass(slots=True)
+class ListStageJob:
+    """``LIST`` one stage, or one folder in it (ST2)."""
+
+    stage: StageRef
+    prefix: str = ""
+    cap: int | None = None
+
+
+@dataclass(slots=True)
 class EndTransactionJob:
     """``COMMIT`` or ``ROLLBACK`` the open transaction (Q10)."""
 
@@ -129,6 +147,8 @@ Job = (
     | CloseResultJob
     | ProfileJob
     | BrowseJob
+    | StagesJob
+    | ListStageJob
     | EndTransactionJob
     | SetAutocommitJob
     | ShutdownJob
@@ -183,6 +203,20 @@ class SnowflakeWorker(QObject):
     nodes_ready = Signal(object, object)  # path tuple, list[ObjectNode]
     browse_failed = Signal(object, str)  # path tuple, message
 
+    stages_ready = Signal(object)  # list[StageRef]
+    stages_failed = Signal(str)
+    stage_listed = Signal(object, str, object, bool)  # stage, prefix, files, truncated
+    stage_list_failed = Signal(object, str, str)  # stage, prefix, message
+
+    #: A transfer has been worked out and is waiting to be confirmed.
+    transfer_planned = Signal(object)  # TransferPlan
+    transfer_plan_failed = Signal(str, str)  # transfer id, message
+    transfer_progress = Signal(object)  # TransferProgress
+    transfer_file_done = Signal(object)  # FileResult
+    #: Each PUT, GET or REMOVE a transfer ran, for Messages and History.
+    transfer_statement = Signal(object)  # StatementOutcome
+    transfer_finished = Signal(object)  # TransferSummary
+
     worker_error = Signal(str)
 
     def __init__(self, session: SnowflakeSession | None = None) -> None:
@@ -199,6 +233,13 @@ class SnowflakeWorker(QObject):
         # does (spec 6.2).
         self._export_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="snowdesk-export")
         self._export_stop = threading.Event()
+        # Stage transfers likewise: a PUT holds its thread for as long as the
+        # upload takes (docs/stage-browser.md §7.2).  One thread, so plans
+        # and transfers run in the order they were asked for.
+        self._transfer_pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="snowdesk-transfer"
+        )
+        self._transfer_stop = threading.Event()
         self._busy = threading.Event()
         # Key passphrases the user has entered this run, so Disconnect followed
         # by Connect does not ask again.  In memory only, never persisted, and
@@ -290,8 +331,70 @@ class SnowflakeWorker(QObject):
         else:
             self.export_finished.emit(result_id, path, rows)
 
+    # -- stage transfers (docs/stage-browser.md) ---------------------------
+
+    def plan_upload(self, transfer_id: str, stage: StageRef, folder: str, paths: list[str]) -> None:
+        """Work out an upload off the UI thread; answers with ``transfer_planned``."""
+        self._submit_plan(transfer_id, stage_ops.plan_upload, stage, folder, paths)
+
+    def plan_download(
+        self, transfer_id: str, stage: StageRef, selection: list[str], local_root: str
+    ) -> None:
+        self._submit_plan(transfer_id, stage_ops.plan_download, stage, selection, local_root)
+
+    def _submit_plan(self, transfer_id: str, planner: Any, *args: Any) -> None:
+        if not self.session.is_connected:
+            self.transfer_plan_failed.emit(transfer_id, "Not connected.")
+            return
+        self._transfer_pool.submit(self._do_plan, transfer_id, planner, *args)
+
+    def _do_plan(self, transfer_id: str, planner: Any, *args: Any) -> None:
+        try:
+            plan = planner(self.session.connection, transfer_id, *args)
+        except stage_ops.UnsafeName as exc:
+            self.transfer_plan_failed.emit(transfer_id, str(exc))
+        except Exception as exc:
+            log.warning("Planning transfer %s failed", transfer_id, exc_info=True)
+            self.transfer_plan_failed.emit(transfer_id, to_query_error(exc).formatted())
+        else:
+            self.transfer_planned.emit(plan)
+
+    def start_transfer(self, plan: TransferPlan) -> None:
+        """Run a confirmed plan; Stop takes effect between statements (ST8)."""
+        if not self.session.is_connected:
+            self.transfer_plan_failed.emit(plan.transfer_id, "Not connected.")
+            return
+        self._transfer_stop.clear()
+        self._transfer_pool.submit(self._do_transfer, plan)
+
+    def stop_transfer(self) -> None:
+        self._transfer_stop.set()
+
+    def _do_transfer(self, plan: TransferPlan) -> None:
+        callbacks = stage_ops.Callbacks(
+            progress=self.transfer_progress.emit,
+            file_done=self.transfer_file_done.emit,
+            statement=self.transfer_statement.emit,
+        )
+        try:
+            summary = stage_ops.run_transfer(
+                self.session.connection, plan, self._transfer_stop, callbacks
+            )
+        except Exception as exc:
+            # run_transfer handles what it expects; anything else is a bug,
+            # and the UI must still hear that the transfer is over.
+            log.exception("Transfer %s failed", plan.transfer_id)
+            summary = TransferSummary(
+                transfer_id=plan.transfer_id,
+                kind=plan.kind,
+                stage=plan.stage,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        self.transfer_finished.emit(summary)
+
     def shutdown(self) -> None:
         self._export_stop.set()
+        self._transfer_stop.set()
         self._queue.put(ShutdownJob())
 
     # -- job loop (runs on the worker thread) -----------------------------
@@ -317,6 +420,7 @@ class SnowflakeWorker(QObject):
         self.session.close()
         self._cancel_pool.shutdown(wait=False)
         self._export_pool.shutdown(wait=False)
+        self._transfer_pool.shutdown(wait=False)
         self.state_changed.emit(ConnectionState.DISCONNECTED.value, "")
 
     def _dispatch(self, job: Job) -> None:
@@ -336,6 +440,10 @@ class SnowflakeWorker(QObject):
             self._profile(job)
         elif isinstance(job, BrowseJob):
             self._browse(job)
+        elif isinstance(job, StagesJob):
+            self._list_stages()
+        elif isinstance(job, ListStageJob):
+            self._list_stage(job)
         elif isinstance(job, EndTransactionJob):
             self._end_transaction(job)
         elif isinstance(job, SetAutocommitJob):
@@ -741,9 +849,40 @@ class SnowflakeWorker(QObject):
         except Exception as exc:
             self._note_failure(exc)
             error: QueryError = to_query_error(exc)
-            self.browse_failed.emit(path, error.message)
+            self.browse_failed.emit(path, error.formatted())
             return
         self.nodes_ready.emit(path, nodes)
+
+    # -- stages (docs/stage-browser.md) ------------------------------------
+
+    def _list_stages(self) -> None:
+        if not self.session.is_connected:
+            self.stages_failed.emit("Not connected.")
+            return
+        try:
+            found = stage_ops.list_stages(self.session.connection)
+        except Exception as exc:
+            self._note_failure(exc)
+            self.stages_failed.emit(to_query_error(exc).formatted())
+            return
+        self.stages_ready.emit(found)
+
+    def _list_stage(self, job: ListStageJob) -> None:
+        if not self.session.is_connected:
+            self.stage_list_failed.emit(job.stage, job.prefix, "Not connected.")
+            return
+        try:
+            files, truncated = stage_ops.list_files(
+                self.session.connection, job.stage, job.prefix, job.cap
+            )
+        except stage_ops.UnsafeName as exc:
+            self.stage_list_failed.emit(job.stage, job.prefix, str(exc))
+            return
+        except Exception as exc:
+            self._note_failure(exc)
+            self.stage_list_failed.emit(job.stage, job.prefix, to_query_error(exc).formatted())
+            return
+        self.stage_listed.emit(job.stage, job.prefix, files, truncated)
 
 
 def _affected_rows(columns: list[Any], rows: list[Any]) -> int | None:

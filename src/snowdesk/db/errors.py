@@ -84,6 +84,13 @@ _SESSION_LOST_ERRNOS = frozenset(
     }
 )
 
+#: The connector's own PUT and GET errors (``ER_INVALID_STAGE_FS`` through
+#: ``ER_INTERNAL_NOT_MATCH_ENCRYPT_MATERIAL``): a missing local file, a GET
+#: whose PATTERN matched nothing, a failed upload to the cloud store.  They are
+#: raised as ``OperationalError``, the class that otherwise means the network
+#: is gone, but the session is fine and the next statement will run.
+_FILE_TRANSFER_ERRNOS = range(253001, 253009)
+
 #: Connector exception classes raised for transport-level trouble.  Matched by
 #: name so this module stays importable, and testable, without the connector.
 _SESSION_LOST_TYPES = frozenset(
@@ -128,6 +135,8 @@ def is_session_lost(exc: BaseException) -> bool:
     if is_cancellation(exc):
         return False
     errno = getattr(exc, "errno", None)
+    if isinstance(errno, int) and errno in _FILE_TRANSFER_ERRNOS:
+        return False
     if isinstance(errno, int) and errno in _SESSION_LOST_ERRNOS:
         return True
     sqlstate = getattr(exc, "sqlstate", None)
