@@ -274,7 +274,6 @@ class UploadItem:
     folder: str
     #: The name it is expected to get on the stage, once compressed.
     target: str
-    size: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -320,14 +319,12 @@ class FileResult:
 
 @dataclass(frozen=True, slots=True)
 class TransferProgress:
+    """What a running transfer is working on now; it carries no counts."""
+
     transfer_id: str
     kind: TransferKind
-    files_done: int
-    files_total: int
-    bytes_done: int
-    bytes_total: int
-    #: The file (or folder, for a download) being transferred now.
-    current: str = ""
+    #: The file (a folder, or a batch of names, for a download or delete).
+    current: str
 
 
 @dataclass(frozen=True, slots=True)

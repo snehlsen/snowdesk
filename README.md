@@ -140,7 +140,8 @@ A few things behave in ways worth knowing:
   into one directory, so `a/x.csv` and `b/x.csv` would overwrite each other.
   SnowDesk issues one GET per stage folder instead.
 * **Stop takes effect between files.** The connector cannot interrupt a file
-  mid-transfer, and progress advances a file at a time for the same reason.
+  mid-transfer. For the same reason the strip shows a busy bar and the file
+  under way rather than a percentage; Messages lists each file as it finishes.
 * **Transfers run beside queries**, on their own thread, so the editor and
   browser keep working. One transfer runs at a time.
 * **External stages can be browsed, not transferred.** PUT and GET only work

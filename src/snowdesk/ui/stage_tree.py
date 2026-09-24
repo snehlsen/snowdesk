@@ -493,7 +493,10 @@ class StagePanel(QWidget):
         self.progress_label.setTextFormat(Qt.TextFormat.PlainText)
         # A long file name must not push the sidebar wider.
         self.progress_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        # Busy, never a fraction: a PUT or GET reports nothing until it is
+        # done, so no honest percentage exists (docs/stage-browser.md §7.3).
         self.progress_bar = QProgressBar(self)
+        self.progress_bar.setRange(0, 0)
         self.progress_bar.setTextVisible(False)
         self.progress_bar.setMaximumHeight(8)
         self.stop_button = QPushButton("Stop", self)
@@ -748,7 +751,6 @@ class StagePanel(QWidget):
         else:
             self.log_message.emit(f"Deleting from {where}…")
         self.progress_label.setText(f"{_VERBS[plan.kind]}…")
-        self.progress_bar.setRange(0, 0)
         self.stop_button.setEnabled(True)
         self.progress_strip.setVisible(True)
         self._update_buttons()
@@ -756,16 +758,7 @@ class StagePanel(QWidget):
     def _on_progress(self, progress: TransferProgress) -> None:
         if not self.stop_button.isEnabled():
             return  # keep saying "Stopping…"
-        text = f"{_VERBS[progress.kind]} {progress.files_done + 1:,} of {progress.files_total:,}"
-        if progress.current:
-            text += f" · {progress.current}"
-        self.progress_label.setText(text)
-        if progress.bytes_total:
-            self.progress_bar.setRange(0, 1000)
-            self.progress_bar.setValue(int(1000 * progress.bytes_done / progress.bytes_total))
-        elif progress.files_total:
-            self.progress_bar.setRange(0, progress.files_total)
-            self.progress_bar.setValue(progress.files_done)
+        self.progress_label.setText(f"{_VERBS[progress.kind]} {progress.current}…")
 
     def _on_file_done(self, result: FileResult) -> None:
         detail = f"  ({result.detail})" if result.detail else ""
