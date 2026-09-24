@@ -45,7 +45,7 @@ from snowdesk.model import ColumnInfo, QueryError, RunStatus, SessionContext, St
 from snowdesk.storage.history import HistoryStore
 from snowdesk.storage.session import SessionStore
 from snowdesk.ui import preferences, theme
-from snowdesk.ui.dialogs import warn
+from snowdesk.ui.dialogs import message_box, warn
 from snowdesk.ui.editor import SqlEditor
 from snowdesk.ui.editor_tabs import EditorTabs
 from snowdesk.ui.history_panel import HistoryPanel
@@ -484,13 +484,20 @@ class MainWindow(QMainWindow):
             view.set_escape_formulas(escape)
 
     def _show_about(self) -> None:
-        QMessageBox.about(
-            self,
-            "About SnowDesk",
+        # Qt's static about box would go native; this is the same box, built
+        # by hand so it does not (see snowdesk.ui.dialogs).
+        box = message_box(self, QMessageBox.Icon.NoIcon)
+        box.setWindowTitle("About SnowDesk")
+        icon = QApplication.windowIcon()
+        if not icon.isNull():
+            box.setIconPixmap(icon.pixmap(64, 64))
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setText(
             f"<b>SnowDesk {__version__}</b><br><br>"
             "A lightweight macOS client for Snowflake.<br>"
-            "Connections come from the same files the <code>snow</code> CLI uses.",
+            "Connections come from the same files the <code>snow</code> CLI uses."
         )
+        box.exec()
 
     def _menu(self, name: str) -> QMenu:
         menu = self._menus.get(name)
@@ -963,8 +970,7 @@ class MainWindow(QMainWindow):
         history; the platform convention is the safe choice by default and a
         distinct destructive button.
         """
-        box = QMessageBox(self)
-        box.setIcon(QMessageBox.Icon.Warning)
+        box = message_box(self)
         box.setText("Delete all query history?")
         box.setInformativeText(
             "Every statement SnowDesk has recorded on this Mac will be removed. "
