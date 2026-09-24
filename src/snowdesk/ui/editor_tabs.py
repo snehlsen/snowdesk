@@ -10,7 +10,7 @@ from PySide6.QtCore import QTimer, Signal
 from PySide6.QtWidgets import QFileDialog, QMessageBox, QTabWidget, QWidget
 
 from snowdesk.storage.session import SessionState, SessionStore, TabState
-from snowdesk.ui.dialogs import warn
+from snowdesk.ui.dialogs import message_box, warn
 from snowdesk.ui.editor import SqlEditor
 
 log = logging.getLogger(__name__)
@@ -170,8 +170,7 @@ class EditorTabs(QTabWidget):
         rather than "Discard".  Separate from the decision above so the
         decision can be exercised without a modal dialog.
         """
-        box = QMessageBox(self)
-        box.setIcon(QMessageBox.Icon.Warning)
+        box = message_box(self)
         box.setText(f"Do you want to save the changes you made to \u201c{name}\u201d?")
         box.setInformativeText("Your changes will be lost if you don't save them.")
         dont_save = box.addButton("Don't Save", QMessageBox.ButtonRole.DestructiveRole)

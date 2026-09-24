@@ -413,6 +413,8 @@ def test_every_action_survives_the_checked_argument(harness: Harness, monkeypatc
     monkeypatch.setattr(harness.window, "confirm_clear_history", lambda: False)
     monkeypatch.setattr(harness.window, "ask_preferences", lambda: None)
     monkeypatch.setattr(harness.window, "ask_export_path", lambda: "")
+    # About has no answer to stub; its box is dismissed as soon as it opens.
+    monkeypatch.setattr("snowdesk.ui.dialogs.QMessageBox.exec", lambda _box: 0)
 
     escaped: list[str] = []
     monkeypatch.setattr(
