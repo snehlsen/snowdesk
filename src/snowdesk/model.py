@@ -121,9 +121,15 @@ class SessionContext:
     warehouse: str | None = None
     database: str | None = None
     schema: str | None = None
+    #: As ``SHOW WAREHOUSES`` gives it ("X-Small", "Medium", ...), or ``None``
+    #: when there is no warehouse or the role cannot see it.
+    warehouse_size: str | None = None
 
     def __str__(self) -> str:
-        left = " · ".join(x for x in (self.role, self.warehouse) if x)
+        warehouse = self.warehouse
+        if warehouse and self.warehouse_size:
+            warehouse = f"{warehouse} ({self.warehouse_size})"
+        left = " · ".join(x for x in (self.role, warehouse) if x)
         scope = ".".join(x for x in (self.database, self.schema) if x)
         return " · ".join(x for x in (left, scope) if x) or "no context"
 

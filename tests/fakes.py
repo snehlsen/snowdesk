@@ -160,6 +160,8 @@ class FakeConnection:
         self.warehouse = "COMPUTE_WH"
         self.database = "RAW"
         self.schema = "PUBLIC"
+        #: SHOW WAREHOUSES rows, by name: the size the status bar shows.
+        self.warehouses: dict[str, str] = {"COMPUTE_WH": "X-Small"}
         self._qid = 0
         self._polled: dict[str, int] = {}
         self.autocommit = True
@@ -183,6 +185,11 @@ class FakeConnection:
         elif upper.startswith("SHOW PARAMETERS LIKE 'AUTOCOMMIT'"):
             column = [("key", 2, None, None, None, None, False)]
             rows = [("AUTOCOMMIT", str(self.autocommit).lower(), "true", "SESSION")]
+        elif upper.startswith("SHOW WAREHOUSES LIKE "):
+            column = [("name", 2, None, None, None, None, False)]
+            column.append(("size", 2, None, None, None, None, True))
+            pattern = sql.split("LIKE", 1)[1].strip().strip("'").upper()
+            rows = [(n, size) for n, size in self.warehouses.items() if n.upper() == pattern]
         else:
             return None
         self.status_queries.append(sql)

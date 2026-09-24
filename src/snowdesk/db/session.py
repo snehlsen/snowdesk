@@ -9,10 +9,11 @@ from __future__ import annotations
 import logging
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any, Protocol
 
+from snowdesk.db.identifiers import quote_literal
 from snowdesk.model import SessionContext
 
 log = logging.getLogger(__name__)
@@ -104,6 +105,9 @@ class SnowflakeSession:
         self._conn: Connection | None = None
         self._params: ConnectParams | None = None
         self._slow_auth_count = 0
+        #: The last size looked up, keyed by the role and warehouse it was
+        #: looked up for, so a script that changes neither costs no round trip.
+        self._warehouse_size: tuple[str | None, str, str | None] | None = None
         self.state = ConnectionState.DISCONNECTED
 
     # -- lifecycle ---------------------------------------------------------
@@ -147,6 +151,7 @@ class SnowflakeSession:
 
     def close(self) -> None:
         conn, self._conn = self._conn, None
+        self._warehouse_size = None
         self.state = ConnectionState.DISCONNECTED
         if conn is None:
             return
@@ -157,8 +162,13 @@ class SnowflakeSession:
 
     # -- context (spec 7.6) ------------------------------------------------
 
-    def read_context(self) -> SessionContext:
-        """Read role / warehouse / database / schema after a statement."""
+    def read_context(self, recheck_warehouse: bool = False) -> SessionContext:
+        """Read role / warehouse / database / schema after a statement.
+
+        The warehouse size is asked of the server only when the role or
+        warehouse changed, or ``recheck_warehouse`` says it may have (an
+        ``ALTER WAREHOUSE ... SET WAREHOUSE_SIZE``).
+        """
         conn = self._conn
         if conn is None:
             return SessionContext()
@@ -168,9 +178,41 @@ class SnowflakeSession:
             database=_attr(conn, "database"),
             schema=_attr(conn, "schema"),
         )
-        if any((ctx.role, ctx.warehouse, ctx.database, ctx.schema)):
+        if not any((ctx.role, ctx.warehouse, ctx.database, ctx.schema)):
+            ctx = self._query_context()
+        if not ctx.warehouse:
             return ctx
-        return self._query_context()
+        cached = self._warehouse_size
+        if recheck_warehouse or cached is None or cached[:2] != (ctx.role, ctx.warehouse):
+            cached = (ctx.role, ctx.warehouse, self._read_warehouse_size(ctx.warehouse))
+            self._warehouse_size = cached
+        return replace(ctx, warehouse_size=cached[2])
+
+    def _read_warehouse_size(self, name: str) -> str | None:
+        """The warehouse's size, or ``None`` if it could not be read."""
+        try:
+            cur = self.connection.cursor()
+            try:
+                cur.execute(f"SHOW WAREHOUSES LIKE {quote_literal(name)}")
+                columns = [str(d[0]).lower() for d in cur.description or ()]
+                rows = cur.fetchall()
+            finally:
+                cur.close()
+        except Exception:
+            log.debug("Could not read the size of warehouse %s", name, exc_info=True)
+            return None
+        if "name" not in columns or "size" not in columns:
+            return None
+        name_at, size_at = columns.index("name"), columns.index("size")
+        # LIKE treats "_" as a wildcard and ignores case, and the connector
+        # hands back the warehouse as it was configured ("compute_wh"), so
+        # prefer the exact name and settle for a case-insensitive one.
+        matches = sorted(
+            (row for row in rows if str(row[name_at]).upper() == name.upper()),
+            key=lambda row: row[name_at] != name,
+        )
+        size = matches[0][size_at] if matches else None
+        return str(size) if size else None
 
     def _query_context(self) -> SessionContext:
         """Fallback when the connector's cached context looks stale."""

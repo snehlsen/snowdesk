@@ -102,7 +102,7 @@ def test_session_reads_context_from_the_connection() -> None:
         "RAW",
         "PUBLIC",
     )
-    assert str(ctx) == "ANALYST · COMPUTE_WH · RAW.PUBLIC"
+    assert str(ctx) == "ANALYST · COMPUTE_WH (X-Small) · RAW.PUBLIC"
 
 
 def test_session_falls_back_to_current_functions() -> None:

@@ -51,6 +51,9 @@ log = logging.getLogger(__name__)
 #: A statement that may have changed the session's AUTOCOMMIT, so it is worth
 #: asking the server again.  Loose on purpose: a false positive costs one SHOW.
 _MENTIONS_AUTOCOMMIT = re.compile(r"\bautocommit\b", re.IGNORECASE)
+#: Likewise for the current warehouse's size (``ALTER WAREHOUSE ... SET
+#: WAREHOUSE_SIZE``), which the status bar shows.
+_MENTIONS_WAREHOUSE = re.compile(r"\bwarehouse", re.IGNORECASE)
 
 
 # --------------------------------------------------------------------------
@@ -550,7 +553,11 @@ class SnowflakeWorker(QObject):
             self._busy.clear()
             with self._runner_lock:
                 self._runner = None
-            self.context_changed.emit(self.session.read_context())
+            self.context_changed.emit(
+                self.session.read_context(
+                    recheck_warehouse=any(_MENTIONS_WAREHOUSE.search(s.sql) for s in job.statements)
+                )
+            )
             self._refresh_transaction(
                 reread_autocommit=any(_MENTIONS_AUTOCOMMIT.search(s.sql) for s in job.statements)
             )
