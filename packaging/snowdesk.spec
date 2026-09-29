@@ -20,10 +20,17 @@
 #     are dropped from the tables below instead.
 
 import os
+import re
 
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(SPEC)))
+
+# The one place the version is written down; pyproject.toml and the release
+# workflow read it from here too.  Parsed rather than imported, so building
+# does not depend on what importing the package happens to pull in.
+with open(os.path.join(ROOT, "src", "snowdesk", "__init__.py"), encoding="utf-8") as f:
+    VERSION = re.search(r'^__version__ = "([^"]+)"', f.read(), re.M).group(1)
 
 hiddenimports = [
     # See the note above: the compiled Arrow reader's imports are invisible.
@@ -125,7 +132,8 @@ app = BUNDLE(
     icon=icon,
     bundle_identifier="dev.snowdesk.app",
     info_plist={
-        "CFBundleShortVersionString": "0.1.0",
+        "CFBundleShortVersionString": VERSION,
+        "CFBundleVersion": VERSION,
         "LSMinimumSystemVersion": "13.0",
         "NSHighResolutionCapable": True,
         "NSRequiresAquaSystemAppearance": False,
