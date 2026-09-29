@@ -1,6 +1,8 @@
 [project]
 name = "snowdesk"
-version = "0.1.0"
+# Read from src/snowdesk/__init__.py, which the app bundle and the release
+# workflow also take it from.
+dynamic = ["version"]
 description = "A lightweight macOS client for Snowflake"
 readme = "README.md"
 license = "MIT"
@@ -26,6 +28,9 @@ dev = [
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/snowdesk/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/snowdesk"]

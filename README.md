@@ -201,8 +201,25 @@ open dist/SnowDesk.app
 
 For personal use, `uv run snowdesk` is enough. See spec section 12 for signing
 and notarization; the build is ad-hoc signed, so Gatekeeper rejects it until it
-is signed with a Developer ID and notarized. No `.dmg` is produced yet — the
-build stops at `dist/SnowDesk.app`.
+is signed with a Developer ID and notarized. A local build stops at
+`dist/SnowDesk.app`; the `.dmg` comes from the release workflow below.
+
+### Releasing
+
+The version lives in one place, `__version__` in `src/snowdesk/__init__.py`;
+`pyproject.toml` and the bundle's `Info.plist` both read it from there. Bump
+it, merge, then tag that commit:
+
+```
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+[`.github/workflows/release.yml`](.github/workflows/release.yml) runs the CI
+checks, fails if the tag and `__version__` disagree, builds the bundle, runs
+`--selftest` on it, and publishes a GitHub Release with
+`SnowDesk-<version>-arm64.dmg` and its `SHA256SUMS`. The release is not signed
+or notarized, and its notes tell people how to open it anyway.
 
 ### Application icon
 
