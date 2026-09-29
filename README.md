@@ -1,3 +1,5 @@
+![SnowDesk: a lightweight Snowflake client for macOS](docs/social-preview.png)
+
 # SnowDesk
 
 A lightweight macOS client for Snowflake: query editor, results grid, and schema
