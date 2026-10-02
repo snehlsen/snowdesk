@@ -700,6 +700,8 @@ class MainWindow(QMainWindow):
         self.stage_panel.run_requested.connect(self._run_browser_sql)
         self.stage_panel.log_message.connect(self._log_message)
         self.stage_panel.status_message.connect(lambda msg: self.statusBar().showMessage(msg, 4000))
+        # Transfers record their PUT, GET and REMOVE statements in History too.
+        self.stages.finished.connect(lambda _summary: self.history_panel.reload())
 
     # -- connections -------------------------------------------------------
 
