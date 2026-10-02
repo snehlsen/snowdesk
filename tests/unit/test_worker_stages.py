@@ -6,12 +6,20 @@ from pathlib import Path
 
 import pytest
 
+from snowdesk.controllers.session_lifecycle import SessionLifecycle
 from snowdesk.controllers.stages import StageController
-from snowdesk.db.session import ConnectParams, SnowflakeSession
-from snowdesk.db.worker import ConnectJob, ListStageJob, SnowflakeWorker, StagesJob
+from snowdesk.db.session import SnowflakeSession
+from snowdesk.db.worker import ListStageJob, SnowflakeWorker, StagesJob
 from snowdesk.model import FileStatus, StageFile, StageKind, StageRef, TransferKind
 from snowdesk.storage.history import HistoryStore
-from tests.fakes import FakeConnection, FakeProgrammingError, FakeStages, drain, inline
+from tests.fakes import (
+    FakeConnection,
+    FakeProgrammingError,
+    FakeStages,
+    drain,
+    inline,
+    start_session,
+)
 
 LANDING = StageRef(kind=StageKind.NAMED, name="LANDING", database="RAW", schema="PUBLIC")
 
@@ -24,8 +32,9 @@ def worker_and_conn(qapp):
         files={"landing/a.csv.gz": b"a", "landing/b/c.csv.gz": b"c"},
     )
     worker = inline(SnowflakeWorker(session=SnowflakeSession(connect_fn=lambda _p: conn)))
-    drain(worker, ConnectJob(params=ConnectParams(name="dev")))
-    return worker, conn
+    lifecycle = SessionLifecycle(worker)
+    start_session(lifecycle)
+    return worker, conn, lifecycle
 
 
 def collect(signal) -> list:
@@ -35,14 +44,14 @@ def collect(signal) -> list:
 
 
 def test_stages_job_lists_every_stage(worker_and_conn) -> None:
-    worker, _conn = worker_and_conn
+    worker, _conn, _lifecycle = worker_and_conn
     found = collect(worker.stages_ready)
     drain(worker, StagesJob())
     assert [s.name for s in found[0]] == ["LANDING"]
 
 
 def test_list_stage_job_reports_files_and_truncation(worker_and_conn) -> None:
-    worker, _conn = worker_and_conn
+    worker, _conn, _lifecycle = worker_and_conn
     listed = collect(worker.stage_listed)
     drain(worker, ListStageJob(stage=LANDING, cap=1))
     stage, prefix, files, truncated = listed[0]
@@ -51,7 +60,7 @@ def test_list_stage_job_reports_files_and_truncation(worker_and_conn) -> None:
 
 
 def test_a_failed_listing_is_reported_against_its_node(worker_and_conn) -> None:
-    worker, conn = worker_and_conn
+    worker, conn, _lifecycle = worker_and_conn
     conn.stage.fail_on = {}
     failures = collect(worker.stage_list_failed)
 
@@ -64,7 +73,7 @@ def test_a_failed_listing_is_reported_against_its_node(worker_and_conn) -> None:
 
 
 def test_an_unsafe_prefix_is_refused_without_a_query(worker_and_conn) -> None:
-    worker, conn = worker_and_conn
+    worker, conn, _lifecycle = worker_and_conn
     failures = collect(worker.stage_list_failed)
     before = len(conn.executed)
     drain(worker, ListStageJob(stage=LANDING, prefix="it's/"))
@@ -73,10 +82,9 @@ def test_an_unsafe_prefix_is_refused_without_a_query(worker_and_conn) -> None:
 
 
 def test_controller_plans_confirms_and_records_history(worker_and_conn, tmp_path: Path) -> None:
-    worker, _conn = worker_and_conn
+    worker, _conn, lifecycle = worker_and_conn
     history = HistoryStore(tmp_path / "history.db")
-    controller = StageController(worker, history=history)
-    controller._connection_name = "dev"
+    controller = StageController(worker, lifecycle, history=history)
     plans = collect(controller.plan_ready)
     finished = collect(controller.finished)
     local = tmp_path / "a.csv"
@@ -100,8 +108,8 @@ def test_controller_plans_confirms_and_records_history(worker_and_conn, tmp_path
 
 
 def test_a_plan_that_fails_frees_the_controller(worker_and_conn, tmp_path: Path) -> None:
-    worker, _conn = worker_and_conn
-    controller = StageController(worker)
+    worker, _conn, lifecycle = worker_and_conn
+    controller = StageController(worker, lifecycle)
     failed = collect(controller.failed)
     external = StageRef(kind=StageKind.NAMED, name="X", database="D", schema="S", internal=False)
     controller.download(external, ["a"], str(tmp_path))
@@ -112,8 +120,8 @@ def test_a_plan_that_fails_frees_the_controller(worker_and_conn, tmp_path: Path)
 
 
 def test_an_unexpected_error_still_finishes_the_transfer(worker_and_conn, monkeypatch) -> None:
-    worker, _conn = worker_and_conn
-    controller = StageController(worker)
+    worker, _conn, lifecycle = worker_and_conn
+    controller = StageController(worker, lifecycle)
     finished = collect(controller.finished)
 
     def explode(*_a, **_k):

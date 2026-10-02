@@ -17,7 +17,7 @@ from snowdesk.db.worker import (
     SetAutocommitJob,
     SnowflakeWorker,
 )
-from snowdesk.model import RunStatus, TransactionState
+from snowdesk.model import ConnectFailure, RunStatus, TransactionState
 from tests.fakes import FakeConnection, FakeProgrammingError, FakeStatement, drain
 
 COLS = [("N", 0, None, None, 38, 0, False)]
@@ -39,13 +39,14 @@ def collect(signal) -> list:
     return received
 
 
-def test_connect_emits_state_and_context(qapp) -> None:
+def test_connect_reports_the_connection_and_its_context(qapp) -> None:
     conn = FakeConnection()
     worker = SnowflakeWorker(session=SnowflakeSession(connect_fn=lambda _p: conn))
-    states = collect(worker.state_changed)
+    connected = collect(worker.connected)
     contexts = collect(worker.context_changed)
     drain(worker, ConnectJob(params=ConnectParams(name="dev")))
-    assert [s[0] for s in states] == ["connecting", "connected"]
+    ((name, ctx, sso_hint),) = connected
+    assert name == "dev" and ctx.role == "ANALYST" and sso_hint is False
     assert contexts[-1].role == "ANALYST"
 
 
@@ -55,10 +56,9 @@ def test_connect_failure_emits_error(qapp) -> None:
 
     worker = SnowflakeWorker(session=SnowflakeSession(connect_fn=boom))
     failures = collect(worker.connect_failed)
-    states = collect(worker.state_changed)
     drain(worker, ConnectJob(params=ConnectParams(name="dev")))
-    assert failures[0].errno == 390100
-    assert states[-1][0] == "error"
+    ((name, kind, error),) = failures
+    assert (name, kind, error.errno) == ("dev", ConnectFailure.ERROR, 390100)
 
 
 @pytest.mark.parametrize(
@@ -463,13 +463,14 @@ def test_a_failed_commit_is_reported(qapp) -> None:
 def test_losing_the_session_while_reading_the_transaction_resets_it(worker_and_conn) -> None:
     worker, conn = worker_and_conn
     run_sql(worker, "begin")
-    lost = collect(worker.connection_lost)
+    lost = collect(worker.session_lost)
     states = collect(worker.transaction_changed)
     conn.status_error = FakeProgrammingError("Session no longer exists", errno=390104)
     run_sql(worker, "select 1")
     assert lost
-    assert states[-1] == TransactionState()
     assert not worker.session.is_connected
+    drain(worker, DisconnectJob())  # what the Session lifecycle queues next
+    assert states[-1] == TransactionState()
 
 
 def test_an_unreadable_transaction_keeps_what_was_last_known(worker_and_conn) -> None:

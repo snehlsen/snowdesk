@@ -16,8 +16,10 @@ prompt alike, so no box is safe to leave native.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QMessageBox, QWidget
+from PySide6.QtWidgets import QInputDialog, QLineEdit, QMessageBox, QWidget
 
 
 def message_box(
@@ -43,3 +45,53 @@ def warning_box(parent: QWidget | None, title: str, text: str) -> QMessageBox:
 def warn(parent: QWidget | None, title: str, text: str) -> None:
     """Show ``text`` literally in a warning box."""
     warning_box(parent, title, text).exec()
+
+
+class DialogPrompter:
+    """Asks the Session lifecycle's questions with dialogs (its production prompter)."""
+
+    def __init__(self, parent: QWidget, key_file: Callable[[str], str | None]) -> None:
+        self.parent = parent
+        #: The private key file a Connection uses, to show in the passphrase prompt.
+        self.key_file = key_file
+
+    def ask_passphrase(self, connection: str, rejected: bool) -> str | None:
+        """Ask for the private key passphrase (C3).
+
+        SnowDesk never writes it anywhere (spec 5, Security).
+        """
+        headline = (
+            "Incorrect passphrase. Try again."
+            if rejected
+            else f"The private key for \u201c{connection}\u201d is encrypted."
+        )
+        lines = [headline]
+        key_file = self.key_file(connection)
+        if key_file:
+            lines.append(f"Key: {key_file}")
+        lines.extend(["", "Enter the passphrase to unlock it:"])
+        passphrase, accepted = QInputDialog.getText(
+            self.parent,
+            "Private key passphrase",
+            "\n".join(lines),
+            QLineEdit.EchoMode.Password,
+        )
+        return passphrase if accepted and passphrase else None
+
+    def ask_settle(self, reason: str) -> bool | None:
+        """Commit (True), Roll Back (False), or Cancel (None)."""
+        box = message_box(self.parent)
+        box.setWindowTitle("Open transaction")
+        box.setText("This session has a transaction open.")
+        box.setInformativeText(f"{reason} Commit its changes or roll them back?")
+        commit = box.addButton("Commit", QMessageBox.ButtonRole.AcceptRole)
+        rollback = box.addButton("Roll Back", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(commit)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is commit:
+            return True
+        if clicked is rollback:
+            return False
+        return None

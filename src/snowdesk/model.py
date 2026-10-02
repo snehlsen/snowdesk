@@ -153,6 +153,16 @@ class TransactionState:
         return self.transaction_id is not None
 
 
+class ConnectFailure(StrEnum):
+    """Why a connect did not produce a Session."""
+
+    #: The private key is encrypted and no passphrase was given.
+    PASSPHRASE_NEEDED = "passphrase needed"
+    #: The private key is encrypted and the passphrase given was wrong.
+    PASSPHRASE_REJECTED = "passphrase rejected"
+    ERROR = "error"
+
+
 @dataclass(frozen=True, slots=True)
 class QueryError:
     """A Snowflake error, with everything needed for the Messages tab (Q5)."""

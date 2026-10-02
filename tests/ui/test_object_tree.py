@@ -6,6 +6,7 @@ import pytest
 from PySide6.QtGui import QGuiApplication
 
 from snowdesk.controllers.browser import BrowserController
+from snowdesk.controllers.session_lifecycle import SessionLifecycle
 from snowdesk.db import browser as browse
 from snowdesk.db.worker import SnowflakeWorker
 from snowdesk.model import ObjectNode
@@ -37,7 +38,8 @@ COLUMNS = [
 
 @pytest.fixture
 def tree(qtbot):
-    controller = BrowserController(SnowflakeWorker())
+    worker = SnowflakeWorker()
+    controller = BrowserController(worker, SessionLifecycle(worker))
     widget = ObjectTree(controller)
     qtbot.addWidget(widget)
     # Populate through the controller so its per-node cache fills too.

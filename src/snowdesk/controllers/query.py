@@ -7,6 +7,7 @@ import logging
 from PySide6.QtCore import QObject, Signal
 
 from snowdesk.config import DEFAULT_PAGE_SIZE, DEFAULT_ROW_CAP
+from snowdesk.controllers.session_lifecycle import SessionLifecycle
 from snowdesk.db.splitter import split_sql
 from snowdesk.db.worker import CloseResultJob, FetchMoreJob, RunScriptJob, SnowflakeWorker
 from snowdesk.model import RunStatus, Statement, StatementOutcome
@@ -71,31 +72,28 @@ class QueryController(QObject):
     def __init__(
         self,
         worker: SnowflakeWorker,
+        lifecycle: SessionLifecycle,
         history: HistoryStore | None = None,
         page_size: int = DEFAULT_PAGE_SIZE,
         row_cap: int = DEFAULT_ROW_CAP,
     ) -> None:
         super().__init__()
         self.worker = worker
+        self.lifecycle = lifecycle
         self.history = history
         self.page_size = page_size
         self.row_cap = row_cap
         self._running = False
-        self._connection_name = ""
         worker.statement_finished.connect(self._on_statement_finished)
         # Commit and Roll back from the status bar belong in History too.
         worker.transaction_ended.connect(self._on_statement_finished)
         worker.script_finished.connect(self._on_script_finished)
-        worker.connected.connect(self._on_connected)
 
     # -- state -------------------------------------------------------------
 
     @property
     def is_running(self) -> bool:
         return self._running
-
-    def _on_connected(self, name: str, _ctx: object) -> None:
-        self._connection_name = name
 
     # -- intents -----------------------------------------------------------
 
@@ -117,7 +115,7 @@ class QueryController(QObject):
         if not statements:
             self.rejected.emit("Nothing to run.")
             return []
-        if not self.worker.session.is_connected:
+        if not self.lifecycle.is_connected:
             self.rejected.emit("Not connected.")
             return []
         self._running = True
@@ -141,7 +139,7 @@ class QueryController(QObject):
         if self.history is None or outcome.status is RunStatus.SKIPPED:
             return
         try:
-            self.history.record(outcome, self._connection_name)
+            self.history.record(outcome, self.lifecycle.connection_name)
         except Exception:
             log.warning("Could not write history entry", exc_info=True)
 

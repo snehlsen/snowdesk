@@ -15,7 +15,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Any
 
 from PySide6.QtCore import QObject, Signal
@@ -33,8 +33,9 @@ from snowdesk.db.errors import (
 )
 from snowdesk.db.results import ResultRegistry, summarize_status
 from snowdesk.db.runner import Cancelled, StatementRunner
-from snowdesk.db.session import ConnectionState, ConnectParams, SnowflakeSession
+from snowdesk.db.session import ConnectParams, SnowflakeSession
 from snowdesk.model import (
+    ConnectFailure,
     QueryError,
     RunStatus,
     SessionContext,
@@ -69,11 +70,6 @@ class ConnectJob:
 @dataclass(slots=True)
 class DisconnectJob:
     pass
-
-
-@dataclass(slots=True)
-class ReconnectJob:
-    """Re-open the last connection, reusing whatever it was opened with."""
 
 
 @dataclass(slots=True)
@@ -144,7 +140,6 @@ class ShutdownJob:
 Job = (
     ConnectJob
     | DisconnectJob
-    | ReconnectJob
     | RunScriptJob
     | FetchMoreJob
     | CloseResultJob
@@ -166,16 +161,15 @@ Job = (
 class SnowflakeWorker(QObject):
     """Runs the job loop on its own thread. Public methods are thread-safe."""
 
-    state_changed = Signal(str, str)  # ConnectionState value, detail
-    context_changed = Signal(object)  # SessionContext
-    connected = Signal(str, object)  # connection name, SessionContext
-    connect_failed = Signal(object)  # QueryError
-    #: The connection uses an encrypted private key and needs a passphrase:
-    #: connection name, and whether a previous attempt was rejected.
-    passphrase_required = Signal(str, bool)
+    # What happened to the session.  What it means for the Session lifecycle
+    # is decided on the UI thread (controllers/session_lifecycle.py).
+    #: Connection name, SessionContext, and whether the browser had to open
+    #: again for SSO (a hint that ALLOW_ID_TOKEN is off).
+    connected = Signal(str, object, bool)
+    connect_failed = Signal(str, object, object)  # connection name, ConnectFailure, QueryError
     #: The session died mid-flight: connection name and what went wrong.
-    connection_lost = Signal(str, str)
-    sso_hint = Signal()
+    session_lost = Signal(str, str)
+    context_changed = Signal(object)  # SessionContext
 
     script_started = Signal(int)  # statement count
     statement_started = Signal(int, object, str)  # index, Statement, query id
@@ -244,15 +238,6 @@ class SnowflakeWorker(QObject):
         )
         self._transfer_stop = threading.Event()
         self._busy = threading.Event()
-        # Key passphrases the user has entered this run, so Disconnect followed
-        # by Connect does not ask again.  In memory only, never persisted, and
-        # dropped as soon as one is rejected.  They deliberately outlive a
-        # Disconnect: being asked again for a key the app already unlocked
-        # reads as a fault, and a passphrase held in a Python str cannot be
-        # wiped anyway, so dropping the reference buys less than it costs.
-        self._passphrases: dict[str, str] = {}
-        # Survives a lost session, which clears the session's own copy.
-        self._last_name: str | None = None
         self._transaction = TransactionState()
 
     # -- public API (called from the UI thread) ---------------------------
@@ -424,13 +409,10 @@ class SnowflakeWorker(QObject):
         self._cancel_pool.shutdown(wait=False)
         self._export_pool.shutdown(wait=False)
         self._transfer_pool.shutdown(wait=False)
-        self.state_changed.emit(ConnectionState.DISCONNECTED.value, "")
 
     def _dispatch(self, job: Job) -> None:
         if isinstance(job, ConnectJob):
             self._connect(job)
-        elif isinstance(job, ReconnectJob):
-            self._reconnect()
         elif isinstance(job, DisconnectJob):
             self._disconnect()
         elif isinstance(job, RunScriptJob):
@@ -457,67 +439,30 @@ class SnowflakeWorker(QObject):
     def _connect(self, job: ConnectJob) -> None:
         self.results.close_all()
         params = job.params
-        if params.private_key_passphrase is None:
-            remembered = self._passphrases.get(params.name)
-            if remembered is not None:
-                params = replace(params, private_key_passphrase=remembered)
-        self._last_name = params.name
-        self.state_changed.emit(ConnectionState.CONNECTING.value, params.name)
         try:
             ctx = self.session.connect(params)
         except Exception as exc:
-            self._on_connect_error(params, exc)
+            self.connect_failed.emit(params.name, _connect_failure(exc), to_query_error(exc))
+            log.info("Connect to %s failed: %s", params.name, exc)
             return
-        if params.private_key_passphrase:
-            self._passphrases[params.name] = params.private_key_passphrase
-        self.state_changed.emit(ConnectionState.CONNECTED.value, params.name)
-        self.connected.emit(params.name, ctx)
+        self.connected.emit(params.name, ctx, self.session.should_hint_id_token())
         self.context_changed.emit(ctx)
         self._refresh_transaction(reread_autocommit=True)
-        if self.session.should_hint_id_token():
-            self.sso_hint.emit()
-
-    def _on_connect_error(self, params: ConnectParams, exc: BaseException) -> None:
-        """Route an encrypted-key failure to the passphrase prompt, not an error.
-
-        The key is encrypted and either no passphrase was given or the one we
-        had is wrong; in both cases the user can still get connected, so this
-        is a prompt rather than a dead end.
-        """
-        rejected = is_bad_private_key_passphrase(exc)
-        if needs_private_key_passphrase(exc) or rejected:
-            if rejected:
-                self._passphrases.pop(params.name, None)
-            log.info("Connection %s needs a private key passphrase", params.name)
-            self.state_changed.emit(ConnectionState.DISCONNECTED.value, "")
-            self.passphrase_required.emit(params.name, rejected)
-            return
-        error = to_query_error(exc)
-        log.warning("Connect to %s failed: %s", params.name, error.message)
-        self.state_changed.emit(ConnectionState.ERROR.value, error.message)
-        self.connect_failed.emit(error)
-
-    def _reconnect(self) -> None:
-        """Re-open the last connection after a loss or a disconnect (C6)."""
-        name = self._last_name
-        if not name:
-            self.worker_error.emit("No connection to reconnect to.")
-            return
-        self._connect(ConnectJob(params=ConnectParams(name=name)))
 
     def _disconnect(self) -> None:
+        """Close the session; also how a lost one is cleaned up."""
         self.results.close_all()
         self.session.close()
-        self.state_changed.emit(ConnectionState.DISCONNECTED.value, "")
         self.context_changed.emit(SessionContext())
         self._set_transaction(TransactionState())
 
     def _note_failure(self, exc: BaseException) -> bool:
-        """Mark the session dead if ``exc`` says the connection is gone (spec 9).
+        """Report the session as lost if ``exc`` says the connection is gone (spec 9).
 
-        Returns whether it did.  Closing the session here is what makes the
-        toolbar stop claiming to be connected and the Reconnect path available;
-        the editor and its tabs are untouched.
+        Returns whether it did.  The session is closed here, on the thread
+        that owns it, so the rest of the job fails fast instead of waiting on
+        a dead socket; the Session lifecycle decides what the loss means and
+        queues the rest of the cleanup.
         """
         if not is_session_lost(exc):
             return False
@@ -526,12 +471,7 @@ class SnowflakeWorker(QObject):
         log.warning("Connection %s lost: %s", name, message)
         self.results.close_all()
         self.session.close()
-        self.state_changed.emit(ConnectionState.ERROR.value, message)
-        self.connection_lost.emit(name, message)
-        self.context_changed.emit(SessionContext())
-        # After connection_lost, so the UI can still tell whether a
-        # transaction went down with the session.
-        self._set_transaction(TransactionState())
+        self.session_lost.emit(name, message)
         return True
 
     # -- script execution -------------------------------------------------
@@ -890,6 +830,14 @@ class SnowflakeWorker(QObject):
             self.stage_list_failed.emit(job.stage, job.prefix, to_query_error(exc).formatted())
             return
         self.stage_listed.emit(job.stage, job.prefix, files, truncated)
+
+
+def _connect_failure(exc: BaseException) -> ConnectFailure:
+    if is_bad_private_key_passphrase(exc):
+        return ConnectFailure.PASSPHRASE_REJECTED
+    if needs_private_key_passphrase(exc):
+        return ConnectFailure.PASSPHRASE_NEEDED
+    return ConnectFailure.ERROR
 
 
 def _affected_rows(columns: list[Any], rows: list[Any]) -> int | None:

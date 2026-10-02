@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from snowdesk.controllers.session_lifecycle import SessionLifecycle
     from snowdesk.db.worker import Job, SnowflakeWorker
 
 
@@ -509,3 +510,32 @@ def drain(worker: SnowflakeWorker, *jobs: Job) -> None:
         except queue.Empty:
             return
         worker._dispatch(job)
+
+
+# -- the Session lifecycle ----------------------------------------------------
+
+
+class ScriptedPrompter:
+    """Answers the Session lifecycle's questions from a script, and records them."""
+
+    def __init__(self, passphrases: tuple[str | None, ...] = (), settle: bool | None = None):
+        #: Answers to the passphrase prompt, in order; None (or running out) gives up.
+        self.passphrases = list(passphrases)
+        #: The answer to every Settle question: Commit, Roll back, or None to cancel.
+        self.settle = settle
+        self.passphrase_questions: list[tuple[str, bool]] = []
+        self.settle_questions: list[str] = []
+
+    def ask_passphrase(self, connection: str, rejected: bool) -> str | None:
+        self.passphrase_questions.append((connection, rejected))
+        return self.passphrases.pop(0) if self.passphrases else None
+
+    def ask_settle(self, reason: str) -> bool | None:
+        self.settle_questions.append(reason)
+        return self.settle
+
+
+def start_session(lifecycle: SessionLifecycle, connection: str = "dev") -> None:
+    """Connect through the Session lifecycle and run the worker until it answers."""
+    lifecycle.start(connection)
+    drain(lifecycle.worker)
