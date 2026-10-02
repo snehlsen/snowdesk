@@ -210,6 +210,8 @@ def history_db_path() -> Path:
     return support_dir() / "history.db"
 
 
-def session_path() -> Path:
-    """Where autosaved editor tabs live (E2)."""
+def workspace_path() -> Path:
+    """Where the autosaved workspace lives (E2)."""
+    # The file predates the Workspace name and keeps the old one, so tabs
+    # saved by earlier versions are still found and restored.
     return support_dir() / "session.json"

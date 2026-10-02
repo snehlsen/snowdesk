@@ -319,7 +319,7 @@ The browser uses `SHOW DATABASES`, `SHOW SCHEMAS IN DATABASE <db>`, `SHOW OBJECT
 
 ### 7.8 Local storage
 
-History lives in SQLite at `~/Library/Application Support/SnowDesk/history.db`. Preferences and window geometry use `QSettings`. Editor tab contents are autosaved to the same support folder every few seconds.
+History lives in SQLite at `~/Library/Application Support/SnowDesk/history.db`. Preferences and window geometry use `QSettings`. The workspace (the open editor tabs and their unsaved contents) is autosaved to the same support folder every few seconds, as `session.json`; the file keeps that name from before the workspace was called one, so existing installs restore their tabs.
 
 ## 8. UI specification
 

@@ -65,7 +65,7 @@ from snowdesk.model import (
     TransactionState,
 )
 from snowdesk.storage.history import HistoryStore
-from snowdesk.storage.session import SessionStore
+from snowdesk.storage.workspace import WorkspaceStore
 from snowdesk.ui import preferences, theme
 from snowdesk.ui.dialogs import message_box, warn
 from snowdesk.ui.editor import SqlEditor
@@ -114,7 +114,7 @@ class MainWindow(QMainWindow):
         query: QueryController,
         browser: BrowserController,
         history: HistoryStore,
-        session: SessionStore | None = None,
+        workspace: WorkspaceStore | None = None,
         dark: bool = False,
         stages: StageController | None = None,
     ) -> None:
@@ -124,7 +124,7 @@ class MainWindow(QMainWindow):
         self.browser = browser
         self.history = history
         self.stages = stages or StageController(worker, history=history)
-        self.session = session or SessionStore(config.session_path())
+        self.workspace = workspace or WorkspaceStore(config.workspace_path())
 
         self.setWindowTitle("SnowDesk")
         self.resize(1280, 820)
@@ -309,11 +309,11 @@ class MainWindow(QMainWindow):
         left = self.sidebar
 
         # Right: editor tabs over results
-        self.editors = EditorTabs(self.session, self, dark=dark)
+        self.editors = EditorTabs(self.workspace, self, dark=dark)
         self.editors.run_requested.connect(self.run_current)
         self.editors.run_all_requested.connect(self.run_all)
         self.editors.current_file_changed.connect(self._on_file_changed)
-        self.editors.restore_session()
+        self.editors.restore_workspace()
 
         self.result_tabs = QTabWidget(self)
         self.result_tabs.setDocumentMode(True)
@@ -1327,7 +1327,7 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self.stages.stop()
-        self.editors.save_session()
+        self.editors.save_workspace()
         self.closing.emit()
         super().closeEvent(event)
 

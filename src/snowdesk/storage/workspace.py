@@ -1,11 +1,11 @@
-"""Editor session persistence (E2, spec 7.8).
+"""Workspace persistence (E2, spec 7.8).
 
 Tab contents are autosaved to the application support folder so that quitting
 and relaunching restores what was being worked on, including tabs that were
 never saved to a file.
 
 A tab backed by a file that has not been edited stores only its path and is
-re-read from disk on restore; only unsaved work is copied into the session
+re-read from disk on restore; only unsaved work is copied into the workspace
 file.  That keeps the file small, keeps a single source of truth for saved
 files, and means an externally edited file comes back with its new contents.
 """
@@ -24,7 +24,7 @@ from snowdesk import config
 
 log = logging.getLogger(__name__)
 
-SESSION_VERSION = 1
+WORKSPACE_VERSION = 1
 
 #: Buffers larger than this are not carried across a restart.  A tab holding
 #: megabytes of generated SQL is not worth rewriting to disk every few seconds;
@@ -75,20 +75,20 @@ class TabState:
 
 
 @dataclass(slots=True)
-class SessionState:
+class WorkspaceState:
     tabs: list[TabState] = field(default_factory=list)
     current: int = 0
 
     def to_json(self) -> dict[str, Any]:
         return {
-            "version": SESSION_VERSION,
+            "version": WORKSPACE_VERSION,
             "current": self.current,
             "tabs": [t.to_json() for t in self.tabs],
         }
 
     @classmethod
-    def from_json(cls, data: Any) -> SessionState:
-        if not isinstance(data, dict) or data.get("version") != SESSION_VERSION:
+    def from_json(cls, data: Any) -> WorkspaceState:
+        if not isinstance(data, dict) or data.get("version") != WORKSPACE_VERSION:
             return cls()
         raw_tabs = data.get("tabs")
         if not isinstance(raw_tabs, list):
@@ -100,8 +100,8 @@ class SessionState:
         return cls(tabs=tabs, current=current)
 
 
-class SessionStore:
-    """Reads and atomically writes the editor session file."""
+class WorkspaceStore:
+    """Reads and atomically writes the workspace file."""
 
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
@@ -114,27 +114,27 @@ class SessionStore:
         if self.path.exists():
             config.secure(self.path)
 
-    def load(self) -> SessionState:
-        """Read the session, returning an empty one if it is absent or damaged.
+    def load(self) -> WorkspaceState:
+        """Read the workspace, returning an empty one if it is absent or damaged.
 
-        A corrupt session file must never stop the app from starting, so any
-        read problem is logged and treated as "no session".
+        A corrupt workspace file must never stop the app from starting, so any
+        read problem is logged and treated as "no workspace".
         """
         try:
             raw = self.path.read_text(encoding="utf-8")
         except FileNotFoundError:
-            return SessionState()
+            return WorkspaceState()
         except OSError:
-            log.warning("Could not read session file %s", self.path, exc_info=True)
-            return SessionState()
+            log.warning("Could not read workspace file %s", self.path, exc_info=True)
+            return WorkspaceState()
         try:
-            return SessionState.from_json(json.loads(raw))
+            return WorkspaceState.from_json(json.loads(raw))
         except ValueError:
-            log.warning("Ignoring damaged session file %s", self.path)
-            return SessionState()
+            log.warning("Ignoring damaged workspace file %s", self.path)
+            return WorkspaceState()
 
-    def save(self, state: SessionState) -> bool:
-        """Write the session atomically. Returns whether it was written."""
+    def save(self, state: WorkspaceState) -> bool:
+        """Write the workspace atomically. Returns whether it was written."""
         payload = state.to_json()
         for tab in payload["tabs"]:
             text = tab.get("text")
@@ -144,7 +144,7 @@ class SessionStore:
         try:
             config.private_dir(self.path.parent)
             # Write beside the target and rename, so a crash or a full disk
-            # never leaves a half-written session behind.  mkstemp also opens
+            # never leaves a half-written workspace behind.  mkstemp also opens
             # at 0600, which is what the restored file should keep: unsaved
             # editor buffers are the user's working notes.
             fd, tmp_name = tempfile.mkstemp(
@@ -160,7 +160,7 @@ class SessionStore:
                 Path(tmp_name).unlink(missing_ok=True)
                 raise
         except OSError:
-            log.warning("Could not write session file %s", self.path, exc_info=True)
+            log.warning("Could not write workspace file %s", self.path, exc_info=True)
             return False
         return True
 

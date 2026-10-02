@@ -15,7 +15,7 @@ from snowdesk.controllers.query import QueryController
 from snowdesk.db.session import ConnectParams, SnowflakeSession
 from snowdesk.db.worker import ConnectJob, SnowflakeWorker
 from snowdesk.storage.history import HistoryStore
-from snowdesk.storage.session import SessionStore
+from snowdesk.storage.workspace import WorkspaceStore
 from snowdesk.ui import preferences, theme
 from snowdesk.ui.editor import SqlEditor
 from snowdesk.ui.editor_tabs import SaveAnswer
@@ -67,7 +67,7 @@ def harness(qtbot, tmp_path, monkeypatch):
         query=QueryController(worker, history=history),
         browser=BrowserController(worker),
         history=history,
-        session=SessionStore(tmp_path / "session.json"),
+        workspace=WorkspaceStore(tmp_path / "workspace.json"),
     )
     qtbot.addWidget(window)
     # pytest-qt closes the window before fixtures are torn down, so a
@@ -235,7 +235,7 @@ def key_harness(qtbot, tmp_path, monkeypatch):
         query=QueryController(worker, history=history),
         browser=BrowserController(worker),
         history=history,
-        session=SessionStore(tmp_path / "session.json"),
+        workspace=WorkspaceStore(tmp_path / "workspace.json"),
     )
     qtbot.addWidget(window)
     yield Harness(window, worker, conn)
@@ -364,13 +364,13 @@ def test_the_title_follows_the_open_file(harness: Harness, tmp_path) -> None:
     assert "report.sql" in harness.window.windowTitle()
 
 
-def test_closing_the_window_saves_the_session(harness: Harness) -> None:
+def test_closing_the_window_saves_the_workspace(harness: Harness) -> None:
     window = harness.window
     cursor = window.editor.textCursor()
     cursor.insertText("select 'unsaved'")
     window.close()
 
-    restored = window.session.load()
+    restored = window.workspace.load()
     assert [t.text for t in restored.tabs] == ["select 'unsaved'"]
 
 
@@ -431,7 +431,7 @@ def test_closing_the_sole_tab_keeps_the_window_usable(harness: Harness) -> None:
     cursor = window.editor.textCursor()
     cursor.insertText("select 1")
     assert window.editor.toPlainText() == "select 1"
-    assert window.editors.capture_session().tabs[0].text == "select 1"
+    assert window.editors.capture_workspace().tabs[0].text == "select 1"
 
 
 def test_closing_the_sole_tab_with_the_shortcut(harness: Harness, monkeypatch) -> None:
