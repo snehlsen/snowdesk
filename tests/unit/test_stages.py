@@ -320,7 +320,7 @@ def test_a_failed_put_does_not_stop_the_others(conn: FakeConnection, tmp_path: P
     _plan, summary, statements, _f = upload(conn, paths)
     assert summary.counts == {FileStatus.FAILED: 1, FileStatus.UPLOADED: 1}
     assert [s.status for s in statements] == [RunStatus.ERROR, RunStatus.SUCCESS]
-    assert not summary.error
+    assert not summary.error and not summary.session_lost
 
 
 def test_a_lost_session_ends_the_transfer(conn: FakeConnection, tmp_path: Path) -> None:
@@ -332,7 +332,7 @@ def test_a_lost_session_ends_the_transfer(conn: FakeConnection, tmp_path: Path) 
     assert conn.stage is not None
     conn.stage.fail_on[1] = FakeProgrammingError("Session no longer exists.", errno=390111)
     _plan, summary, _s, _f = upload(conn, paths)
-    assert summary.error
+    assert summary.error and summary.session_lost
     assert summary.counts == {FileStatus.FAILED: 1, FileStatus.NOT_STARTED: 2}
     assert conn.stage.transfers == 1
 

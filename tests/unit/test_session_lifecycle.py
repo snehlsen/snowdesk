@@ -13,16 +13,19 @@ import pytest
 
 from snowdesk.controllers.browser import BrowserController
 from snowdesk.controllers.session_lifecycle import Phase, SessionLifecycle, SessionStatus
+from snowdesk.db import stages as stage_ops
 from snowdesk.db.session import ConnectParams, SnowflakeSession
 from snowdesk.db.splitter import split_sql
 from snowdesk.db.worker import RunScriptJob, SnowflakeWorker
-from snowdesk.model import ObjectNode
+from snowdesk.model import ObjectNode, StageKind, StageRef
 from tests.fakes import (
     FakeConnection,
     FakeProgrammingError,
+    FakeStages,
     FakeStatement,
     ScriptedPrompter,
     drain,
+    inline,
     start_session,
 )
 
@@ -254,6 +257,72 @@ def test_reconnect_reopens_the_last_connection(qapp, conn: FakeConnection) -> No
 def test_reconnect_without_a_previous_connection_says_so(app: App) -> None:
     assert not app.lifecycle.reconnect()
     assert app.notices == ["No connection to reconnect to."]
+
+
+# -- losing the Session on the export and transfer lanes ------------------------
+
+LANDING = StageRef(kind=StageKind.NAMED, name="LANDING", database="RAW", schema="PUBLIC")
+GONE = FakeProgrammingError("Session no longer exists.", errno=390111)
+
+
+@pytest.fixture
+def lanes(qapp) -> tuple[App, FakeConnection]:
+    """An app whose export and transfer lanes run inline, with one stage."""
+    conn = FakeConnection()
+    conn.stage = FakeStages(
+        stages=[{"name": "LANDING", "database_name": "RAW", "schema_name": "PUBLIC"}]
+    )
+    app = App(lambda _p: conn, ScriptedPrompter())
+    inline(app.worker)
+    start_session(app.lifecycle)
+    return app, conn
+
+
+def test_a_transfer_that_loses_the_session_loses_it_for_the_app(lanes, tmp_path) -> None:
+    app, conn = lanes
+    local = tmp_path / "a.csv"
+    local.write_text("a")
+    plan = stage_ops.plan_upload(conn, "t1", LANDING, "", [str(local)])
+    assert conn.stage is not None
+    conn.stage.fail_on[1] = GONE
+    finished: list = []
+    app.worker.transfer_finished.connect(finished.append)
+
+    app.worker.start_transfer(plan)
+    app.drain()
+
+    assert finished[0].error  # the transfer still reports itself interrupted
+    assert app.phase is Phase.LOST
+    assert not app.worker.session.is_connected  # closed on the job queue's thread
+
+
+def test_planning_that_loses_the_session_loses_it_for_the_app(lanes, tmp_path) -> None:
+    app, conn = lanes
+    assert conn.stage is not None
+
+    def gone(_sql: str):
+        raise GONE
+
+    conn.stage.handle = gone  # type: ignore[method-assign]
+    local = tmp_path / "a.csv"
+    local.write_text("a")  # something to upload, so planning lists the stage
+    app.worker.plan_upload("t1", LANDING, "", [str(local)])
+    app.drain()
+    assert app.phase is Phase.LOST
+
+
+def test_an_export_that_loses_the_session_loses_it_for_the_app(lanes, tmp_path) -> None:
+    app, conn = lanes
+    cols = [("N", 0, None, None, 38, 0, False)]
+    conn.plan["from orders"] = FakeStatement(columns=cols, rows=[(1,)])
+    ready: list = []
+    app.worker.result_ready.connect(lambda result_id, *_rest: ready.append(result_id))
+    app.run("select * from orders")
+    conn.plan["result_scan"] = FakeStatement(error=GONE)
+
+    app.worker.export_csv(ready[0], str(tmp_path / "out.csv"), page_size=100)
+    app.drain()
+    assert app.phase is Phase.LOST
 
 
 # -- Settle ---------------------------------------------------------------------

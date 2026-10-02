@@ -315,6 +315,7 @@ class SnowflakeWorker(QObject):
         except Exception as exc:
             log.warning("Export of %s failed", result_id, exc_info=True)
             csv_export.discard(path)
+            self._report_lost_off_queue(exc)
             self.export_failed.emit(result_id, to_query_error(exc).message)
         else:
             self.export_finished.emit(result_id, path, rows)
@@ -343,6 +344,7 @@ class SnowflakeWorker(QObject):
             self.transfer_plan_failed.emit(transfer_id, str(exc))
         except Exception as exc:
             log.warning("Planning transfer %s failed", transfer_id, exc_info=True)
+            self._report_lost_off_queue(exc)
             self.transfer_plan_failed.emit(transfer_id, to_query_error(exc).formatted())
         else:
             self.transfer_planned.emit(plan)
@@ -378,6 +380,8 @@ class SnowflakeWorker(QObject):
                 stage=plan.stage,
                 error=f"{type(exc).__name__}: {exc}",
             )
+        if summary.session_lost:
+            self.session_lost.emit(self.session.connection_name or "", summary.error)
         self.transfer_finished.emit(summary)
 
     def shutdown(self) -> None:
@@ -473,6 +477,18 @@ class SnowflakeWorker(QObject):
         self.session.close()
         self.session_lost.emit(name, message)
         return True
+
+    def _report_lost_off_queue(self, exc: BaseException) -> None:
+        """:meth:`_note_failure` for the export and transfer threads.
+
+        Only reports: the session belongs to the job queue's thread, so the
+        Session lifecycle queues the closing there.
+        """
+        if is_session_lost(exc):
+            name = self.session.connection_name or ""
+            message = to_query_error(exc).message
+            log.warning("Connection %s lost: %s", name, message)
+            self.session_lost.emit(name, message)
 
     # -- script execution -------------------------------------------------
 

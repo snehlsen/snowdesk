@@ -353,3 +353,5 @@ class TransferSummary:
     stopped: bool = False
     #: Set when the transfer could not go on at all, e.g. the session died.
     error: str = ""
+    #: The session died mid-transfer; ``error`` says how.
+    session_lost: bool = False
