@@ -11,17 +11,9 @@ from snowdesk.db.session import ConnectParams, SnowflakeSession
 from snowdesk.db.worker import ConnectJob, ListStageJob, SnowflakeWorker, StagesJob
 from snowdesk.model import FileStatus, StageFile, StageKind, StageRef, TransferKind
 from snowdesk.storage.history import HistoryStore
-from tests.fakes import FakeConnection, FakeProgrammingError, FakeStages
+from tests.fakes import FakeConnection, FakeProgrammingError, FakeStages, drain, inline
 
 LANDING = StageRef(kind=StageKind.NAMED, name="LANDING", database="RAW", schema="PUBLIC")
-
-
-class Immediately:
-    def submit(self, fn, *args):
-        fn(*args)
-
-    def shutdown(self, wait: bool = True) -> None:
-        pass
 
 
 @pytest.fixture
@@ -31,9 +23,8 @@ def worker_and_conn(qapp):
         stages=[{"name": "LANDING", "database_name": "RAW", "schema_name": "PUBLIC"}],
         files={"landing/a.csv.gz": b"a", "landing/b/c.csv.gz": b"c"},
     )
-    worker = SnowflakeWorker(session=SnowflakeSession(connect_fn=lambda _p: conn))
-    worker._transfer_pool = Immediately()  # type: ignore[assignment]
-    worker._dispatch(ConnectJob(params=ConnectParams(name="dev")))
+    worker = inline(SnowflakeWorker(session=SnowflakeSession(connect_fn=lambda _p: conn)))
+    drain(worker, ConnectJob(params=ConnectParams(name="dev")))
     return worker, conn
 
 
@@ -46,14 +37,14 @@ def collect(signal) -> list:
 def test_stages_job_lists_every_stage(worker_and_conn) -> None:
     worker, _conn = worker_and_conn
     found = collect(worker.stages_ready)
-    worker._dispatch(StagesJob())
+    drain(worker, StagesJob())
     assert [s.name for s in found[0]] == ["LANDING"]
 
 
 def test_list_stage_job_reports_files_and_truncation(worker_and_conn) -> None:
     worker, _conn = worker_and_conn
     listed = collect(worker.stage_listed)
-    worker._dispatch(ListStageJob(stage=LANDING, cap=1))
+    drain(worker, ListStageJob(stage=LANDING, cap=1))
     stage, prefix, files, truncated = listed[0]
     assert stage == LANDING and prefix == "" and truncated
     assert [f.name for f in files] == ["a.csv.gz"]
@@ -68,7 +59,7 @@ def test_a_failed_listing_is_reported_against_its_node(worker_and_conn) -> None:
         raise FakeProgrammingError("Insufficient privileges to operate on stage", errno=3001)
 
     conn.stage.handle = refuse  # type: ignore[method-assign]
-    worker._dispatch(ListStageJob(stage=LANDING, prefix="b/"))
+    drain(worker, ListStageJob(stage=LANDING, prefix="b/"))
     assert failures == [(LANDING, "b/", "[3001] Insufficient privileges to operate on stage")]
 
 
@@ -76,7 +67,7 @@ def test_an_unsafe_prefix_is_refused_without_a_query(worker_and_conn) -> None:
     worker, conn = worker_and_conn
     failures = collect(worker.stage_list_failed)
     before = len(conn.executed)
-    worker._dispatch(ListStageJob(stage=LANDING, prefix="it's/"))
+    drain(worker, ListStageJob(stage=LANDING, prefix="it's/"))
     assert failures and "quote" in failures[0][2]
     assert len(conn.executed) == before
 

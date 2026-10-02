@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import gzip
-import queue
 import sys
 from pathlib import Path
 
@@ -29,17 +28,7 @@ from snowdesk.ui.stage_tree import (
     STAGE_ROLE,
     StagePanel,
 )
-from tests.fakes import FakeConnection, FakeProgrammingError, FakeStages
-
-
-class Immediately:
-    """Stands in for the transfer thread pool: runs each job as it is submitted."""
-
-    def submit(self, fn, *args):
-        fn(*args)
-
-    def shutdown(self, wait: bool = True) -> None:
-        pass
+from tests.fakes import FakeConnection, FakeProgrammingError, FakeStages, drain, inline
 
 
 class Harness:
@@ -55,12 +44,7 @@ class Harness:
         return self.window.stage_panel
 
     def drain(self) -> None:
-        while True:
-            try:
-                job = self.worker._queue.get_nowait()
-            except queue.Empty:
-                return
-            self.worker._dispatch(job)
+        drain(self.worker)
 
     def show_stages(self) -> None:
         self.window.sidebar.setCurrentWidget(self.panel)
@@ -126,8 +110,7 @@ def harness(qtbot, tmp_path, monkeypatch):
             "landing/readme.txt": b"hello",
         },
     )
-    worker = SnowflakeWorker(session=SnowflakeSession(connect_fn=lambda _p: conn))
-    worker._transfer_pool = Immediately()  # type: ignore[assignment]
+    worker = inline(SnowflakeWorker(session=SnowflakeSession(connect_fn=lambda _p: conn)))
     history = HistoryStore(tmp_path / "history.db")
     window = MainWindow(
         worker=worker,

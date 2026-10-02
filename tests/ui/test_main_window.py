@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import queue
 import sys
 
 import pytest
@@ -21,7 +20,7 @@ from snowdesk.ui.editor import SqlEditor
 from snowdesk.ui.editor_tabs import SaveAnswer
 from snowdesk.ui.main_window import CONTROL_SPACING, WINDOW_MARGIN, MainWindow
 from snowdesk.ui.result_view import ResultView
-from tests.fakes import FakeConnection, FakeProgrammingError, FakeStatement
+from tests.fakes import FakeConnection, FakeProgrammingError, FakeStatement, drain, inline
 
 COLS = [("N", 0, None, None, 38, 0, False)]
 
@@ -35,12 +34,7 @@ class Harness:
         self.conn = conn
 
     def drain(self) -> None:
-        while True:
-            try:
-                job = self.worker._queue.get_nowait()
-            except queue.Empty:
-                return
-            self.worker._dispatch(job)
+        drain(self.worker)
 
 
 @pytest.fixture
@@ -60,7 +54,7 @@ def harness(qtbot, tmp_path, monkeypatch):
             "wait": FakeStatement(columns=COLS, rows=[(1,)], polls=1000),
         }
     )
-    worker = SnowflakeWorker(session=SnowflakeSession(connect_fn=lambda _p: conn))
+    worker = inline(SnowflakeWorker(session=SnowflakeSession(connect_fn=lambda _p: conn)))
     history = HistoryStore(tmp_path / "history.db")
     window = MainWindow(
         worker=worker,
@@ -837,8 +831,6 @@ def test_export_streams_the_whole_result_by_query_id(
     target = tmp_path / "out.csv"
     monkeypatch.setattr(window, "ask_export_path", lambda: str(target))
     window.export_current_result()
-    harness.worker._export_pool.shutdown(wait=True)
-    harness.window.worker.export_finished.emit("", str(target), 900)
 
     # The export re-read the result rather than draining the grid's cursor.
     assert any("RESULT_SCAN" in sql.upper() for sql in harness.conn.executed)
@@ -863,7 +855,6 @@ def test_exported_rows_are_safe_to_open_in_a_spreadsheet(
     target = tmp_path / "out.csv"
     monkeypatch.setattr(window, "ask_export_path", lambda: str(target))
     window.export_current_result()
-    harness.worker._export_pool.shutdown(wait=True)
 
     assert "'=1+1" in target.read_text()
 
