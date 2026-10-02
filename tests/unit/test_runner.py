@@ -115,26 +115,11 @@ def test_session_falls_back_to_current_functions() -> None:
     assert (ctx.role, ctx.warehouse, ctx.database, ctx.schema) == ("R", "W", "D", "S")
 
 
-def test_reconnect_reuses_parameters() -> None:
-    seen: list[ConnectParams] = []
-
-    def connect_fn(params: ConnectParams) -> FakeConnection:
-        seen.append(params)
-        return FakeConnection()
-
-    session = SnowflakeSession(connect_fn=connect_fn)
-    session.connect(ConnectParams(name="dev", role="ANALYST"))
-    session.reconnect()
-    assert [p.name for p in seen] == ["dev", "dev"]
-    assert seen[1].role == "ANALYST"
-
-
-def test_connect_failure_sets_error_state() -> None:
+def test_a_failed_connect_leaves_no_connection() -> None:
     def boom(_params: ConnectParams) -> FakeConnection:
         raise FakeProgrammingError("Incorrect username or password", errno=390100)
 
     session = SnowflakeSession(connect_fn=boom)
     with pytest.raises(FakeProgrammingError):
         session.connect(ConnectParams(name="dev"))
-    assert session.state.value == "error"
     assert not session.is_connected

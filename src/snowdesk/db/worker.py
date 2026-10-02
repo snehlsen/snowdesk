@@ -171,7 +171,6 @@ class SnowflakeWorker(QObject):
     session_lost = Signal(str, str)
     context_changed = Signal(object)  # SessionContext
 
-    script_started = Signal(int)  # statement count
     statement_started = Signal(int, object, str)  # index, Statement, query id
     statement_finished = Signal(object)  # StatementOutcome
     script_finished = Signal(object)  # list[StatementOutcome]
@@ -237,17 +236,12 @@ class SnowflakeWorker(QObject):
             max_workers=1, thread_name_prefix="snowdesk-transfer"
         )
         self._transfer_stop = threading.Event()
-        self._busy = threading.Event()
         self._transaction = TransactionState()
 
     # -- public API (called from the UI thread) ---------------------------
 
     def submit(self, job: Job) -> None:
         self._queue.put(job)
-
-    @property
-    def is_busy(self) -> bool:
-        return self._busy.is_set()
 
     def cancel_running(self) -> None:
         """Cancel the running statement server-side (Q4).
@@ -501,12 +495,10 @@ class SnowflakeWorker(QObject):
         runner = StatementRunner(self.session.connection)
         with self._runner_lock:
             self._runner = runner
-        self._busy.set()
         outcomes: list[StatementOutcome] = []
         try:
             self._execute_statements(job, runner, outcomes)
         finally:
-            self._busy.clear()
             with self._runner_lock:
                 self._runner = None
             self.context_changed.emit(
@@ -522,7 +514,6 @@ class SnowflakeWorker(QObject):
     def _execute_statements(
         self, job: RunScriptJob, runner: StatementRunner, outcomes: list[StatementOutcome]
     ) -> None:
-        self.script_started.emit(len(job.statements))
         stopped = False
         for index, statement in enumerate(job.statements):
             if stopped:
