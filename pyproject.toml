@@ -63,3 +63,8 @@ ignore_missing_imports = true
 testpaths = ["tests"]
 addopts = "-q --strict-markers"
 markers = ["integration: requires a real Snowflake account (opt-in)"]
+# Deprecated calls inside snowflake-connector-python itself (still present in 4.8.0).
+filterwarnings = [
+    "ignore:X509.get_subject is deprecated:DeprecationWarning:snowflake.connector",
+    "ignore:codecs.open\\(\\) is deprecated:DeprecationWarning:snowflake.connector",
+]
