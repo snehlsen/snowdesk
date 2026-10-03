@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import gzip
-import queue
 import sys
 from pathlib import Path
 
@@ -13,8 +12,9 @@ from PySide6.QtGui import QDropEvent
 
 from snowdesk.controllers.browser import BrowserController
 from snowdesk.controllers.query import QueryController
-from snowdesk.db.session import ConnectParams, SnowflakeSession
-from snowdesk.db.worker import ConnectJob, SnowflakeWorker
+from snowdesk.controllers.session_lifecycle import SessionLifecycle
+from snowdesk.db.session import SnowflakeSession
+from snowdesk.db.worker import SnowflakeWorker
 from snowdesk.model import StageKind
 from snowdesk.storage.history import HistoryStore
 from snowdesk.storage.workspace import WorkspaceStore
@@ -29,17 +29,15 @@ from snowdesk.ui.stage_tree import (
     STAGE_ROLE,
     StagePanel,
 )
-from tests.fakes import FakeConnection, FakeProgrammingError, FakeStages
-
-
-class Immediately:
-    """Stands in for the transfer thread pool: runs each job as it is submitted."""
-
-    def submit(self, fn, *args):
-        fn(*args)
-
-    def shutdown(self, wait: bool = True) -> None:
-        pass
+from tests.fakes import (
+    FakeConnection,
+    FakeProgrammingError,
+    FakeStages,
+    ScriptedPrompter,
+    drain,
+    inline,
+    start_session,
+)
 
 
 class Harness:
@@ -55,12 +53,7 @@ class Harness:
         return self.window.stage_panel
 
     def drain(self) -> None:
-        while True:
-            try:
-                job = self.worker._queue.get_nowait()
-            except queue.Empty:
-                return
-            self.worker._dispatch(job)
+        drain(self.worker)
 
     def show_stages(self) -> None:
         self.window.sidebar.setCurrentWidget(self.panel)
@@ -126,23 +119,22 @@ def harness(qtbot, tmp_path, monkeypatch):
             "landing/readme.txt": b"hello",
         },
     )
-    worker = SnowflakeWorker(session=SnowflakeSession(connect_fn=lambda _p: conn))
-    worker._transfer_pool = Immediately()  # type: ignore[assignment]
+    worker = inline(SnowflakeWorker(session=SnowflakeSession(connect_fn=lambda _p: conn)))
+    lifecycle = SessionLifecycle(worker, ScriptedPrompter(settle=False))
     history = HistoryStore(tmp_path / "history.db")
     window = MainWindow(
         worker=worker,
-        query=QueryController(worker, history=history),
-        browser=BrowserController(worker),
+        lifecycle=lifecycle,
+        query=QueryController(worker, lifecycle, history=history),
+        browser=BrowserController(worker, lifecycle),
         history=history,
         workspace=WorkspaceStore(tmp_path / "workspace.json"),
     )
     qtbot.addWidget(window)
-    monkeypatch.setattr(window, "ask_open_transaction", lambda _reason: False)
     monkeypatch.setattr(window, "ask_quit_during_transfer", lambda: True)
     assert window.sidebar.currentIndex() == 0  # Objects, with nothing remembered
     h = Harness(window, worker, conn)
-    worker.submit(ConnectJob(params=ConnectParams(name="dev")))
-    h.drain()
+    start_session(lifecycle)
     yield h
     history.close()
 
@@ -351,6 +343,31 @@ def test_the_upload_button_uses_the_selected_folder(
     assert "landing/top.json.gz" in harness.stage.files
 
 
+def test_a_transfer_shows_up_in_the_history_tab_straight_away(
+    harness: Harness, tmp_path: Path, monkeypatch
+) -> None:
+    harness.show_stages()
+    panel = harness.window.history_panel
+
+    def statements() -> list[str]:
+        return [
+            entry.sql for row in range(panel.table.rowCount()) if (entry := panel.entry_at(row))
+        ]
+
+    new = tmp_path / "orders_03.csv"
+    new.write_text("a,b\n")
+    drop(harness, harness.item("RAW", "PUBLIC", "LANDING", "2026-09/"), [new])
+    assert any(sql.startswith("PUT 'file://") for sql in statements())
+
+    target = tmp_path / "out"
+    target.mkdir()
+    monkeypatch.setattr(harness.panel, "ask_download_folder", lambda: str(target))
+    harness.panel.tree.setCurrentItem(harness.item("RAW", "PUBLIC", "LANDING", "2026-09/"))
+    harness.panel.download_action.trigger()
+    harness.drain()
+    assert any(sql.startswith("GET @") for sql in statements())
+
+
 # -- downloads and deletes ---------------------------------------------------------
 
 
@@ -475,10 +492,12 @@ def test_show_table_stage_while_the_stage_list_is_loading(harness: Harness) -> N
 def test_the_sidebar_remembers_its_page(harness: Harness, qtbot, tmp_path) -> None:
     harness.show_stages()
     worker = harness.worker
+    lifecycle = harness.window.lifecycle
     again = MainWindow(
         worker=worker,
-        query=QueryController(worker),
-        browser=BrowserController(worker),
+        lifecycle=lifecycle,
+        query=QueryController(worker, lifecycle),
+        browser=BrowserController(worker, lifecycle),
         history=harness.window.history,
         workspace=WorkspaceStore(tmp_path / "workspace2.json"),
     )

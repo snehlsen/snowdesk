@@ -114,9 +114,10 @@ while it writes, and it can be cancelled.
 is remembered, and with Follow System the window changes with macOS while
 SnowDesk is running.
 
-If the session expires or the network drops, SnowDesk marks the connection
-dead and shows a strip offering one-click Reconnect. Editor tabs, their
-contents and the messages log are left alone — only the connection is gone.
+If the session expires or the network drops, SnowDesk marks the session lost,
+whether a query, an export or a stage transfer noticed, and shows a strip
+offering one-click Reconnect. Editor tabs, their contents and the messages log
+are left alone — only the session is gone.
 
 Right-click a node in the object browser to preview 100 rows, generate a
 `SELECT` (with the column list, once columns have been loaded), copy or insert

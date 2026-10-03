@@ -32,7 +32,8 @@ from snowdesk.db.worker import (
     SetAutocommitJob,
     SnowflakeWorker,
 )
-from snowdesk.model import RunStatus
+from snowdesk.model import ConnectFailure, RunStatus
+from tests.fakes import drain
 
 pytestmark = pytest.mark.integration
 
@@ -48,38 +49,41 @@ PASSPHRASE_ENV = "SNOWDESK_IT_PASSPHRASE"
 def _connect(worker: SnowflakeWorker) -> None:
     """Connect the way the app does, answering the passphrase prompt if asked.
 
-    The worker does not fail on an encrypted key: it asks the UI for the
-    passphrase and waits.  Without an answer these tests would only ever
-    see "not connected", so the prompt is answered here, and a failure says
-    which of the two things went wrong.
+    The worker does not fail on an encrypted key: it reports that the key
+    needs a passphrase, for the app to ask.  Without an answer these tests
+    would only ever see "not connected", so the prompt is answered here, and
+    a failure says which of the two things went wrong.
     """
     from snowdesk.selftest import _prompt_passphrase
 
     failures: list = []
-    asked: list[bool] = []
-    worker.connect_failed.connect(failures.append)
-    worker.passphrase_required.connect(lambda _name, rejected: asked.append(rejected))
+    worker.connect_failed.connect(lambda _name, kind, error: failures.append((kind, error)))
 
     passphrase = os.environ.get(PASSPHRASE_ENV) or None
-    worker._dispatch(
-        ConnectJob(params=ConnectParams(name=CONNECTION, private_key_passphrase=passphrase))
+    drain(
+        worker, ConnectJob(params=ConnectParams(name=CONNECTION, private_key_passphrase=passphrase))
     )
+    asked = bool(failures) and failures[-1][0] is ConnectFailure.PASSPHRASE_NEEDED
     if not worker.session.is_connected and asked and passphrase is None:
         # getpass reads the terminal itself, so this works under pytest's
         # capture; with no terminal it returns None and we report instead.
         passphrase = _prompt_passphrase(CONNECTION, retry=False)
         if passphrase:
-            worker._dispatch(
-                ConnectJob(params=ConnectParams(name=CONNECTION, private_key_passphrase=passphrase))
+            drain(
+                worker,
+                ConnectJob(
+                    params=ConnectParams(name=CONNECTION, private_key_passphrase=passphrase)
+                ),
             )
     if worker.session.is_connected:
         return
-    if failures:
-        reason = failures[-1].formatted()
-    elif asked and asked[-1]:
+    kind, error = failures[-1] if failures else (None, None)
+    if kind is ConnectFailure.PASSPHRASE_REJECTED:
         reason = "the private key passphrase was rejected"
-    elif asked:
+    elif kind is ConnectFailure.PASSPHRASE_NEEDED:
         reason = f"the private key is encrypted; set {PASSPHRASE_ENV} or run from a terminal"
+    elif error is not None:
+        reason = error.formatted()
     else:
         reason = "no error was reported"
     pytest.fail(f"Could not connect to {CONNECTION!r}: {reason}", pytrace=False)
@@ -106,7 +110,7 @@ def run(worker: SnowflakeWorker, sql: str) -> list:
     outcomes: list = []
     worker.statement_finished.connect(outcomes.append)
     try:
-        worker._dispatch(RunScriptJob(statements=split_sql(sql)))
+        drain(worker, RunScriptJob(statements=split_sql(sql)))
     finally:
         worker.statement_finished.disconnect(outcomes.append)
     return outcomes
@@ -128,7 +132,7 @@ def test_large_result_spans_multiple_chunks(worker) -> None:
     worker.result_ready.connect(lambda *a: results.append(a))
     sql = "SELECT SEQ4() AS N FROM TABLE(GENERATOR(ROWCOUNT => 5000))"
     try:
-        worker._dispatch(RunScriptJob(statements=split_sql(sql), page_size=500))
+        drain(worker, RunScriptJob(statements=split_sql(sql), page_size=500))
     finally:
         worker.result_ready.disconnect()
 
@@ -140,7 +144,7 @@ def test_large_result_spans_multiple_chunks(worker) -> None:
     worker.rows_appended.connect(lambda *a: appended.append(a))
     try:
         while not appended or not appended[-1][2]:
-            worker._dispatch(FetchMoreJob(result_id=result_id, page_size=500))
+            drain(worker, FetchMoreJob(result_id=result_id, page_size=500))
     finally:
         worker.rows_appended.disconnect()
     assert sum(len(a[1]) for a in appended) == 4500
@@ -169,7 +173,7 @@ def test_cancellation_is_server_side(worker) -> None:
     worker.statement_started.connect(lambda *_: threading.Timer(1.0, worker.cancel_running).start())
     started = time.monotonic()
     try:
-        worker._dispatch(RunScriptJob(statements=split_sql("SELECT SYSTEM$WAIT(30)")))
+        drain(worker, RunScriptJob(statements=split_sql("SELECT SYSTEM$WAIT(30)")))
     finally:
         worker.statement_finished.disconnect(outcomes.append)
         worker.statement_started.disconnect()
@@ -190,7 +194,7 @@ def test_manual_commit_round_trip(worker, schema) -> None:
     table = f"{schema}.SNOWDESK_TXN"
     run(worker, f"CREATE OR REPLACE TABLE {table} (N INT)")
     assert worker._transaction.autocommit is True
-    worker._dispatch(SetAutocommitJob(enabled=False))
+    drain(worker, SetAutocommitJob(enabled=False))
     try:
         assert worker._transaction.autocommit is False
 
@@ -199,20 +203,20 @@ def test_manual_commit_round_trip(worker, schema) -> None:
         refused: list = []
         worker.autocommit_failed.connect(refused.append)
         try:
-            worker._dispatch(SetAutocommitJob(enabled=True))
+            drain(worker, SetAutocommitJob(enabled=True))
         finally:
             worker.autocommit_failed.disconnect(refused.append)
         assert refused and worker.session.read_autocommit() is False
 
-        worker._dispatch(EndTransactionJob(commit=False))
+        drain(worker, EndTransactionJob(commit=False))
         assert not worker._transaction.in_transaction
 
         run(worker, f"INSERT INTO {table} VALUES (2)")
-        worker._dispatch(EndTransactionJob(commit=True))
+        drain(worker, EndTransactionJob(commit=True))
         assert not worker._transaction.in_transaction
     finally:
-        worker._dispatch(EndTransactionJob(commit=False))
-        worker._dispatch(SetAutocommitJob(enabled=True))
+        drain(worker, EndTransactionJob(commit=False))
+        drain(worker, SetAutocommitJob(enabled=True))
     assert worker._transaction.autocommit is True
 
     outcomes = run(worker, f"SELECT N FROM {table}")

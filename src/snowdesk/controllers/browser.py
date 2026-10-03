@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import QObject, Signal
 
+from snowdesk.controllers.session_lifecycle import SessionLifecycle, SessionStatus
 from snowdesk.db.worker import BrowseJob, SnowflakeWorker
 from snowdesk.model import ObjectNode
 
@@ -16,14 +17,14 @@ class BrowserController(QObject):
     nodes_ready = Signal(object, object)  # path, list[ObjectNode]
     failed = Signal(object, str)
 
-    def __init__(self, worker: SnowflakeWorker) -> None:
+    def __init__(self, worker: SnowflakeWorker, lifecycle: SessionLifecycle) -> None:
         super().__init__()
         self.worker = worker
         self._cache: dict[Path, list[ObjectNode]] = {}
         self._pending: set[Path] = set()
         worker.nodes_ready.connect(self._on_nodes)
         worker.browse_failed.connect(self._on_failed)
-        worker.connected.connect(lambda *_: self.invalidate_all())
+        lifecycle.changed.connect(self._on_session_changed)
 
     def cached(self, path: Path) -> list[ObjectNode] | None:
         return self._cache.get(path)
@@ -46,6 +47,12 @@ class BrowserController(QObject):
     def invalidate_all(self) -> None:
         self._cache.clear()
         self._pending.clear()
+
+    def _on_session_changed(self, status: SessionStatus) -> None:
+        # On the way out of a Session rather than into the next one, so the
+        # cache is empty before anyone can ask the new Session for roots.
+        if not status.is_connected:
+            self.invalidate_all()
 
     def _on_nodes(self, path: Path, nodes: list[ObjectNode]) -> None:
         self._pending.discard(path)

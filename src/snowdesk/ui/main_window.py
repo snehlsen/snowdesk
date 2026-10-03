@@ -22,7 +22,6 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -43,22 +42,18 @@ from PySide6.QtWidgets import (
 from snowdesk import __version__, config
 from snowdesk.controllers.browser import BrowserController
 from snowdesk.controllers.query import QueryController
+from snowdesk.controllers.session_lifecycle import Phase, SessionLifecycle, SessionStatus
 from snowdesk.controllers.stages import StageController
 from snowdesk.db import profile
 from snowdesk.db.identifiers import qualify
-from snowdesk.db.session import ConnectionState, ConnectParams
 from snowdesk.db.worker import (
-    ConnectJob,
-    DisconnectJob,
     EndTransactionJob,
     ProfileJob,
-    ReconnectJob,
     SetAutocommitJob,
     SnowflakeWorker,
 )
 from snowdesk.model import (
     ColumnInfo,
-    QueryError,
     RunStatus,
     SessionContext,
     StatementOutcome,
@@ -67,7 +62,7 @@ from snowdesk.model import (
 from snowdesk.storage.history import HistoryStore
 from snowdesk.storage.workspace import WorkspaceStore
 from snowdesk.ui import preferences, theme
-from snowdesk.ui.dialogs import message_box, warn
+from snowdesk.ui.dialogs import DialogPrompter, message_box, warn
 from snowdesk.ui.editor import SqlEditor
 from snowdesk.ui.editor_tabs import EditorTabs
 from snowdesk.ui.history_panel import HistoryPanel
@@ -87,10 +82,12 @@ WINDOW_MARGIN = 12
 CONTROL_SPACING = 8
 
 _STATE_DOT = {
-    ConnectionState.DISCONNECTED.value: ("○", "#8a8f98", "Disconnected"),
-    ConnectionState.CONNECTING.value: ("◐", "#a15c00", "Connecting…"),
-    ConnectionState.CONNECTED.value: ("●", "#1a7f37", "Connected"),
-    ConnectionState.ERROR.value: ("●", "#e5534b", "Error"),
+    Phase.DISCONNECTED: ("○", "#8a8f98", "Disconnected"),
+    Phase.CONNECTING: ("◐", "#a15c00", "Connecting…"),
+    Phase.AWAITING_PASSPHRASE: ("◐", "#a15c00", "Waiting for passphrase…"),
+    Phase.CONNECTED: ("●", "#1a7f37", "Connected"),
+    Phase.LOST: ("●", "#e5534b", "Connection lost"),
+    Phase.FAILED: ("●", "#e5534b", "Error"),
 }
 
 #: The open-transaction dot.  Amber that reads on both light and dark bars.
@@ -111,6 +108,7 @@ class MainWindow(QMainWindow):
     def __init__(
         self,
         worker: SnowflakeWorker,
+        lifecycle: SessionLifecycle,
         query: QueryController,
         browser: BrowserController,
         history: HistoryStore,
@@ -120,10 +118,11 @@ class MainWindow(QMainWindow):
     ) -> None:
         super().__init__()
         self.worker = worker
+        self.lifecycle = lifecycle
         self.query = query
         self.browser = browser
         self.history = history
-        self.stages = stages or StageController(worker, history=history)
+        self.stages = stages or StageController(worker, lifecycle, history=history)
         self.workspace = workspace or WorkspaceStore(config.workspace_path())
 
         self.setWindowTitle("SnowDesk")
@@ -140,7 +139,12 @@ class MainWindow(QMainWindow):
         self._context = SessionContext()
         self._connections: dict[str, config.ConnectionInfo] = {}
         self._escape_formulas = True
-        self._connected = False
+        #: The Session as last rendered, to tell which transition just happened.
+        self._shown = SessionStatus()
+        #: closeEvent is on the stack, so a settled quit must not close again.
+        self._in_close_event = False
+        #: The user already chose Stop and Quit for the running transfer.
+        self._quit_during_transfer = False
         self._transaction = TransactionState()
         #: When the open transaction was first seen, for its elapsed time.
         self._transaction_since: datetime | None = None
@@ -152,9 +156,11 @@ class MainWindow(QMainWindow):
         self._build_actions()
         self._connect_signals()
 
+        if lifecycle.prompter is None:
+            lifecycle.prompter = DialogPrompter(self, self._key_file)
         self._populate_connections()
         self._apply_saved_preferences()
-        self._set_state(ConnectionState.DISCONNECTED.value, "")
+        self._on_session_changed(lifecycle.status)
 
     @property
     def editor(self) -> SqlEditor:
@@ -265,10 +271,7 @@ class MainWindow(QMainWindow):
         self.banner_bar.setVisible(False)
 
     def _reconnect(self) -> None:
-        if not self._settle_transaction("Reconnecting ends this session and its open transaction."):
-            return
-        self.hide_banner()
-        self.worker.submit(ReconnectJob())
+        self.lifecycle.reconnect()
 
     def _build_central(self, dark: bool) -> None:
         # Left: object browser
@@ -651,14 +654,11 @@ class MainWindow(QMainWindow):
     # -- signal wiring -----------------------------------------------------
 
     def _connect_signals(self) -> None:
+        self.lifecycle.changed.connect(self._on_session_changed)
+        self.lifecycle.notice.connect(self._log_message)
+
         w = self.worker
-        w.state_changed.connect(self._set_state)
         w.context_changed.connect(self._set_context)
-        w.connected.connect(self._on_connected)
-        w.connect_failed.connect(self._on_connect_failed)
-        w.passphrase_required.connect(self._on_passphrase_required)
-        w.connection_lost.connect(self._on_connection_lost)
-        w.sso_hint.connect(self._on_sso_hint)
         w.statement_started.connect(self._on_statement_started)
         w.statement_finished.connect(self._on_statement_finished)
         w.result_ready.connect(self._on_result_ready)
@@ -700,6 +700,8 @@ class MainWindow(QMainWindow):
         self.stage_panel.run_requested.connect(self._run_browser_sql)
         self.stage_panel.log_message.connect(self._log_message)
         self.stage_panel.status_message.connect(lambda msg: self.statusBar().showMessage(msg, 4000))
+        # Transfers record their PUT, GET and REMOVE statements in History too.
+        self.stages.finished.connect(lambda _summary: self.history_panel.reload())
 
     # -- connections -------------------------------------------------------
 
@@ -736,100 +738,59 @@ class MainWindow(QMainWindow):
         )
 
     def _on_connect_clicked(self) -> None:
+        if self.lifecycle.is_connected:
+            self.lifecycle.end()
+            return
         name = self.connection_box.currentData()
-        if not name:
-            return
-        if self.worker.session.is_connected and self.connect_button.text() == "Disconnect":
-            if not self._settle_transaction(
-                "Disconnecting ends this session and its open transaction."
-            ):
-                return
-            self.worker.submit(DisconnectJob())
-            return
-        self.worker.submit(ConnectJob(params=ConnectParams(name=name)))
+        if name:
+            self.lifecycle.start(name)
 
-    def _on_connected(self, name: str, ctx: SessionContext) -> None:
-        self.hide_banner()
-        self.statusBar().showMessage(f"Connected to {name}", 4000)
-        self._set_context(ctx)
-        self.object_tree.load_roots()
-        self.stage_panel.set_connected(True)
-        if self.sidebar.currentWidget() is self.stage_panel:
-            self.stage_panel.ensure_loaded()
+    def _key_file(self, connection: str) -> str | None:
+        info = self._connections.get(connection)
+        return info.private_key_file if info else None
 
-    def _on_connect_failed(self, error: QueryError) -> None:
-        self._log_message(f"Connection failed: {error.formatted()}")
-        warn(self, "Could not connect", error.message)
-
-    def _on_passphrase_required(self, name: str, rejected: bool) -> None:
-        """Ask for the private key passphrase and retry the connect (C3).
-
-        The passphrase is held in memory for this run only so a reconnect does
-        not ask again; SnowDesk never writes it anywhere (spec 5, Security).
-        """
-        info = self._connections.get(name)
-        headline = (
-            "Incorrect passphrase. Try again."
-            if rejected
-            else f"The private key for \u201c{name}\u201d is encrypted."
-        )
-        lines = [headline]
-        if info and info.private_key_file:
-            lines.append(f"Key: {info.private_key_file}")
-        lines.extend(["", "Enter the passphrase to unlock it:"])
-
-        passphrase, accepted = QInputDialog.getText(
-            self,
-            "Private key passphrase",
-            "\n".join(lines),
-            QLineEdit.EchoMode.Password,
-        )
-        if not accepted or not passphrase:
-            self._log_message(
-                f"Connection to {name} cancelled: the private key passphrase is required."
-            )
-            self.statusBar().showMessage("Passphrase required to connect", 6000)
-            return
-        self.worker.submit(
-            ConnectJob(params=ConnectParams(name=name, private_key_passphrase=passphrase))
-        )
-
-    def _on_connection_lost(self, name: str, message: str) -> None:
-        """The session died mid-flight (spec 9).
-
-        Editor tabs and results are left exactly as they are; only the
-        connection is gone, and one click brings it back.
-        """
-        where = f" to {name}" if name else ""
-        lost = (
-            " The open transaction was not committed." if self._transaction.in_transaction else ""
-        )
-        self._log_message(f"Connection{where} lost: {message}{lost}")
-        self.show_banner(f"Connection{where} lost — {message}{lost}")
-        self.statusBar().showMessage("Disconnected", 6000)
-
-    def _on_sso_hint(self) -> None:
-        self._log_message(
-            "The browser opened again for SSO. Ask an account admin to set "
-            "ALLOW_ID_TOKEN = TRUE so the cached token in the Keychain can be reused."
-        )
-
-    def _set_state(self, state: str, detail: str) -> None:
-        glyph, color, text = _STATE_DOT.get(state, ("○", "#8a8f98", state))
+    def _on_session_changed(self, status: SessionStatus) -> None:
+        """Render the Session, and act on the transition that just happened."""
+        was, self._shown = self._shown, status
+        glyph, color, text = _STATE_DOT[status.phase]
         self.state_label.setText(f'<span style="color:{color}">{glyph}</span> {text}')
-        connected = state == ConnectionState.CONNECTED.value
+        connected = status.is_connected
         self.connect_button.setText("Disconnect" if connected else "Connect")
-        self.connect_button.setEnabled(state != ConnectionState.CONNECTING.value)
-        self.run_button.setEnabled(connected)
-        if detail and state == ConnectionState.ERROR.value:
-            self.statusBar().showMessage(detail, 8000)
-        was_connected = self._connected
-        self._connected = connected
+        self.connect_button.setEnabled(
+            bool(self._connections)
+            and status.phase not in (Phase.CONNECTING, Phase.AWAITING_PASSPHRASE)
+        )
+        self.run_button.setEnabled(connected and not self.query.is_running)
         self._render_transaction()
-        if not connected:
+
+        if connected and not was.is_connected:
+            self.hide_banner()
+            self.statusBar().showMessage(f"Connected to {status.connection}", 4000)
+            self.object_tree.load_roots()
+            self.stage_panel.set_connected(True)
+            if self.sidebar.currentWidget() is self.stage_panel:
+                self.stage_panel.ensure_loaded()
+        if was.is_connected and not connected:
             self._set_context(SessionContext())
-            if was_connected:
-                self.stage_panel.set_connected(False)
+            self.object_tree.clear()
+            self.stage_panel.set_connected(False)
+        if status.phase is Phase.CONNECTING:
+            self.hide_banner()
+
+        if status.phase is Phase.FAILED and status.error is not None:
+            self._log_message(f"Connection failed: {status.error.formatted()}")
+            self.statusBar().showMessage(status.message, 8000)
+            warn(self, "Could not connect", status.message)
+        elif status.phase is Phase.LOST:
+            # Editor tabs and results are left exactly as they are; only the
+            # Session is gone, and one click brings a new one (spec 9).
+            where = f" to {status.connection}" if status.connection else ""
+            lost = " The open transaction was not committed." if status.transaction_lost else ""
+            self._log_message(f"Connection{where} lost: {status.message}{lost}")
+            self.show_banner(f"Connection{where} lost — {status.message}{lost}")
+            self.statusBar().showMessage("Disconnected", 6000)
+        elif status.phase is Phase.DISCONNECTED and was.phase is Phase.AWAITING_PASSPHRASE:
+            self.statusBar().showMessage("Passphrase required to connect", 6000)
 
     def _set_context(self, ctx: SessionContext) -> None:
         self._context = ctx
@@ -881,7 +842,7 @@ class MainWindow(QMainWindow):
             self._set_status_segment(self.qid_label, outcome.query_id)
 
     def _on_run_finished(self, outcomes: list[StatementOutcome]) -> None:
-        self.run_button.setEnabled(self.worker.session.is_connected)
+        self.run_button.setEnabled(self.lifecycle.is_connected)
         self.stop_button.setEnabled(False)
         self.cancel_action.setEnabled(False)
         self._update_transaction_actions()
@@ -908,7 +869,7 @@ class MainWindow(QMainWindow):
         """Show the session's commit mode, as last read back from it."""
         state = self._transaction
         button = self.commit_button
-        self._set_status_visible(button, self._connected)
+        self._set_status_visible(button, self.lifecycle.is_connected)
         if state.in_transaction:
             since = self._transaction_since or datetime.now()
             elapsed = _elapsed_minutes(datetime.now() - since)
@@ -940,7 +901,7 @@ class MainWindow(QMainWindow):
         self._update_transaction_actions()
 
     def _update_transaction_actions(self) -> None:
-        ready = self._connected and not self.query.is_running
+        ready = self.lifecycle.is_connected and not self.query.is_running
         in_transaction = ready and self._transaction.in_transaction
         self.autocommit_action.setEnabled(ready)
         self.manual_commit_action.setEnabled(ready)
@@ -954,11 +915,10 @@ class MainWindow(QMainWindow):
         self._render_transaction()
         if self._transaction.autocommit is enabled:
             return
-        if not self._settle_transaction(
-            "The commit mode can only change once the open transaction has ended."
-        ):
-            return
-        self.worker.submit(SetAutocommitJob(enabled=enabled))
+        self.lifecycle.settle(
+            "The commit mode can only change once the open transaction has ended.",
+            then=lambda: self.worker.submit(SetAutocommitJob(enabled=enabled)),
+        )
 
     def commit_transaction(self) -> None:
         self.worker.submit(EndTransactionJob(commit=True))
@@ -967,38 +927,6 @@ class MainWindow(QMainWindow):
     def rollback_transaction(self) -> None:
         self.worker.submit(EndTransactionJob(commit=False))
         self.statusBar().showMessage("Rolling back…")
-
-    def _settle_transaction(self, reason: str) -> bool:
-        """Ask what to do with an open transaction before ending the session.
-
-        Returns False when the user backs out.  Otherwise the COMMIT or
-        ROLLBACK is queued, and runs before whatever the caller queues next.
-        """
-        if not self._transaction.in_transaction:
-            return True
-        commit = self.ask_open_transaction(reason)
-        if commit is None:
-            return False
-        self.worker.submit(EndTransactionJob(commit=commit))
-        return True
-
-    def ask_open_transaction(self, reason: str) -> bool | None:
-        """Commit (True), Roll Back (False), or Cancel (None)."""
-        box = message_box(self)
-        box.setWindowTitle("Open transaction")
-        box.setText("This session has a transaction open.")
-        box.setInformativeText(f"{reason} Commit its changes or roll them back?")
-        commit = box.addButton("Commit", QMessageBox.ButtonRole.AcceptRole)
-        rollback = box.addButton("Roll Back", QMessageBox.ButtonRole.DestructiveRole)
-        box.addButton(QMessageBox.StandardButton.Cancel)
-        box.setDefaultButton(commit)
-        box.exec()
-        clicked = box.clickedButton()
-        if clicked is commit:
-            return True
-        if clicked is rollback:
-            return False
-        return None
 
     def _on_transaction_ended(self, outcome: StatementOutcome) -> None:
         sql = outcome.statement.sql
@@ -1126,7 +1054,7 @@ class MainWindow(QMainWindow):
         self.show_query_profile(query_id)
 
     def show_query_profile(self, query_id: str) -> None:
-        if not self.worker.session.is_connected:
+        if not self.lifecycle.is_connected:
             self.statusBar().showMessage("Not connected.", 4000)
             return
         self.statusBar().showMessage(f"Reading the profile for {query_id}…", 4000)
@@ -1318,18 +1246,37 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         # Tab contents are autosaved, so quitting only has to ask about
-        # changes that live in Snowflake: an open transaction (E2, Q10).  The
-        # COMMIT or ROLLBACK is queued ahead of the worker's shutdown job.
-        if self.stages.is_busy and not self.ask_quit_during_transfer():
-            event.ignore()
-            return
-        if not self._settle_transaction("Quitting ends this session and its open transaction."):
+        # changes that live in Snowflake: a running transfer and an open
+        # transaction (E2, Q10).  The window closes only once a COMMIT or
+        # ROLLBACK chosen here has succeeded.
+        if self.stages.is_busy and not self._quit_during_transfer:
+            if not self.ask_quit_during_transfer():
+                event.ignore()
+                return
+            self._quit_during_transfer = True
+        self._in_close_event = True
+        try:
+            settled = self.lifecycle.settle(
+                "Quitting ends this session and its open transaction.",
+                then=self._close_once_settled,
+            )
+        finally:
+            self._in_close_event = False
+        if not settled:
+            if not self.lifecycle.settling:
+                self._quit_during_transfer = False  # the user backed out of quitting
             event.ignore()
             return
         self.stages.stop()
         self.editors.save_workspace()
         self.closing.emit()
         super().closeEvent(event)
+
+    def _close_once_settled(self) -> None:
+        # Called straight back from inside closeEvent when there was nothing
+        # to settle, where closing again would recurse.
+        if not self._in_close_event:
+            self.close()
 
 
 def _elapsed_minutes(delta: timedelta) -> str:

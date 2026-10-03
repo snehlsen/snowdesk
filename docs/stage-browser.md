@@ -294,7 +294,7 @@ for it, can be added later if needed.
 | External stage | Listing works. The menu has no transfer or delete items, Upload… is disabled, and drops are refused. |
 | One file fails mid-batch | That file is marked failed and the rest continue. The summary line reads "3 uploaded, 1 failed". |
 | Stop pressed | The current file finishes. Remaining files are marked "not started". This is a neutral status, not an error. |
-| Session lost during transfer | The transfer stops and is reported as interrupted, listing which files completed and which were not started. The reconnect strip appears once the worker's next statement notices the session is gone. |
+| Session lost during transfer | The transfer stops and is reported as interrupted, listing which files completed and which were not started. The session is marked lost at once and the reconnect strip appears. |
 | Local file unreadable or disappears | Checked before PUT. Reported per file. |
 | Listing hits the cap | A notice row says so and suggests refreshing a folder on its own. |
 | Quit with a transfer running | Ask: Stop and Quit / Keep Running. Same pattern as an open transaction. |

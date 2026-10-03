@@ -702,6 +702,7 @@ def run_transfer(
         run.report(name, FileStatus.FAILED, reason)
     error = ""
     stopped = False
+    lost = False
     try:
         if plan.kind is TransferKind.UPLOAD:
             _run_upload(run)
@@ -713,6 +714,7 @@ def run_transfer(
         stopped = True
     except _SessionLost as exc:
         error = str(exc)
+        lost = True
     return TransferSummary(
         transfer_id=plan.transfer_id,
         kind=plan.kind,
@@ -720,6 +722,7 @@ def run_transfer(
         counts=dict(run.counts),
         stopped=stopped,
         error=error,
+        session_lost=lost,
     )
 
 
