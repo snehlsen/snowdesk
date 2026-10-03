@@ -343,6 +343,31 @@ def test_the_upload_button_uses_the_selected_folder(
     assert "landing/top.json.gz" in harness.stage.files
 
 
+def test_a_transfer_shows_up_in_the_history_tab_straight_away(
+    harness: Harness, tmp_path: Path, monkeypatch
+) -> None:
+    harness.show_stages()
+    panel = harness.window.history_panel
+
+    def statements() -> list[str]:
+        return [
+            entry.sql for row in range(panel.table.rowCount()) if (entry := panel.entry_at(row))
+        ]
+
+    new = tmp_path / "orders_03.csv"
+    new.write_text("a,b\n")
+    drop(harness, harness.item("RAW", "PUBLIC", "LANDING", "2026-09/"), [new])
+    assert any(sql.startswith("PUT 'file://") for sql in statements())
+
+    target = tmp_path / "out"
+    target.mkdir()
+    monkeypatch.setattr(harness.panel, "ask_download_folder", lambda: str(target))
+    harness.panel.tree.setCurrentItem(harness.item("RAW", "PUBLIC", "LANDING", "2026-09/"))
+    harness.panel.download_action.trigger()
+    harness.drain()
+    assert any(sql.startswith("GET @") for sql in statements())
+
+
 # -- downloads and deletes ---------------------------------------------------------
 
 
