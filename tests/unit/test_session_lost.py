@@ -126,3 +126,36 @@ def test_a_lost_session_drops_live_results(qapp) -> None:
     conn.plan["good"] = FakeStatement(error=dead)
     worker.submit(RunScriptJob(statements=split_sql("select good")))
     assert len(worker.results) == 0
+
+
+def test_an_export_that_loses_the_session_reports_it_but_leaves_closing_to_the_session_lane(
+    qapp, tmp_path
+) -> None:
+    """The session belongs to the session lane; the Session lifecycle queues the close there."""
+    cols = [("N", 0, None, None, 38, 0, False)]
+    worker, conn = _connected(qapp, {"from orders": FakeStatement(columns=cols, rows=[(1,)])})
+    ready = collect(worker.result_ready)
+    worker.submit(RunScriptJob(statements=split_sql("select * from orders")))
+    conn.plan["result_scan"] = FakeStatement(error=OperationalError("Connection aborted"))
+    lost = collect(worker.session_lost)
+    failed = collect(worker.export_failed)
+
+    worker.export_csv(ready[0][0], str(tmp_path / "out.csv"), page_size=100)
+
+    assert lost == [("dev", "Connection aborted")]
+    assert failed and "Connection aborted" in failed[0][1]
+    assert worker.session.is_connected
+    assert not (tmp_path / "out.csv").exists()  # no partial file left behind
+
+
+def test_an_export_without_a_session_is_refused(qapp, tmp_path) -> None:
+    cols = [("N", 0, None, None, 38, 0, False)]
+    worker, _conn = _connected(qapp, {"from orders": FakeStatement(columns=cols, rows=[(1,)])})
+    ready = collect(worker.result_ready)
+    worker.submit(RunScriptJob(statements=split_sql("select * from orders")))
+    worker.session.close()  # the result handle outlives it until a Disconnect
+    failed = collect(worker.export_failed)
+
+    worker.export_csv(ready[0][0], str(tmp_path / "out.csv"), page_size=100)
+
+    assert failed == [(ready[0][0], "Not connected.")]
