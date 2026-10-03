@@ -118,3 +118,11 @@ def test_summary_for_picker(cfg_dir: Path) -> None:
 def test_snowflake_home_is_honoured(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SNOWFLAKE_HOME", str(tmp_path))
     assert config.connections_file() == tmp_path / "connections.toml"
+
+
+def test_workspace_keeps_its_original_file_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Renaming the file would lose every existing user's restored tabs.
+    monkeypatch.setattr(config, "SUPPORT_DIR", tmp_path)
+    assert config.workspace_path() == tmp_path / "session.json"

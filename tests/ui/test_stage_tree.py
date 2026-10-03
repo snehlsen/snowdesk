@@ -17,7 +17,7 @@ from snowdesk.db.session import SnowflakeSession
 from snowdesk.db.worker import SnowflakeWorker
 from snowdesk.model import StageKind
 from snowdesk.storage.history import HistoryStore
-from snowdesk.storage.session import SessionStore
+from snowdesk.storage.workspace import WorkspaceStore
 from snowdesk.ui.main_window import MainWindow
 from snowdesk.ui.stage_tree import (
     DATA_ROLE,
@@ -128,7 +128,7 @@ def harness(qtbot, tmp_path, monkeypatch):
         query=QueryController(worker, lifecycle, history=history),
         browser=BrowserController(worker, lifecycle),
         history=history,
-        session=SessionStore(tmp_path / "session.json"),
+        workspace=WorkspaceStore(tmp_path / "workspace.json"),
     )
     qtbot.addWidget(window)
     monkeypatch.setattr(window, "ask_quit_during_transfer", lambda: True)
@@ -499,7 +499,7 @@ def test_the_sidebar_remembers_its_page(harness: Harness, qtbot, tmp_path) -> No
         query=QueryController(worker, lifecycle),
         browser=BrowserController(worker, lifecycle),
         history=harness.window.history,
-        session=SessionStore(tmp_path / "session2.json"),
+        workspace=WorkspaceStore(tmp_path / "workspace2.json"),
     )
     qtbot.addWidget(again)
     assert again.sidebar.currentWidget() is again.stage_panel

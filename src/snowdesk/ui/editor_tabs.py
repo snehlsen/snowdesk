@@ -9,7 +9,7 @@ from pathlib import Path
 from PySide6.QtCore import QTimer, Signal
 from PySide6.QtWidgets import QFileDialog, QMessageBox, QTabWidget, QWidget
 
-from snowdesk.storage.session import SessionState, SessionStore, TabState
+from snowdesk.storage.workspace import TabState, WorkspaceState, WorkspaceStore
 from snowdesk.ui.dialogs import message_box, warn
 from snowdesk.ui.editor import SqlEditor
 
@@ -39,7 +39,7 @@ class EditorTabs(QTabWidget):
 
     def __init__(
         self,
-        store: SessionStore,
+        store: WorkspaceStore,
         parent: QWidget | None = None,
         dark: bool = False,
     ) -> None:
@@ -269,12 +269,12 @@ class EditorTabs(QTabWidget):
         if isinstance(current, SqlEditor):
             self.current_file_changed.emit(self._paths.get(current))
 
-    # -- session (E2) ------------------------------------------------------
+    # -- workspace (E2) ----------------------------------------------------
 
     def _autosave_tick(self) -> None:
         if not self._pending_save and not self._any_modified():
             return
-        self.save_session()
+        self.save_workspace()
 
     def _any_modified(self) -> bool:
         return any(
@@ -282,7 +282,7 @@ class EditorTabs(QTabWidget):
             for w in (self.widget(i) for i in range(self.count()))
         )
 
-    def capture_session(self) -> SessionState:
+    def capture_workspace(self) -> WorkspaceState:
         tabs: list[TabState] = []
         for index in range(self.count()):
             editor = self.widget(index)
@@ -299,15 +299,15 @@ class EditorTabs(QTabWidget):
                     cursor=editor.textCursor().position(),
                 )
             )
-        return SessionState(tabs=tabs, current=max(0, self.currentIndex()))
+        return WorkspaceState(tabs=tabs, current=max(0, self.currentIndex()))
 
-    def save_session(self) -> bool:
-        written = self.store.save(self.capture_session())
+    def save_workspace(self) -> bool:
+        written = self.store.save(self.capture_workspace())
         if written:
             self._pending_save = False
         return written
 
-    def restore_session(self) -> int:
+    def restore_workspace(self) -> int:
         """Rebuild tabs from the last run; returns how many were restored."""
         state = self.store.load()
         restored = 0
@@ -338,5 +338,5 @@ class EditorTabs(QTabWidget):
         editor.setTextCursor(cursor)
 
     def confirm_close_all(self) -> bool:
-        """On quit: the session is autosaved, so nothing needs confirming."""
-        return self.save_session() or True
+        """On quit: the workspace is autosaved, so nothing needs confirming."""
+        return self.save_workspace() or True

@@ -14,7 +14,7 @@ from pathlib import Path
 
 from snowdesk import config
 from snowdesk.storage.history import HistoryStore
-from snowdesk.storage.session import SessionState, SessionStore, TabState
+from snowdesk.storage.workspace import TabState, WorkspaceState, WorkspaceStore
 
 from .test_history import outcome
 
@@ -62,7 +62,7 @@ def test_history_database_is_not_world_readable(tmp_path: Path) -> None:
     assert mode_of(tmp_path / "support") & 0o077 == 0
 
 
-def test_session_file_is_not_world_readable(tmp_path: Path) -> None:
-    path = tmp_path / "support" / "session.json"
-    assert SessionStore(path).save(SessionState(tabs=[TabState(text="select 1")]))
+def test_workspace_file_is_not_world_readable(tmp_path: Path) -> None:
+    path = tmp_path / "support" / "workspace.json"
+    assert WorkspaceStore(path).save(WorkspaceState(tabs=[TabState(text="select 1")]))
     assert mode_of(path) & 0o077 == 0

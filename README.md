@@ -155,7 +155,7 @@ A few things behave in ways worth knowing:
 
 Every PUT, GET and REMOVE is logged in Messages and recorded in History.
 
-Editor tabs are autosaved every few seconds to
+The workspace (your open editor tabs) is autosaved every few seconds to
 `~/Library/Application Support/SnowDesk/session.json`, so unsaved work survives
 a relaunch. A tab backed by an unmodified file stores only its path and is
 re-read from disk, so editing a file outside SnowDesk is picked up.

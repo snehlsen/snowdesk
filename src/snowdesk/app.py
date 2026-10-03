@@ -19,7 +19,7 @@ from snowdesk.controllers.session_lifecycle import SessionLifecycle
 from snowdesk.controllers.stages import StageController
 from snowdesk.db.worker import SnowflakeWorker
 from snowdesk.storage.history import HistoryStore
-from snowdesk.storage.session import SessionStore
+from snowdesk.storage.workspace import WorkspaceStore
 from snowdesk.ui import theme
 from snowdesk.ui.main_window import MainWindow
 
@@ -112,7 +112,7 @@ class Application:
         theme.apply(theme.load(), self.qt)
 
         self.history = HistoryStore(config.history_db_path())
-        self.session = SessionStore(config.session_path())
+        self.workspace = WorkspaceStore(config.workspace_path())
         self.worker = SnowflakeWorker()
         self.thread = QThread()
         self.thread.setObjectName("snowdesk-worker")
@@ -132,7 +132,7 @@ class Application:
             browser=self.browser,
             history=self.history,
             stages=self.stages,
-            session=self.session,
+            workspace=self.workspace,
             dark=theme.is_dark(self.qt),
         )
         self.qt.aboutToQuit.connect(self.shutdown)
@@ -144,7 +144,7 @@ class Application:
 
     def shutdown(self) -> None:
         log.info("Shutting down")
-        self.window.editors.save_session()
+        self.window.editors.save_workspace()
         # Break any polling loop first so the worker reaches the shutdown job.
         self.worker.cancel_running()
         self.worker.shutdown()

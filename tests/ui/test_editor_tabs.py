@@ -1,4 +1,4 @@
-"""Editor tabs, .sql files and session restore (E2, E3)."""
+"""Editor tabs, .sql files and workspace restore (E2, E3)."""
 
 from __future__ import annotations
 
@@ -6,14 +6,14 @@ from pathlib import Path
 
 import pytest
 
-from snowdesk.storage.session import SessionStore
+from snowdesk.storage.workspace import WorkspaceStore
 from snowdesk.ui import editor_tabs
 from snowdesk.ui.editor_tabs import DIRTY_MARK, EditorTabs, SaveAnswer
 
 
 @pytest.fixture
 def tabs(qtbot, tmp_path):
-    widget = EditorTabs(SessionStore(tmp_path / "session.json"))
+    widget = EditorTabs(WorkspaceStore(tmp_path / "workspace.json"))
     qtbot.addWidget(widget)
     widget.new_tab()
     return widget
@@ -164,11 +164,11 @@ def test_cancelling_the_save_dialog_saves_nothing(tabs: EditorTabs, monkeypatch)
     assert tabs.editor.document().isModified()
 
 
-# -- session restore (E2) ---------------------------------------------------
+# -- workspace restore (E2) -------------------------------------------------
 
 
 def test_unsaved_work_survives_a_relaunch(qtbot, tmp_path: Path) -> None:
-    store = SessionStore(tmp_path / "session.json")
+    store = WorkspaceStore(tmp_path / "workspace.json")
     first = EditorTabs(store)
     qtbot.addWidget(first)
     first.new_tab()
@@ -176,11 +176,11 @@ def test_unsaved_work_survives_a_relaunch(qtbot, tmp_path: Path) -> None:
     first.new_tab()
     type_into(first.editor, "select 2")
     first.setCurrentIndex(0)
-    assert first.save_session()
+    assert first.save_workspace()
 
     second = EditorTabs(store)
     qtbot.addWidget(second)
-    assert second.restore_session() == 2
+    assert second.restore_workspace() == 2
     assert second.widget(0).toPlainText() == "select 'not saved anywhere'"
     assert second.widget(1).toPlainText() == "select 2"
     assert second.currentIndex() == 0
@@ -189,34 +189,34 @@ def test_unsaved_work_survives_a_relaunch(qtbot, tmp_path: Path) -> None:
 def test_a_saved_file_is_reread_from_disk(qtbot, tmp_path: Path) -> None:
     path = tmp_path / "q.sql"
     path.write_text("select 1")
-    store = SessionStore(tmp_path / "session.json")
+    store = WorkspaceStore(tmp_path / "workspace.json")
 
     first = EditorTabs(store)
     qtbot.addWidget(first)
     first.open_file(path)
-    first.save_session()
+    first.save_workspace()
 
     path.write_text("select 999 -- changed outside SnowDesk")
     second = EditorTabs(store)
     qtbot.addWidget(second)
-    second.restore_session()
+    second.restore_workspace()
     assert "changed outside SnowDesk" in second.widget(0).toPlainText()
 
 
 def test_unsaved_edits_to_a_file_win_over_the_file(qtbot, tmp_path: Path) -> None:
     path = tmp_path / "q.sql"
     path.write_text("select 1")
-    store = SessionStore(tmp_path / "session.json")
+    store = WorkspaceStore(tmp_path / "workspace.json")
 
     first = EditorTabs(store)
     qtbot.addWidget(first)
     editor = first.open_file(path)
     type_into(editor, "select 1 -- work in progress")
-    first.save_session()
+    first.save_workspace()
 
     second = EditorTabs(store)
     qtbot.addWidget(second)
-    second.restore_session()
+    second.restore_workspace()
     assert "work in progress" in second.widget(0).toPlainText()
     assert second.widget(0).document().isModified()
     assert second.tabText(0).endswith(DIRTY_MARK)
@@ -225,31 +225,31 @@ def test_unsaved_edits_to_a_file_win_over_the_file(qtbot, tmp_path: Path) -> Non
 def test_a_vanished_file_is_skipped_not_fatal(qtbot, tmp_path: Path) -> None:
     path = tmp_path / "gone.sql"
     path.write_text("select 1")
-    store = SessionStore(tmp_path / "session.json")
+    store = WorkspaceStore(tmp_path / "workspace.json")
 
     first = EditorTabs(store)
     qtbot.addWidget(first)
     first.open_file(path)
     first.new_tab()
     type_into(first.editor, "select 2")
-    first.save_session()
+    first.save_workspace()
     path.unlink()
 
     second = EditorTabs(store)
     qtbot.addWidget(second)
-    assert second.restore_session() == 1
+    assert second.restore_workspace() == 1
     assert second.widget(0).toPlainText() == "select 2"
 
 
 def test_restoring_nothing_still_gives_one_tab(qtbot, tmp_path: Path) -> None:
-    tabs = EditorTabs(SessionStore(tmp_path / "session.json"))
+    tabs = EditorTabs(WorkspaceStore(tmp_path / "workspace.json"))
     qtbot.addWidget(tabs)
-    assert tabs.restore_session() == 0
+    assert tabs.restore_workspace() == 0
     assert tabs.count() == 1
 
 
 def test_the_cursor_position_comes_back(qtbot, tmp_path: Path) -> None:
-    store = SessionStore(tmp_path / "session.json")
+    store = WorkspaceStore(tmp_path / "workspace.json")
     first = EditorTabs(store)
     qtbot.addWidget(first)
     first.new_tab()
@@ -257,9 +257,9 @@ def test_the_cursor_position_comes_back(qtbot, tmp_path: Path) -> None:
     cursor = first.editor.textCursor()
     cursor.setPosition(9)
     first.editor.setTextCursor(cursor)
-    first.save_session()
+    first.save_workspace()
 
     second = EditorTabs(store)
     qtbot.addWidget(second)
-    second.restore_session()
+    second.restore_workspace()
     assert second.widget(0).textCursor().position() == 9
