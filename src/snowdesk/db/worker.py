@@ -1,8 +1,8 @@
-"""The worker thread: job queue, Snowflake calls, Qt signals (spec 6.2).
+"""The worker: jobs, Snowflake calls, Qt signals (spec 6.2).
 
-All Snowflake I/O happens here, on one dedicated thread that owns the
-connection.  Cancellation is the single exception: it runs on a small
-side-thread so it does not queue behind the statement it is cancelling.
+All Snowflake I/O happens here.  Which thread runs it is the worker's
+lanes' business (db/lanes.py): the session lane owns the connection, and
+exports, transfers and cancels each run in a lane of their own.
 
 Signals always carry plain Python data — never live cursors.
 """
@@ -10,13 +10,12 @@ Signals always carry plain Python data — never live cursors.
 from __future__ import annotations
 
 import logging
-import queue
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from PySide6.QtCore import QObject, Signal
 
@@ -31,12 +30,13 @@ from snowdesk.db.errors import (
     needs_private_key_passphrase,
     to_query_error,
 )
-from snowdesk.db.results import ResultRegistry, summarize_status
+from snowdesk.db.lanes import Lanes
+from snowdesk.db.results import ResultHandle, ResultRegistry, summarize_status
 from snowdesk.db.runner import Cancelled, StatementRunner
-from snowdesk.db.session import ConnectParams, SnowflakeSession
+from snowdesk.db.session import Connection, ConnectParams, SnowflakeSession
 from snowdesk.model import (
     ConnectFailure,
-    QueryError,
+    ObjectNode,
     RunStatus,
     SessionContext,
     StageRef,
@@ -132,11 +132,6 @@ class SetAutocommitJob:
     enabled: bool
 
 
-@dataclass(slots=True)
-class ShutdownJob:
-    pass
-
-
 Job = (
     ConnectJob
     | DisconnectJob
@@ -149,8 +144,36 @@ Job = (
     | ListStageJob
     | EndTransactionJob
     | SetAutocommitJob
-    | ShutdownJob
 )
+
+
+# --------------------------------------------------------------------------
+# Operations
+# --------------------------------------------------------------------------
+
+LaneName = Literal["session", "export", "transfer"]
+
+
+class Refused(Exception):
+    """A request turned down before Snowflake is asked; its message is the answer."""
+
+
+@dataclass(frozen=True, slots=True)
+class Operation[T]:
+    """One request to Snowflake: the lane it runs in, and where its answer goes.
+
+    :meth:`SnowflakeWorker._run` puts it in the envelope every request
+    shares: the connected check, the lost-session check, and turning a
+    failure into the message ``failed`` hears.
+    """
+
+    name: str  # for the log: "<name> failed"
+    work: Callable[[Connection], T]
+    done: Callable[[T], None]
+    failed: Callable[[str], None]
+    lane: LaneName = "session"
+    #: Failures whose own message is the answer, besides :class:`Refused`.
+    refusals: tuple[type[Exception], ...] = ()
 
 
 # --------------------------------------------------------------------------
@@ -159,7 +182,7 @@ Job = (
 
 
 class SnowflakeWorker(QObject):
-    """Runs the job loop on its own thread. Public methods are thread-safe."""
+    """Runs Snowflake work in its lanes. Public methods are thread-safe."""
 
     # What happened to the session.  What it means for the Session lifecycle
     # is decided on the UI thread (controllers/session_lifecycle.py).
@@ -215,33 +238,26 @@ class SnowflakeWorker(QObject):
 
     worker_error = Signal(str)
 
-    def __init__(self, session: SnowflakeSession | None = None) -> None:
+    def __init__(self, session: SnowflakeSession | None = None, lanes: Lanes | None = None) -> None:
         super().__init__()
         self.session = session or SnowflakeSession()
         self.results = ResultRegistry()
-        self._queue: queue.Queue[Job] = queue.Queue()
+        # Exports and stage transfers run off the session lane: a million
+        # rows, or a PUT, takes minutes, and blocking every other job behind
+        # it would freeze the browser and any further queries.  Each uses its
+        # own cursor, as the cancel lane already does (spec 6.2,
+        # docs/stage-browser.md §7.2).
+        self._lanes = lanes or Lanes.threaded()
         self._runner: StatementRunner | None = None
         self._runner_lock = threading.Lock()
-        self._cancel_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="snowdesk-cancel")
-        # Exports run off the job queue: a million rows takes minutes, and
-        # blocking every other job behind it would freeze the browser and
-        # any further queries.  Its own cursor, as the cancel path already
-        # does (spec 6.2).
-        self._export_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="snowdesk-export")
         self._export_stop = threading.Event()
-        # Stage transfers likewise: a PUT holds its thread for as long as the
-        # upload takes (docs/stage-browser.md §7.2).  One thread, so plans
-        # and transfers run in the order they were asked for.
-        self._transfer_pool = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="snowdesk-transfer"
-        )
         self._transfer_stop = threading.Event()
         self._transaction = TransactionState()
 
     # -- public API (called from the UI thread) ---------------------------
 
     def submit(self, job: Job) -> None:
-        self._queue.put(job)
+        self._lanes.session.submit(lambda: self._dispatch(job))
 
     def cancel_running(self) -> None:
         """Cancel the running statement server-side (Q4).
@@ -254,7 +270,7 @@ class SnowflakeWorker(QObject):
         if runner is None:
             return
         runner.request_stop()
-        self._cancel_pool.submit(self._do_cancel, runner)
+        self._lanes.cancel.submit(lambda: self._do_cancel(runner))
 
     def _do_cancel(self, runner: StatementRunner) -> None:
         try:
@@ -267,52 +283,53 @@ class SnowflakeWorker(QObject):
     def export_csv(
         self, result_id: str, path: str, page_size: int, escape_formulas: bool = True
     ) -> None:
-        """Stream a finished result to a CSV file, off the job queue."""
+        """Stream a finished result to a CSV file, in the export lane."""
         handle = self.results.get(result_id)
         if handle is None or not handle.query_id:
             self.export_failed.emit(
                 result_id, "That result can no longer be exported; run the query again."
             )
             return
-        if not self.session.is_connected:
-            self.export_failed.emit(result_id, "Not connected.")
-            return
+        query_id = handle.query_id
         self._export_stop.clear()
-        self._export_pool.submit(
-            self._do_export, result_id, handle.query_id, path, page_size, escape_formulas
+
+        def export(conn: Connection) -> int | None:
+            """Rows written, or None when cancelled; no partial file is left either way."""
+            try:
+                return csv_export.export_result(
+                    conn,
+                    query_id,
+                    path,
+                    page_size,
+                    self._export_stop,
+                    on_progress=lambda written: self.export_progress.emit(result_id, written),
+                    escape_formulas=escape_formulas,
+                )
+            except csv_export.ExportCancelled:
+                csv_export.discard(path)
+                return None
+            except Exception:
+                csv_export.discard(path)
+                raise
+
+        def finished(rows: int | None) -> None:
+            if rows is None:
+                self.export_cancelled.emit(result_id)
+            else:
+                self.export_finished.emit(result_id, path, rows)
+
+        self._submit(
+            Operation(
+                f"Export of {result_id}",
+                work=export,
+                done=finished,
+                failed=lambda message: self.export_failed.emit(result_id, message),
+                lane="export",
+            )
         )
 
     def cancel_export(self) -> None:
         self._export_stop.set()
-
-    def _do_export(
-        self,
-        result_id: str,
-        query_id: str,
-        path: str,
-        page_size: int,
-        escape_formulas: bool = True,
-    ) -> None:
-        try:
-            rows = csv_export.export_result(
-                self.session.connection,
-                query_id,
-                path,
-                page_size,
-                self._export_stop,
-                on_progress=lambda written: self.export_progress.emit(result_id, written),
-                escape_formulas=escape_formulas,
-            )
-        except csv_export.ExportCancelled:
-            csv_export.discard(path)
-            self.export_cancelled.emit(result_id)
-        except Exception as exc:
-            log.warning("Export of %s failed", result_id, exc_info=True)
-            csv_export.discard(path)
-            self._report_lost_off_queue(exc)
-            self.export_failed.emit(result_id, to_query_error(exc).message)
-        else:
-            self.export_finished.emit(result_id, path, rows)
 
     # -- stage transfers (docs/stage-browser.md) ---------------------------
 
@@ -326,22 +343,16 @@ class SnowflakeWorker(QObject):
         self._submit_plan(transfer_id, stage_ops.plan_download, stage, selection, local_root)
 
     def _submit_plan(self, transfer_id: str, planner: Any, *args: Any) -> None:
-        if not self.session.is_connected:
-            self.transfer_plan_failed.emit(transfer_id, "Not connected.")
-            return
-        self._transfer_pool.submit(self._do_plan, transfer_id, planner, *args)
-
-    def _do_plan(self, transfer_id: str, planner: Any, *args: Any) -> None:
-        try:
-            plan = planner(self.session.connection, transfer_id, *args)
-        except stage_ops.UnsafeName as exc:
-            self.transfer_plan_failed.emit(transfer_id, str(exc))
-        except Exception as exc:
-            log.warning("Planning transfer %s failed", transfer_id, exc_info=True)
-            self._report_lost_off_queue(exc)
-            self.transfer_plan_failed.emit(transfer_id, to_query_error(exc).formatted())
-        else:
-            self.transfer_planned.emit(plan)
+        self._submit(
+            Operation(
+                f"Planning transfer {transfer_id}",
+                work=lambda conn: planner(conn, transfer_id, *args),
+                done=self.transfer_planned.emit,
+                failed=lambda message: self.transfer_plan_failed.emit(transfer_id, message),
+                lane="transfer",
+                refusals=(stage_ops.UnsafeName,),
+            )
+        )
 
     def start_transfer(self, plan: TransferPlan) -> None:
         """Run a confirmed plan; Stop takes effect between statements (ST8)."""
@@ -349,7 +360,7 @@ class SnowflakeWorker(QObject):
             self.transfer_plan_failed.emit(plan.transfer_id, "Not connected.")
             return
         self._transfer_stop.clear()
-        self._transfer_pool.submit(self._do_transfer, plan)
+        self._lanes.transfer.submit(lambda: self._do_transfer(plan))
 
     def stop_transfer(self) -> None:
         self._transfer_stop.set()
@@ -381,32 +392,26 @@ class SnowflakeWorker(QObject):
     def shutdown(self) -> None:
         self._export_stop.set()
         self._transfer_stop.set()
-        self._queue.put(ShutdownJob())
+        self._lanes.session.stop()
 
-    # -- job loop (runs on the worker thread) -----------------------------
+    # -- session lane (runs on the worker thread) -------------------------
 
     def run_loop(self) -> None:
         log.info("Worker thread started")
-        while True:
-            job = self._queue.get()
-            if isinstance(job, ShutdownJob):
-                break
-            try:
-                self._dispatch(job)
-            except Exception as exc:
-                log.exception("Unhandled error in worker job %s", type(job).__name__)
-                self.worker_error.emit(f"{type(exc).__name__}: {exc}")
-            finally:
-                self._queue.task_done()
+        self._lanes.session.run(on_error=self._job_crashed)
         self._teardown()
         log.info("Worker thread stopped")
+
+    def _job_crashed(self, exc: Exception) -> None:
+        log.error("Unhandled error in worker job", exc_info=exc)
+        self.worker_error.emit(f"{type(exc).__name__}: {exc}")
 
     def _teardown(self) -> None:
         self.results.close_all()
         self.session.close()
-        self._cancel_pool.shutdown(wait=False)
-        self._export_pool.shutdown(wait=False)
-        self._transfer_pool.shutdown(wait=False)
+        self._lanes.cancel.stop()
+        self._lanes.export.stop()
+        self._lanes.transfer.stop()
 
     def _dispatch(self, job: Job) -> None:
         if isinstance(job, ConnectJob):
@@ -454,35 +459,51 @@ class SnowflakeWorker(QObject):
         self.context_changed.emit(SessionContext())
         self._set_transaction(TransactionState())
 
-    def _note_failure(self, exc: BaseException) -> bool:
+    # -- the envelope every operation runs in ---------------------------
+
+    def _submit(self, op: Operation[Any]) -> None:
+        """Run ``op`` in its lane.  For the lanes other than the session's."""
+        lane = self._lanes.export if op.lane == "export" else self._lanes.transfer
+        lane.submit(lambda: self._run(op))
+
+    def _run(self, op: Operation[Any]) -> None:
+        """Run ``op`` here and now, on the lane it names."""
+        if not self.session.is_connected:
+            op.failed("Not connected.")
+            return
+        refusals: tuple[type[Exception], ...] = (Refused, *op.refusals)
+        try:
+            answer = op.work(self.session.connection)
+        except refusals as exc:
+            op.failed(str(exc))
+            return
+        except Exception as exc:
+            log.warning("%s failed", op.name, exc_info=True)
+            self._note_failure(exc, op.lane)
+            op.failed(to_query_error(exc).formatted())
+            return
+        op.done(answer)
+
+    def _note_failure(self, exc: BaseException, lane: LaneName = "session") -> bool:
         """Report the session as lost if ``exc`` says the connection is gone (spec 9).
 
-        Returns whether it did.  The session is closed here, on the thread
-        that owns it, so the rest of the job fails fast instead of waiting on
-        a dead socket; the Session lifecycle decides what the loss means and
-        queues the rest of the cleanup.
+        Returns whether it did.  On the session lane the session is closed
+        here, on the thread that owns it, so the rest of the job fails fast
+        instead of waiting on a dead socket.  The other lanes only report:
+        the session is not theirs to close, so the Session lifecycle queues
+        the closing on the session lane.  Either way it decides what the
+        loss means.
         """
         if not is_session_lost(exc):
             return False
         name = self.session.connection_name or ""
         message = to_query_error(exc).message
         log.warning("Connection %s lost: %s", name, message)
-        self.results.close_all()
-        self.session.close()
+        if lane == "session":
+            self.results.close_all()
+            self.session.close()
         self.session_lost.emit(name, message)
         return True
-
-    def _report_lost_off_queue(self, exc: BaseException) -> None:
-        """:meth:`_note_failure` for the export and transfer threads.
-
-        Only reports: the session belongs to the job queue's thread, so the
-        Session lifecycle queues the closing there.
-        """
-        if is_session_lost(exc):
-            name = self.session.connection_name or ""
-            message = to_query_error(exc).message
-            log.warning("Connection %s lost: %s", name, message)
-            self.session_lost.emit(name, message)
 
     # -- script execution -------------------------------------------------
 
@@ -722,15 +743,19 @@ class SnowflakeWorker(QObject):
         if handle is None or handle.closed:
             self.rows_appended.emit(job.result_id, [], True)
             return
-        try:
-            rows = handle.fetch(job.page_size)
-        except Exception as exc:
-            log.warning("Fetch failed for %s", job.result_id, exc_info=True)
-            if not self._note_failure(exc):
-                self.results.close(job.result_id)
-            self.fetch_failed.emit(job.result_id, to_query_error(exc).formatted())
-            return
-        self.rows_appended.emit(job.result_id, rows, handle.exhausted)
+
+        def failed(message: str) -> None:
+            self.results.close(job.result_id)
+            self.fetch_failed.emit(job.result_id, message)
+
+        self._run(
+            Operation(
+                f"Fetch for {job.result_id}",
+                work=lambda _conn: handle.fetch(job.page_size),
+                done=lambda rows: self.rows_appended.emit(job.result_id, rows, handle.exhausted),
+                failed=failed,
+            )
+        )
 
     # -- query profile ----------------------------------------------------
 
@@ -742,101 +767,94 @@ class SnowflakeWorker(QObject):
         runner that the statement being profiled may still be using.
         """
         qid = job.query_id.strip()
-        if not self.session.is_connected:
-            self.profile_failed.emit(qid, "Not connected.")
-            return
-        if not profile.is_query_id(qid):
-            self.profile_failed.emit(qid, f"{qid or '(empty)'} is not a Snowflake query id.")
-            return
-        try:
-            cursor = self.session.connection.cursor()
+
+        def read(conn: Connection) -> tuple[ResultHandle, list[Any]]:
+            if not profile.is_query_id(qid):
+                raise Refused(f"{qid or '(empty)'} is not a Snowflake query id.")
+            cursor = conn.cursor()
             cursor.execute(profile.profile_sql(qid))
-        except Exception as exc:
-            self._note_failure(exc)
-            log.warning("Could not read the profile for %s", qid, exc_info=True)
-            self.profile_failed.emit(qid, to_query_error(exc).formatted())
-            return
+            handle = self.results.register(cursor)
+            try:
+                return handle, handle.fetch(job.page_size)
+            except Exception:
+                self.results.close(handle.result_id)
+                raise
 
-        handle = self.results.register(cursor)
-        try:
-            rows = handle.fetch(job.page_size)
-        except Exception as exc:
-            self.results.close(handle.result_id)
-            self._note_failure(exc)
-            self.profile_failed.emit(qid, to_query_error(exc).formatted())
-            return
-        if not rows:
-            self.results.close(handle.result_id)
-            self.profile_empty.emit(qid)
-            return
+        def show(answer: tuple[ResultHandle, list[Any]]) -> None:
+            handle, rows = answer
+            if not rows:
+                self.results.close(handle.result_id)
+                self.profile_empty.emit(qid)
+                return
+            # The tab carries the *profiled* query's id, not the id of the
+            # GET_QUERY_OPERATOR_STATS call that filled it: the profiled
+            # query is the one worth copying out of here.
+            self.result_ready.emit(
+                handle.result_id,
+                handle.columns,
+                rows,
+                handle.exhausted,
+                handle.total,
+                qid,
+                f"Profile · {profile.short_id(qid)}",
+            )
 
-        # The tab carries the *profiled* query's id, not the id of the
-        # GET_QUERY_OPERATOR_STATS call that filled it: the profiled query is
-        # the one worth copying out of here.
-        self.result_ready.emit(
-            handle.result_id,
-            handle.columns,
-            rows,
-            handle.exhausted,
-            handle.total,
-            qid,
-            f"Profile · {profile.short_id(qid)}",
+        self._run(
+            Operation(
+                f"Profile of {qid}",
+                work=read,
+                done=show,
+                failed=lambda message: self.profile_failed.emit(qid, message),
+            )
         )
 
     # -- object browser ---------------------------------------------------
 
     def _browse(self, job: BrowseJob) -> None:
-        if not self.session.is_connected:
-            self.browse_failed.emit(job.path, "Not connected.")
-            return
-        conn = self.session.connection
         path = job.path
-        try:
-            if len(path) == 0:
-                nodes = browse.list_databases(conn)
-            elif len(path) == 1:
-                nodes = browse.list_schemas(conn, path[0])
-            elif len(path) == 2:
-                nodes = browse.list_objects(conn, path[0], path[1])
-            else:
-                nodes = browse.list_columns(conn, path[0], path[1], path[2])
-        except Exception as exc:
-            self._note_failure(exc)
-            error: QueryError = to_query_error(exc)
-            self.browse_failed.emit(path, error.formatted())
-            return
-        self.nodes_ready.emit(path, nodes)
+        self._run(
+            Operation(
+                "Browsing",
+                work=lambda conn: _list_children(conn, path),
+                done=lambda nodes: self.nodes_ready.emit(path, nodes),
+                failed=lambda message: self.browse_failed.emit(path, message),
+            )
+        )
 
     # -- stages (docs/stage-browser.md) ------------------------------------
 
     def _list_stages(self) -> None:
-        if not self.session.is_connected:
-            self.stages_failed.emit("Not connected.")
-            return
-        try:
-            found = stage_ops.list_stages(self.session.connection)
-        except Exception as exc:
-            self._note_failure(exc)
-            self.stages_failed.emit(to_query_error(exc).formatted())
-            return
-        self.stages_ready.emit(found)
+        self._run(
+            Operation(
+                "Listing stages",
+                work=stage_ops.list_stages,
+                done=self.stages_ready.emit,
+                failed=self.stages_failed.emit,
+            )
+        )
 
     def _list_stage(self, job: ListStageJob) -> None:
-        if not self.session.is_connected:
-            self.stage_list_failed.emit(job.stage, job.prefix, "Not connected.")
-            return
-        try:
-            files, truncated = stage_ops.list_files(
-                self.session.connection, job.stage, job.prefix, job.cap
+        stage, prefix = job.stage, job.prefix
+        self._run(
+            Operation(
+                f"Listing {stage.name}",
+                work=lambda conn: stage_ops.list_files(conn, stage, prefix, job.cap),
+                done=lambda found: self.stage_listed.emit(stage, prefix, *found),
+                failed=lambda message: self.stage_list_failed.emit(stage, prefix, message),
+                refusals=(stage_ops.UnsafeName,),
             )
-        except stage_ops.UnsafeName as exc:
-            self.stage_list_failed.emit(job.stage, job.prefix, str(exc))
-            return
-        except Exception as exc:
-            self._note_failure(exc)
-            self.stage_list_failed.emit(job.stage, job.prefix, to_query_error(exc).formatted())
-            return
-        self.stage_listed.emit(job.stage, job.prefix, files, truncated)
+        )
+
+
+def _list_children(conn: Connection, path: tuple[str, ...]) -> list[ObjectNode]:
+    """The object browser's children of ``path``: databases down to columns."""
+    if len(path) == 0:
+        return browse.list_databases(conn)
+    if len(path) == 1:
+        return browse.list_schemas(conn, path[0])
+    if len(path) == 2:
+        return browse.list_objects(conn, path[0], path[1])
+    return browse.list_columns(conn, path[0], path[1], path[2])
 
 
 def _connect_failure(exc: BaseException) -> ConnectFailure:

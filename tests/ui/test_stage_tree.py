@@ -13,6 +13,7 @@ from PySide6.QtGui import QDropEvent
 from snowdesk.controllers.browser import BrowserController
 from snowdesk.controllers.query import QueryController
 from snowdesk.controllers.session_lifecycle import SessionLifecycle
+from snowdesk.db.lanes import Lanes
 from snowdesk.db.session import SnowflakeSession
 from snowdesk.db.worker import SnowflakeWorker
 from snowdesk.model import StageKind
@@ -34,16 +35,17 @@ from tests.fakes import (
     FakeProgrammingError,
     FakeStages,
     ScriptedPrompter,
-    drain,
-    inline,
     start_session,
 )
 
 
 class Harness:
-    def __init__(self, window: MainWindow, worker: SnowflakeWorker, conn: FakeConnection):
+    def __init__(
+        self, window: MainWindow, worker: SnowflakeWorker, lanes: Lanes, conn: FakeConnection
+    ):
         self.window = window
         self.worker = worker
+        self.lanes = lanes
         self.conn = conn
         assert conn.stage is not None
         self.stage = conn.stage
@@ -52,12 +54,12 @@ class Harness:
     def panel(self) -> StagePanel:
         return self.window.stage_panel
 
-    def drain(self) -> None:
-        drain(self.worker)
+    def held(self):
+        """Keep the jobs submitted in the block waiting, as if still running."""
+        return self.lanes.session.held()
 
     def show_stages(self) -> None:
         self.window.sidebar.setCurrentWidget(self.panel)
-        self.drain()
 
     def item(self, *labels: str):
         """Walk the tree by visible labels, expanding (and listing) as it goes."""
@@ -72,7 +74,6 @@ class Harness:
             found = next((c for c in children if c is not None and c.text(0) == label), None)
             assert found is not None, f"no {label!r} among {[c.text(0) for c in children]}"
             found.setExpanded(True)
-            self.drain()
         return found
 
     def labels(self, item) -> list[str]:
@@ -119,7 +120,8 @@ def harness(qtbot, tmp_path, monkeypatch):
             "landing/readme.txt": b"hello",
         },
     )
-    worker = inline(SnowflakeWorker(session=SnowflakeSession(connect_fn=lambda _p: conn)))
+    lanes = Lanes.synchronous()
+    worker = SnowflakeWorker(session=SnowflakeSession(connect_fn=lambda _p: conn), lanes=lanes)
     lifecycle = SessionLifecycle(worker, ScriptedPrompter(settle=False))
     history = HistoryStore(tmp_path / "history.db")
     window = MainWindow(
@@ -133,7 +135,7 @@ def harness(qtbot, tmp_path, monkeypatch):
     qtbot.addWidget(window)
     monkeypatch.setattr(window, "ask_quit_during_transfer", lambda: True)
     assert window.sidebar.currentIndex() == 0  # Objects, with nothing remembered
-    h = Harness(window, worker, conn)
+    h = Harness(window, worker, lanes, conn)
     start_session(lifecycle)
     yield h
     history.close()
@@ -239,7 +241,6 @@ def test_describe_stage_runs_in_a_result_tab(harness: Harness) -> None:
     menu = harness.panel.build_context_menu(stage)
     assert menu is not None
     next(a for a in menu.actions() if a.text() == "Describe Stage").trigger()
-    harness.drain()
     assert "DESCRIBE STAGE RAW.PUBLIC.LANDING" in harness.conn.executed
 
 
@@ -260,7 +261,6 @@ def drop(harness: Harness, item, paths: list[Path]) -> None:
         Qt.KeyboardModifier.NoModifier,
     )
     tree.dropEvent(event)
-    harness.drain()
 
 
 def test_dropping_files_on_a_folder_uploads_them_there(
@@ -339,7 +339,6 @@ def test_the_upload_button_uses_the_selected_folder(
     new.write_text("{}")
     monkeypatch.setattr(harness.panel, "ask_upload_files", lambda: [str(new)])
     harness.panel.upload_button.click()
-    harness.drain()
     assert "landing/top.json.gz" in harness.stage.files
 
 
@@ -364,7 +363,6 @@ def test_a_transfer_shows_up_in_the_history_tab_straight_away(
     monkeypatch.setattr(harness.panel, "ask_download_folder", lambda: str(target))
     harness.panel.tree.setCurrentItem(harness.item("RAW", "PUBLIC", "LANDING", "2026-09/"))
     harness.panel.download_action.trigger()
-    harness.drain()
     assert any(sql.startswith("GET @") for sql in statements())
 
 
@@ -381,7 +379,6 @@ def test_download_writes_the_folder_with_its_structure(
     monkeypatch.setattr(harness.panel, "ask_download_folder", lambda: str(target))
     harness.panel.tree.setCurrentItem(folder)
     harness.panel.download_action.trigger()
-    harness.drain()
     assert sorted(p.name for p in (target / "2026-09").iterdir()) == [
         "orders_01.csv.gz",
         "orders_02.csv.gz",
@@ -403,11 +400,9 @@ def test_delete_asks_and_then_removes_only_what_was_chosen(harness: Harness, mon
     monkeypatch.setattr(harness.panel, "confirm_remove", confirm)
     harness.panel.tree.setCurrentItem(file)
     harness.panel.delete_selection(file)
-    harness.drain()
     assert "landing/2026-09/orders_01.csv.gz" in harness.stage.files  # declined
 
     harness.panel.delete_selection(harness.item("RAW", "PUBLIC", "LANDING", "2026-09/").child(0))
-    harness.drain()
     assert asked == [["2026-09/orders_01.csv.gz"]] * 2
     assert "landing/2026-09/orders_01.csv.gz" not in harness.stage.files
     assert "landing/2026-09/orders_02.csv.gz" in harness.stage.files
@@ -418,7 +413,6 @@ def test_delete_asks_and_then_removes_only_what_was_chosen(harness: Harness, mon
 
 def test_show_table_stage_from_the_objects_tree(harness: Harness) -> None:
     harness.window.show_table_stage(("RAW", "PUBLIC", "ORDERS"))
-    harness.drain()
     assert harness.window.sidebar.currentWidget() is harness.panel
     item = harness.panel.tree.currentItem()
     assert item is not None and item.text(0) == "@%ORDERS"
@@ -427,14 +421,12 @@ def test_show_table_stage_from_the_objects_tree(harness: Harness) -> None:
     assert "LIST @RAW.PUBLIC.%ORDERS" in harness.conn.executed
     # It survives the stage list being refreshed.
     harness.panel.reload()
-    harness.drain()
     assert "@%ORDERS" in harness.labels(harness.item("RAW", "PUBLIC"))
 
 
 def test_disconnecting_clears_the_tree(harness: Harness) -> None:
     harness.show_stages()
     harness.window._on_connect_clicked()  # Disconnect
-    harness.drain()
     tree = harness.panel.tree
     assert [tree.topLevelItem(i).text(0) for i in range(tree.topLevelItemCount())] == [
         "Not connected"
@@ -481,9 +473,9 @@ def test_items_carry_what_the_menu_needs(harness: Harness) -> None:
 
 def test_show_table_stage_while_the_stage_list_is_loading(harness: Harness) -> None:
     """The list arriving afterwards must not throw the table stage away."""
-    harness.window.sidebar.setCurrentWidget(harness.panel)  # SHOW STAGES queued, not run
-    harness.window.show_table_stage(("RAW", "PUBLIC", "ORDERS"))
-    harness.drain()
+    with harness.held():
+        harness.window.sidebar.setCurrentWidget(harness.panel)  # SHOW STAGES queued, not run
+        harness.window.show_table_stage(("RAW", "PUBLIC", "ORDERS"))
     item = harness.panel.tree.currentItem()
     assert item is not None and item.text(0) == "@%ORDERS"
     assert item.isExpanded()

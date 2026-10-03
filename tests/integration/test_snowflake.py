@@ -15,13 +15,13 @@ default test run.
 from __future__ import annotations
 
 import os
-import queue
 import threading
 import time
 import uuid
 
 import pytest
 
+from snowdesk.db.lanes import Lanes
 from snowdesk.db.session import ConnectParams, SnowflakeSession
 from snowdesk.db.splitter import split_sql
 from snowdesk.db.worker import (
@@ -33,7 +33,6 @@ from snowdesk.db.worker import (
     SnowflakeWorker,
 )
 from snowdesk.model import ConnectFailure, RunStatus
-from tests.fakes import drain
 
 pytestmark = pytest.mark.integration
 
@@ -60,8 +59,8 @@ def _connect(worker: SnowflakeWorker) -> None:
     worker.connect_failed.connect(lambda _name, kind, error: failures.append((kind, error)))
 
     passphrase = os.environ.get(PASSPHRASE_ENV) or None
-    drain(
-        worker, ConnectJob(params=ConnectParams(name=CONNECTION, private_key_passphrase=passphrase))
+    worker.submit(
+        ConnectJob(params=ConnectParams(name=CONNECTION, private_key_passphrase=passphrase))
     )
     asked = bool(failures) and failures[-1][0] is ConnectFailure.PASSPHRASE_NEEDED
     if not worker.session.is_connected and asked and passphrase is None:
@@ -69,11 +68,8 @@ def _connect(worker: SnowflakeWorker) -> None:
         # capture; with no terminal it returns None and we report instead.
         passphrase = _prompt_passphrase(CONNECTION, retry=False)
         if passphrase:
-            drain(
-                worker,
-                ConnectJob(
-                    params=ConnectParams(name=CONNECTION, private_key_passphrase=passphrase)
-                ),
+            worker.submit(
+                ConnectJob(params=ConnectParams(name=CONNECTION, private_key_passphrase=passphrase))
             )
     if worker.session.is_connected:
         return
@@ -91,7 +87,7 @@ def _connect(worker: SnowflakeWorker) -> None:
 
 @pytest.fixture(scope="module")
 def worker(qapp):
-    worker = SnowflakeWorker(session=SnowflakeSession())
+    worker = SnowflakeWorker(session=SnowflakeSession(), lanes=Lanes.synchronous())
     _connect(worker)
     yield worker
     worker.results.close_all()
@@ -110,7 +106,7 @@ def run(worker: SnowflakeWorker, sql: str) -> list:
     outcomes: list = []
     worker.statement_finished.connect(outcomes.append)
     try:
-        drain(worker, RunScriptJob(statements=split_sql(sql)))
+        worker.submit(RunScriptJob(statements=split_sql(sql)))
     finally:
         worker.statement_finished.disconnect(outcomes.append)
     return outcomes
@@ -132,7 +128,7 @@ def test_large_result_spans_multiple_chunks(worker) -> None:
     worker.result_ready.connect(lambda *a: results.append(a))
     sql = "SELECT SEQ4() AS N FROM TABLE(GENERATOR(ROWCOUNT => 5000))"
     try:
-        drain(worker, RunScriptJob(statements=split_sql(sql), page_size=500))
+        worker.submit(RunScriptJob(statements=split_sql(sql), page_size=500))
     finally:
         worker.result_ready.disconnect()
 
@@ -144,7 +140,7 @@ def test_large_result_spans_multiple_chunks(worker) -> None:
     worker.rows_appended.connect(lambda *a: appended.append(a))
     try:
         while not appended or not appended[-1][2]:
-            drain(worker, FetchMoreJob(result_id=result_id, page_size=500))
+            worker.submit(FetchMoreJob(result_id=result_id, page_size=500))
     finally:
         worker.rows_appended.disconnect()
     assert sum(len(a[1]) for a in appended) == 4500
@@ -173,7 +169,7 @@ def test_cancellation_is_server_side(worker) -> None:
     worker.statement_started.connect(lambda *_: threading.Timer(1.0, worker.cancel_running).start())
     started = time.monotonic()
     try:
-        drain(worker, RunScriptJob(statements=split_sql("SELECT SYSTEM$WAIT(30)")))
+        worker.submit(RunScriptJob(statements=split_sql("SELECT SYSTEM$WAIT(30)")))
     finally:
         worker.statement_finished.disconnect(outcomes.append)
         worker.statement_started.disconnect()
@@ -185,16 +181,12 @@ def test_cancellation_is_server_side(worker) -> None:
     assert outcomes[0].query_id
 
 
-def test_worker_queue_drains_in_order(worker) -> None:
-    assert isinstance(worker._queue, queue.Queue)
-
-
 def test_manual_commit_round_trip(worker, schema) -> None:
     """Q10 against the real thing: the reads, the refusal and the mode switch."""
     table = f"{schema}.SNOWDESK_TXN"
     run(worker, f"CREATE OR REPLACE TABLE {table} (N INT)")
     assert worker._transaction.autocommit is True
-    drain(worker, SetAutocommitJob(enabled=False))
+    worker.submit(SetAutocommitJob(enabled=False))
     try:
         assert worker._transaction.autocommit is False
 
@@ -203,20 +195,20 @@ def test_manual_commit_round_trip(worker, schema) -> None:
         refused: list = []
         worker.autocommit_failed.connect(refused.append)
         try:
-            drain(worker, SetAutocommitJob(enabled=True))
+            worker.submit(SetAutocommitJob(enabled=True))
         finally:
             worker.autocommit_failed.disconnect(refused.append)
         assert refused and worker.session.read_autocommit() is False
 
-        drain(worker, EndTransactionJob(commit=False))
+        worker.submit(EndTransactionJob(commit=False))
         assert not worker._transaction.in_transaction
 
         run(worker, f"INSERT INTO {table} VALUES (2)")
-        drain(worker, EndTransactionJob(commit=True))
+        worker.submit(EndTransactionJob(commit=True))
         assert not worker._transaction.in_transaction
     finally:
-        drain(worker, EndTransactionJob(commit=False))
-        drain(worker, SetAutocommitJob(enabled=True))
+        worker.submit(EndTransactionJob(commit=False))
+        worker.submit(SetAutocommitJob(enabled=True))
     assert worker._transaction.autocommit is True
 
     outcomes = run(worker, f"SELECT N FROM {table}")

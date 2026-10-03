@@ -8,6 +8,7 @@ import pytest
 
 from snowdesk.controllers.session_lifecycle import SessionLifecycle
 from snowdesk.controllers.stages import StageController
+from snowdesk.db.lanes import Lanes
 from snowdesk.db.session import SnowflakeSession
 from snowdesk.db.worker import ListStageJob, SnowflakeWorker, StagesJob
 from snowdesk.model import FileStatus, StageFile, StageKind, StageRef, TransferKind
@@ -16,8 +17,6 @@ from tests.fakes import (
     FakeConnection,
     FakeProgrammingError,
     FakeStages,
-    drain,
-    inline,
     start_session,
 )
 
@@ -31,7 +30,9 @@ def worker_and_conn(qapp):
         stages=[{"name": "LANDING", "database_name": "RAW", "schema_name": "PUBLIC"}],
         files={"landing/a.csv.gz": b"a", "landing/b/c.csv.gz": b"c"},
     )
-    worker = inline(SnowflakeWorker(session=SnowflakeSession(connect_fn=lambda _p: conn)))
+    worker = SnowflakeWorker(
+        session=SnowflakeSession(connect_fn=lambda _p: conn), lanes=Lanes.synchronous()
+    )
     lifecycle = SessionLifecycle(worker)
     start_session(lifecycle)
     return worker, conn, lifecycle
@@ -46,14 +47,14 @@ def collect(signal) -> list:
 def test_stages_job_lists_every_stage(worker_and_conn) -> None:
     worker, _conn, _lifecycle = worker_and_conn
     found = collect(worker.stages_ready)
-    drain(worker, StagesJob())
+    worker.submit(StagesJob())
     assert [s.name for s in found[0]] == ["LANDING"]
 
 
 def test_list_stage_job_reports_files_and_truncation(worker_and_conn) -> None:
     worker, _conn, _lifecycle = worker_and_conn
     listed = collect(worker.stage_listed)
-    drain(worker, ListStageJob(stage=LANDING, cap=1))
+    worker.submit(ListStageJob(stage=LANDING, cap=1))
     stage, prefix, files, truncated = listed[0]
     assert stage == LANDING and prefix == "" and truncated
     assert [f.name for f in files] == ["a.csv.gz"]
@@ -68,7 +69,7 @@ def test_a_failed_listing_is_reported_against_its_node(worker_and_conn) -> None:
         raise FakeProgrammingError("Insufficient privileges to operate on stage", errno=3001)
 
     conn.stage.handle = refuse  # type: ignore[method-assign]
-    drain(worker, ListStageJob(stage=LANDING, prefix="b/"))
+    worker.submit(ListStageJob(stage=LANDING, prefix="b/"))
     assert failures == [(LANDING, "b/", "[3001] Insufficient privileges to operate on stage")]
 
 
@@ -76,7 +77,7 @@ def test_an_unsafe_prefix_is_refused_without_a_query(worker_and_conn) -> None:
     worker, conn, _lifecycle = worker_and_conn
     failures = collect(worker.stage_list_failed)
     before = len(conn.executed)
-    drain(worker, ListStageJob(stage=LANDING, prefix="it's/"))
+    worker.submit(ListStageJob(stage=LANDING, prefix="it's/"))
     assert failures and "quote" in failures[0][2]
     assert len(conn.executed) == before
 

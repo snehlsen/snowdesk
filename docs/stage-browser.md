@@ -281,7 +281,7 @@ for it, can be added later if needed.
 |-------|------|
 | `model.py` | `StageRef`, `StageFile`, `TransferPlan` and the progress, per-file result and summary types that cross the thread boundary |
 | `db/stages.py` | Every statement builder and name check; `list_stages`, `list_files`, `build_tree`; `plan_upload`, `plan_download`, `plan_remove`; `run_transfer` |
-| `db/worker.py` | `StagesJob` and `ListStageJob` on the job queue. `plan_upload`, `plan_download`, `start_transfer` and `stop_transfer` on the transfer pool |
+| `db/worker.py` | `StagesJob` and `ListStageJob` on the session lane. `plan_upload`, `plan_download`, `start_transfer` and `stop_transfer` on the transfer lane (`db/lanes.py`) |
 | `controllers/stages.py` | One transfer at a time, from plan to finish. Records every PUT, GET and REMOVE in History |
 | `ui/stage_tree.py` | `StageTree` (the tree and Finder drops) and `StagePanel` (filter, Upload…, progress strip, context menu). Dialogs are methods tests can replace: `ask_upload_files`, `ask_download_folder`, `ask_replace`, `confirm_remove` |
 | `ui/main_window.py` | Sidebar becomes a `QTabWidget` (Objects, Stages) that remembers its page. `show_table_stage`, and `ask_quit_during_transfer` on close |

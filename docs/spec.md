@@ -376,7 +376,8 @@ snowdesk/
 │   │   ├── runner.py          # StatementRunner: split, async run, cancel
 │   │   ├── results.py         # ResultCursor registry, fetch pages, type info
 │   │   ├── browser.py         # SHOW queries, identifier quoting
-│   │   └── worker.py          # QThread + job queue + signals
+│   │   ├── lanes.py           # where work runs: threaded, or synchronous for tests
+│   │   └── worker.py          # jobs + signals, run in the lanes
 │   ├── controllers/
 │   │   ├── session_lifecycle.py  # Session state, passphrases, reconnect, settle (ADR 0001)
 │   │   ├── query.py
