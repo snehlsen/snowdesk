@@ -1,7 +1,7 @@
 """The Session lifecycle: connecting, passphrases, losing a Session, and Settle.
 
 Driven through the real worker and a fake connection, with the worker run
-synchronously (tests/fakes.drain) and a scripted prompter answering for the
+synchronously (Lanes.synchronous) and a scripted prompter answering for the
 user.
 """
 
@@ -14,6 +14,7 @@ import pytest
 from snowdesk.controllers.browser import BrowserController
 from snowdesk.controllers.session_lifecycle import Phase, SessionLifecycle, SessionStatus
 from snowdesk.db import stages as stage_ops
+from snowdesk.db.lanes import Lanes
 from snowdesk.db.session import ConnectParams, SnowflakeSession
 from snowdesk.db.splitter import split_sql
 from snowdesk.db.worker import RunScriptJob, SnowflakeWorker
@@ -24,8 +25,6 @@ from tests.fakes import (
     FakeStages,
     FakeStatement,
     ScriptedPrompter,
-    drain,
-    inline,
     start_session,
 )
 
@@ -46,7 +45,10 @@ class App:
         connect_fn: Callable[[ConnectParams], FakeConnection],
         prompter: ScriptedPrompter,
     ) -> None:
-        self.worker = SnowflakeWorker(session=SnowflakeSession(connect_fn=connect_fn))
+        self.lanes = Lanes.synchronous()
+        self.worker = SnowflakeWorker(
+            session=SnowflakeSession(connect_fn=connect_fn), lanes=self.lanes
+        )
         self.prompter = prompter
         self.lifecycle = SessionLifecycle(self.worker, prompter)
         self.changes: list[SessionStatus] = []
@@ -59,10 +61,11 @@ class App:
         return self.lifecycle.status.phase
 
     def run(self, sql: str) -> None:
-        drain(self.worker, RunScriptJob(statements=split_sql(sql)))
+        self.worker.submit(RunScriptJob(statements=split_sql(sql)))
 
-    def drain(self) -> None:
-        drain(self.worker)
+    def held(self):
+        """Keep the jobs submitted in the block waiting, as if still running."""
+        return self.lanes.session.held()
 
 
 @pytest.fixture
@@ -163,7 +166,6 @@ def test_the_passphrase_is_remembered_for_the_run(qapp, conn) -> None:
     app = App(encrypted_key(attempts, conn), ScriptedPrompter(passphrases=("right",)))
     start_session(app.lifecycle)
     app.lifecycle.end()
-    app.drain()
     start_session(app.lifecycle)
     assert len(app.prompter.passphrase_questions) == 1
     assert attempts[-1].private_key_passphrase == "right"
@@ -175,7 +177,6 @@ def test_a_rejected_passphrase_is_forgotten(qapp, conn) -> None:
     app = App(encrypted_key(attempts, conn), ScriptedPrompter(passphrases=("right",)))
     start_session(app.lifecycle)
     app.lifecycle.end()
-    app.drain()
 
     # The key changed under us; the remembered passphrase no longer works.
     def changed_key(params: ConnectParams) -> FakeConnection:
@@ -249,7 +250,6 @@ def test_reconnect_reopens_the_last_connection(qapp, conn: FakeConnection) -> No
     start_session(app.lifecycle)
     app.worker.session_lost.emit("dev", "Connection reset by peer")
     app.lifecycle.reconnect()
-    app.drain()
     assert attempts == ["dev", "dev"]
     assert app.lifecycle.is_connected
 
@@ -267,13 +267,12 @@ GONE = FakeProgrammingError("Session no longer exists.", errno=390111)
 
 @pytest.fixture
 def lanes(qapp) -> tuple[App, FakeConnection]:
-    """An app whose export and transfer lanes run inline, with one stage."""
+    """An app with one stage."""
     conn = FakeConnection()
     conn.stage = FakeStages(
         stages=[{"name": "LANDING", "database_name": "RAW", "schema_name": "PUBLIC"}]
     )
     app = App(lambda _p: conn, ScriptedPrompter())
-    inline(app.worker)
     start_session(app.lifecycle)
     return app, conn
 
@@ -289,7 +288,6 @@ def test_a_transfer_that_loses_the_session_loses_it_for_the_app(lanes, tmp_path)
     app.worker.transfer_finished.connect(finished.append)
 
     app.worker.start_transfer(plan)
-    app.drain()
 
     assert finished[0].error  # the transfer still reports itself interrupted
     assert app.phase is Phase.LOST
@@ -307,7 +305,6 @@ def test_planning_that_loses_the_session_loses_it_for_the_app(lanes, tmp_path) -
     local = tmp_path / "a.csv"
     local.write_text("a")  # something to upload, so planning lists the stage
     app.worker.plan_upload("t1", LANDING, "", [str(local)])
-    app.drain()
     assert app.phase is Phase.LOST
 
 
@@ -321,7 +318,6 @@ def test_an_export_that_loses_the_session_loses_it_for_the_app(lanes, tmp_path) 
     conn.plan["result_scan"] = FakeStatement(error=GONE)
 
     app.worker.export_csv(ready[0], str(tmp_path / "out.csv"), page_size=100)
-    app.drain()
     assert app.phase is Phase.LOST
 
 
@@ -331,7 +327,6 @@ def test_an_export_that_loses_the_session_loses_it_for_the_app(lanes, tmp_path) 
 def test_ending_without_a_transaction_does_not_ask(app: App) -> None:
     start_session(app.lifecycle)
     assert app.lifecycle.end()
-    app.drain()
     assert app.prompter.settle_questions == []
     assert app.phase is Phase.DISCONNECTED
     assert not app.worker.session.is_connected
@@ -343,13 +338,11 @@ def test_ending_mid_transaction_asks_and_can_be_called_off(app: App, conn: FakeC
 
     app.prompter.settle = None
     assert not app.lifecycle.end()
-    app.drain()
     assert app.lifecycle.is_connected
     assert conn.transaction_id is not None
 
     app.prompter.settle = False
     app.lifecycle.end()
-    app.drain()
     assert conn.executed[-1] == "ROLLBACK"
     assert app.phase is Phase.DISCONNECTED
     assert len(app.prompter.settle_questions) == 2
@@ -364,7 +357,6 @@ def test_a_failed_commit_leaves_the_session_open(app: App, conn: FakeConnection)
     )
     app.prompter.settle = True
     app.lifecycle.end()
-    app.drain()
     assert app.lifecycle.is_connected
     assert conn.transaction_id is not None
     assert not app.lifecycle.settling
@@ -382,7 +374,6 @@ def test_reconnecting_mid_transaction_settles_first(qapp, conn: FakeConnection) 
     start_session(app.lifecycle)
     app.run("begin")
     app.lifecycle.reconnect()
-    app.drain()
     assert "COMMIT" in conn.executed
     assert attempts == ["dev", "dev"]
     assert app.lifecycle.is_connected
@@ -401,9 +392,9 @@ def test_settle_acts_only_once_the_commit_has_gone_through(app: App) -> None:
     app.run("begin")
     app.prompter.settle = True
     done: list[bool] = []
-    assert not app.lifecycle.settle("Switching", then=lambda: done.append(True))
-    assert app.lifecycle.settling and done == []
-    app.drain()
+    with app.held():
+        assert not app.lifecycle.settle("Switching", then=lambda: done.append(True))
+        assert app.lifecycle.settling and done == []
     assert done == [True]
     assert not app.lifecycle.settling
 

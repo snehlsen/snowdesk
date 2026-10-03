@@ -1,8 +1,8 @@
-"""The worker thread: job queue, Snowflake calls, Qt signals (spec 6.2).
+"""The worker: jobs, Snowflake calls, Qt signals (spec 6.2).
 
-All Snowflake I/O happens here, on one dedicated thread that owns the
-connection.  Cancellation is the single exception: it runs on a small
-side-thread so it does not queue behind the statement it is cancelling.
+All Snowflake I/O happens here.  Which thread runs it is the worker's
+lanes' business (db/lanes.py): the session lane owns the connection, and
+exports, transfers and cancels each run in a lane of their own.
 
 Signals always carry plain Python data — never live cursors.
 """
@@ -10,11 +10,9 @@ Signals always carry plain Python data — never live cursors.
 from __future__ import annotations
 
 import logging
-import queue
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -31,6 +29,7 @@ from snowdesk.db.errors import (
     needs_private_key_passphrase,
     to_query_error,
 )
+from snowdesk.db.lanes import Lanes
 from snowdesk.db.results import ResultRegistry, summarize_status
 from snowdesk.db.runner import Cancelled, StatementRunner
 from snowdesk.db.session import ConnectParams, SnowflakeSession
@@ -132,11 +131,6 @@ class SetAutocommitJob:
     enabled: bool
 
 
-@dataclass(slots=True)
-class ShutdownJob:
-    pass
-
-
 Job = (
     ConnectJob
     | DisconnectJob
@@ -149,7 +143,6 @@ Job = (
     | ListStageJob
     | EndTransactionJob
     | SetAutocommitJob
-    | ShutdownJob
 )
 
 
@@ -159,7 +152,7 @@ Job = (
 
 
 class SnowflakeWorker(QObject):
-    """Runs the job loop on its own thread. Public methods are thread-safe."""
+    """Runs Snowflake work in its lanes. Public methods are thread-safe."""
 
     # What happened to the session.  What it means for the Session lifecycle
     # is decided on the UI thread (controllers/session_lifecycle.py).
@@ -215,33 +208,26 @@ class SnowflakeWorker(QObject):
 
     worker_error = Signal(str)
 
-    def __init__(self, session: SnowflakeSession | None = None) -> None:
+    def __init__(self, session: SnowflakeSession | None = None, lanes: Lanes | None = None) -> None:
         super().__init__()
         self.session = session or SnowflakeSession()
         self.results = ResultRegistry()
-        self._queue: queue.Queue[Job] = queue.Queue()
+        # Exports and stage transfers run off the session lane: a million
+        # rows, or a PUT, takes minutes, and blocking every other job behind
+        # it would freeze the browser and any further queries.  Each uses its
+        # own cursor, as the cancel lane already does (spec 6.2,
+        # docs/stage-browser.md §7.2).
+        self._lanes = lanes or Lanes.threaded()
         self._runner: StatementRunner | None = None
         self._runner_lock = threading.Lock()
-        self._cancel_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="snowdesk-cancel")
-        # Exports run off the job queue: a million rows takes minutes, and
-        # blocking every other job behind it would freeze the browser and
-        # any further queries.  Its own cursor, as the cancel path already
-        # does (spec 6.2).
-        self._export_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="snowdesk-export")
         self._export_stop = threading.Event()
-        # Stage transfers likewise: a PUT holds its thread for as long as the
-        # upload takes (docs/stage-browser.md §7.2).  One thread, so plans
-        # and transfers run in the order they were asked for.
-        self._transfer_pool = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="snowdesk-transfer"
-        )
         self._transfer_stop = threading.Event()
         self._transaction = TransactionState()
 
     # -- public API (called from the UI thread) ---------------------------
 
     def submit(self, job: Job) -> None:
-        self._queue.put(job)
+        self._lanes.session.submit(lambda: self._dispatch(job))
 
     def cancel_running(self) -> None:
         """Cancel the running statement server-side (Q4).
@@ -254,7 +240,7 @@ class SnowflakeWorker(QObject):
         if runner is None:
             return
         runner.request_stop()
-        self._cancel_pool.submit(self._do_cancel, runner)
+        self._lanes.cancel.submit(lambda: self._do_cancel(runner))
 
     def _do_cancel(self, runner: StatementRunner) -> None:
         try:
@@ -267,7 +253,7 @@ class SnowflakeWorker(QObject):
     def export_csv(
         self, result_id: str, path: str, page_size: int, escape_formulas: bool = True
     ) -> None:
-        """Stream a finished result to a CSV file, off the job queue."""
+        """Stream a finished result to a CSV file, in the export lane."""
         handle = self.results.get(result_id)
         if handle is None or not handle.query_id:
             self.export_failed.emit(
@@ -278,8 +264,9 @@ class SnowflakeWorker(QObject):
             self.export_failed.emit(result_id, "Not connected.")
             return
         self._export_stop.clear()
-        self._export_pool.submit(
-            self._do_export, result_id, handle.query_id, path, page_size, escape_formulas
+        query_id = handle.query_id
+        self._lanes.export.submit(
+            lambda: self._do_export(result_id, query_id, path, page_size, escape_formulas)
         )
 
     def cancel_export(self) -> None:
@@ -309,7 +296,7 @@ class SnowflakeWorker(QObject):
         except Exception as exc:
             log.warning("Export of %s failed", result_id, exc_info=True)
             csv_export.discard(path)
-            self._report_lost_off_queue(exc)
+            self._report_lost_off_session_lane(exc)
             self.export_failed.emit(result_id, to_query_error(exc).message)
         else:
             self.export_finished.emit(result_id, path, rows)
@@ -329,7 +316,7 @@ class SnowflakeWorker(QObject):
         if not self.session.is_connected:
             self.transfer_plan_failed.emit(transfer_id, "Not connected.")
             return
-        self._transfer_pool.submit(self._do_plan, transfer_id, planner, *args)
+        self._lanes.transfer.submit(lambda: self._do_plan(transfer_id, planner, *args))
 
     def _do_plan(self, transfer_id: str, planner: Any, *args: Any) -> None:
         try:
@@ -338,7 +325,7 @@ class SnowflakeWorker(QObject):
             self.transfer_plan_failed.emit(transfer_id, str(exc))
         except Exception as exc:
             log.warning("Planning transfer %s failed", transfer_id, exc_info=True)
-            self._report_lost_off_queue(exc)
+            self._report_lost_off_session_lane(exc)
             self.transfer_plan_failed.emit(transfer_id, to_query_error(exc).formatted())
         else:
             self.transfer_planned.emit(plan)
@@ -349,7 +336,7 @@ class SnowflakeWorker(QObject):
             self.transfer_plan_failed.emit(plan.transfer_id, "Not connected.")
             return
         self._transfer_stop.clear()
-        self._transfer_pool.submit(self._do_transfer, plan)
+        self._lanes.transfer.submit(lambda: self._do_transfer(plan))
 
     def stop_transfer(self) -> None:
         self._transfer_stop.set()
@@ -381,32 +368,26 @@ class SnowflakeWorker(QObject):
     def shutdown(self) -> None:
         self._export_stop.set()
         self._transfer_stop.set()
-        self._queue.put(ShutdownJob())
+        self._lanes.session.stop()
 
-    # -- job loop (runs on the worker thread) -----------------------------
+    # -- session lane (runs on the worker thread) -------------------------
 
     def run_loop(self) -> None:
         log.info("Worker thread started")
-        while True:
-            job = self._queue.get()
-            if isinstance(job, ShutdownJob):
-                break
-            try:
-                self._dispatch(job)
-            except Exception as exc:
-                log.exception("Unhandled error in worker job %s", type(job).__name__)
-                self.worker_error.emit(f"{type(exc).__name__}: {exc}")
-            finally:
-                self._queue.task_done()
+        self._lanes.session.run(on_error=self._job_crashed)
         self._teardown()
         log.info("Worker thread stopped")
+
+    def _job_crashed(self, exc: Exception) -> None:
+        log.error("Unhandled error in worker job", exc_info=exc)
+        self.worker_error.emit(f"{type(exc).__name__}: {exc}")
 
     def _teardown(self) -> None:
         self.results.close_all()
         self.session.close()
-        self._cancel_pool.shutdown(wait=False)
-        self._export_pool.shutdown(wait=False)
-        self._transfer_pool.shutdown(wait=False)
+        self._lanes.cancel.stop()
+        self._lanes.export.stop()
+        self._lanes.transfer.stop()
 
     def _dispatch(self, job: Job) -> None:
         if isinstance(job, ConnectJob):
@@ -472,10 +453,10 @@ class SnowflakeWorker(QObject):
         self.session_lost.emit(name, message)
         return True
 
-    def _report_lost_off_queue(self, exc: BaseException) -> None:
-        """:meth:`_note_failure` for the export and transfer threads.
+    def _report_lost_off_session_lane(self, exc: BaseException) -> None:
+        """:meth:`_note_failure` for the export and transfer lanes.
 
-        Only reports: the session belongs to the job queue's thread, so the
+        Only reports: the session belongs to the session lane, so the
         Session lifecycle queues the closing there.
         """
         if is_session_lost(exc):

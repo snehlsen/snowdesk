@@ -8,6 +8,7 @@ from PySide6.QtGui import QGuiApplication
 from snowdesk.controllers.browser import BrowserController
 from snowdesk.controllers.session_lifecycle import SessionLifecycle
 from snowdesk.db import browser as browse
+from snowdesk.db.lanes import Lanes
 from snowdesk.db.worker import SnowflakeWorker
 from snowdesk.model import ObjectNode
 from snowdesk.ui.object_tree import KIND_ROLE, ObjectTree
@@ -37,8 +38,13 @@ COLUMNS = [
 
 
 @pytest.fixture
-def tree(qtbot):
-    worker = SnowflakeWorker()
+def lanes() -> Lanes:
+    return Lanes.synchronous()
+
+
+@pytest.fixture
+def tree(qtbot, lanes):
+    worker = SnowflakeWorker(lanes=lanes)
     controller = BrowserController(worker, SessionLifecycle(worker))
     widget = ObjectTree(controller)
     qtbot.addWidget(widget)
@@ -169,11 +175,12 @@ def test_double_click_on_a_column_inserts_only_its_name(tree: ObjectTree, qtbot)
     assert blocker.args == ['"order date"']
 
 
-def test_refresh_reloads_that_node(tree: ObjectTree) -> None:
+def test_refresh_reloads_that_node(tree: ObjectTree, lanes) -> None:
     item = item_for(tree, ("RAW", "PUBLIC"))
-    tree.refresh(item)
-    assert tree.controller.cached(("RAW", "PUBLIC")) is None  # invalidated
-    assert tree.controller.is_pending(("RAW", "PUBLIC"))
+    with lanes.session.held():
+        tree.refresh(item)
+        assert tree.controller.cached(("RAW", "PUBLIC")) is None  # invalidated
+        assert tree.controller.is_pending(("RAW", "PUBLIC"))
 
 
 def test_filter_hides_non_matching_nodes(tree: ObjectTree) -> None:

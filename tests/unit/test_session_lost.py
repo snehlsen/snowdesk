@@ -5,11 +5,12 @@ from __future__ import annotations
 import pytest
 
 from snowdesk.db.errors import is_session_lost
+from snowdesk.db.lanes import Lanes
 from snowdesk.db.session import ConnectParams, SnowflakeSession
 from snowdesk.db.splitter import split_sql
 from snowdesk.db.worker import ConnectJob, RunScriptJob, SnowflakeWorker
 from snowdesk.model import RunStatus
-from tests.fakes import FakeConnection, FakeProgrammingError, FakeStatement, drain
+from tests.fakes import FakeConnection, FakeProgrammingError, FakeStatement
 
 
 class OperationalError(Exception):
@@ -73,8 +74,10 @@ def test_a_cancel_is_never_a_lost_session() -> None:
 
 def _connected(qapp, plan=None):
     conn = FakeConnection(plan or {})
-    worker = SnowflakeWorker(session=SnowflakeSession(connect_fn=lambda _p: conn))
-    drain(worker, ConnectJob(params=ConnectParams(name="dev")))
+    worker = SnowflakeWorker(
+        session=SnowflakeSession(connect_fn=lambda _p: conn), lanes=Lanes.synchronous()
+    )
+    worker.submit(ConnectJob(params=ConnectParams(name="dev")))
     return worker, conn
 
 
@@ -83,7 +86,7 @@ def test_a_lost_session_is_reported_and_closed(qapp) -> None:
     worker, _conn = _connected(qapp, {"select": FakeStatement(error=dead)})
     lost = collect(worker.session_lost)
 
-    drain(worker, RunScriptJob(statements=split_sql("select 1")))
+    worker.submit(RunScriptJob(statements=split_sql("select 1")))
 
     assert lost == [("dev", "Connection aborted")]
     # Closed on the worker thread, so the rest of the job fails fast.
@@ -94,7 +97,7 @@ def test_the_failing_statement_still_reports_its_error(qapp) -> None:
     dead = OperationalError("Connection aborted")
     worker, _conn = _connected(qapp, {"select": FakeStatement(error=dead)})
     outcomes = collect(worker.statement_finished)
-    drain(worker, RunScriptJob(statements=split_sql("select 1")))
+    worker.submit(RunScriptJob(statements=split_sql("select 1")))
     assert outcomes[0].status is RunStatus.ERROR
     assert "Connection aborted" in outcomes[0].message
 
@@ -104,7 +107,7 @@ def test_an_ordinary_sql_error_keeps_the_connection(qapp) -> None:
     worker, _conn = _connected(qapp, {"boom": FakeStatement(error=boom)})
     lost = collect(worker.session_lost)
 
-    drain(worker, RunScriptJob(statements=split_sql("select boom")))
+    worker.submit(RunScriptJob(statements=split_sql("select boom")))
 
     assert lost == []
     assert worker.session.is_connected
@@ -117,9 +120,9 @@ def test_a_lost_session_drops_live_results(qapp) -> None:
     worker, conn = _connected(
         qapp, {"good": FakeStatement(columns=cols, rows=[(i,) for i in range(10)])}
     )
-    drain(worker, RunScriptJob(statements=split_sql("select good"), page_size=5))
+    worker.submit(RunScriptJob(statements=split_sql("select good"), page_size=5))
     assert len(worker.results) == 1
 
     conn.plan["good"] = FakeStatement(error=dead)
-    drain(worker, RunScriptJob(statements=split_sql("select good")))
+    worker.submit(RunScriptJob(statements=split_sql("select good")))
     assert len(worker.results) == 0

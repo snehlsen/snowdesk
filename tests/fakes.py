@@ -8,7 +8,6 @@ import gzip
 import hashlib
 import mimetypes
 import os
-import queue
 import re
 import threading
 from dataclasses import dataclass, field
@@ -18,7 +17,6 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from snowdesk.controllers.session_lifecycle import SessionLifecycle
-    from snowdesk.db.worker import Job, SnowflakeWorker
 
 
 class FakeProgrammingError(Exception):
@@ -472,46 +470,6 @@ class FakeStages:
         return [_col("name"), _col("result")], [(n, "removed") for n in removed]
 
 
-# -- running the worker synchronously ----------------------------------------
-
-
-class Immediately:
-    """Stands in for a worker thread pool: runs each job as it is submitted."""
-
-    def submit(self, fn: Any, *args: Any) -> None:
-        fn(*args)
-
-    def shutdown(self, wait: bool = True) -> None:
-        pass
-
-
-def inline(worker: SnowflakeWorker) -> SnowflakeWorker:
-    """Run the worker's export and transfer lanes on the calling thread.
-
-    The cancel lane is left alone: a cancel has to arrive while a statement
-    is still running, which only a real second thread can do.
-    """
-    worker._export_pool = Immediately()  # type: ignore[assignment]
-    worker._transfer_pool = Immediately()  # type: ignore[assignment]
-    return worker
-
-
-def drain(worker: SnowflakeWorker, *jobs: Job) -> None:
-    """Submit ``jobs``, then run everything queued on the calling thread, in order.
-
-    The one supported way for tests to run the worker's job queue: signals
-    then reach their slots directly, so a test can assert right after.
-    """
-    for job in jobs:
-        worker.submit(job)
-    while True:
-        try:
-            job = worker._queue.get_nowait()
-        except queue.Empty:
-            return
-        worker._dispatch(job)
-
-
 # -- the Session lifecycle ----------------------------------------------------
 
 
@@ -536,6 +494,5 @@ class ScriptedPrompter:
 
 
 def start_session(lifecycle: SessionLifecycle, connection: str = "dev") -> None:
-    """Connect through the Session lifecycle and run the worker until it answers."""
+    """Connect through the Session lifecycle."""
     lifecycle.start(connection)
-    drain(lifecycle.worker)

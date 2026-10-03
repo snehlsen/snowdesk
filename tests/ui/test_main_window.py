@@ -12,6 +12,7 @@ from PySide6.QtWidgets import QLabel
 from snowdesk.controllers.browser import BrowserController
 from snowdesk.controllers.query import QueryController
 from snowdesk.controllers.session_lifecycle import SessionLifecycle
+from snowdesk.db.lanes import Lanes
 from snowdesk.db.session import SnowflakeSession
 from snowdesk.db.worker import SnowflakeWorker
 from snowdesk.storage.history import HistoryStore
@@ -26,8 +27,6 @@ from tests.fakes import (
     FakeProgrammingError,
     FakeStatement,
     ScriptedPrompter,
-    drain,
-    inline,
     start_session,
 )
 
@@ -35,15 +34,19 @@ COLS = [("N", 0, None, None, 38, 0, False)]
 
 
 class Harness:
-    """Runs the worker's jobs synchronously so tests stay deterministic."""
+    """A window over a worker whose lanes run synchronously, so tests stay deterministic."""
 
-    def __init__(self, window: MainWindow, worker: SnowflakeWorker, conn: FakeConnection) -> None:
+    def __init__(
+        self, window: MainWindow, worker: SnowflakeWorker, lanes: Lanes, conn: FakeConnection
+    ) -> None:
         self.window = window
         self.worker = worker
+        self.lanes = lanes
         self.conn = conn
 
-    def drain(self) -> None:
-        drain(self.worker)
+    def held(self):
+        """Keep the jobs submitted in the block waiting, as if still running."""
+        return self.lanes.session.held()
 
 
 @pytest.fixture
@@ -63,7 +66,8 @@ def harness(qtbot, tmp_path, monkeypatch):
             "wait": FakeStatement(columns=COLS, rows=[(1,)], polls=1000),
         }
     )
-    worker = inline(SnowflakeWorker(session=SnowflakeSession(connect_fn=lambda _p: conn)))
+    lanes = Lanes.synchronous()
+    worker = SnowflakeWorker(session=SnowflakeSession(connect_fn=lambda _p: conn), lanes=lanes)
     # pytest-qt closes the window before fixtures are torn down, so a
     # transaction a test left open would put up the real Commit / Roll Back
     # prompt and hang.  Tests that care about the answer use `ask`.
@@ -78,7 +82,7 @@ def harness(qtbot, tmp_path, monkeypatch):
         workspace=WorkspaceStore(tmp_path / "workspace.json"),
     )
     qtbot.addWidget(window)
-    yield Harness(window, worker, conn)
+    yield Harness(window, worker, lanes, conn)
     history.close()
 
 
@@ -103,7 +107,6 @@ def test_running_a_query_shows_rows(harness: Harness) -> None:
     window = harness.window
     window.editor.setPlainText("select * from orders")
     window.run_all()
-    harness.drain()
 
     view = window.result_tabs.currentWidget()
     assert isinstance(view, ResultView)
@@ -117,11 +120,9 @@ def test_scrolling_loads_more_rows(harness: Harness) -> None:
     window = harness.window
     window.editor.setPlainText("select * from orders")
     window.run_all()
-    harness.drain()
 
     view = window.result_tabs.currentWidget()
     view.model.fetchMore()
-    harness.drain()
     assert view.model.rowCount() == 900
     assert view.model.exhausted
 
@@ -131,7 +132,6 @@ def test_failing_statement_stops_the_run_and_is_underlined(harness: Harness) -> 
     window = harness.window
     window.editor.setPlainText("select 1;\nselect boom;\nselect 3;")
     window.run_all()
-    harness.drain()
 
     messages = window.messages.toPlainText()
     assert "ERROR" in messages
@@ -148,7 +148,6 @@ def test_cancel_reports_cancelled_without_an_error(harness: Harness) -> None:
     harness.worker.statement_started.connect(lambda *_: harness.worker.cancel_running())
     window.editor.setPlainText("select system$wait(60) as wait")
     window.run_all()
-    harness.drain()
 
     assert "Cancelled" in window.messages.toPlainText()
     assert "ERROR" not in window.messages.toPlainText()
@@ -165,7 +164,6 @@ def test_run_statement_under_cursor_runs_only_that_statement(harness: Harness) -
     window.editor.setTextCursor(cursor)
 
     window.run_current()
-    harness.drain()
     assert harness.conn.executed[-1] == "select * from orders"
 
 
@@ -174,7 +172,6 @@ def test_history_records_each_executed_statement(harness: Harness) -> None:
     window = harness.window
     window.editor.setPlainText("select 1;\nselect * from orders;")
     window.run_all()
-    harness.drain()
 
     entries = harness.window.history.recent()
     assert [e.sql for e in entries] == ["select * from orders", "select 1"]
@@ -187,11 +184,9 @@ def test_closing_a_result_tab_releases_the_cursor(harness: Harness) -> None:
     window = harness.window
     window.editor.setPlainText("select * from orders")
     window.run_all()
-    harness.drain()
 
     index = window.result_tabs.currentIndex()
     window._close_result_tab(index)
-    harness.drain()
     assert window._results == {}
     assert len(harness.worker.results) == 0
 
@@ -231,7 +226,8 @@ def key_harness(qtbot, tmp_path, monkeypatch):
             raise ValueError("Incorrect password, could not decrypt key")
         return conn
 
-    worker = SnowflakeWorker(session=SnowflakeSession(connect_fn=connect_fn))
+    lanes = Lanes.synchronous()
+    worker = SnowflakeWorker(session=SnowflakeSession(connect_fn=connect_fn), lanes=lanes)
     # No prompter of its own: the window brings the dialogs.
     lifecycle = SessionLifecycle(worker)
     history = HistoryStore(tmp_path / "history.db")
@@ -244,7 +240,7 @@ def key_harness(qtbot, tmp_path, monkeypatch):
         workspace=WorkspaceStore(tmp_path / "workspace.json"),
     )
     qtbot.addWidget(window)
-    yield Harness(window, worker, conn)
+    yield Harness(window, worker, lanes, conn)
     history.close()
 
 
@@ -265,7 +261,6 @@ def test_encrypted_key_prompts_and_then_connects(key_harness, monkeypatch) -> No
     """The window answers the Session lifecycle's passphrase question with a dialog."""
     labels = answer_prompt(monkeypatch, ("right", True))
     key_harness.window._on_connect_clicked()
-    key_harness.drain()
 
     assert key_harness.window.lifecycle.is_connected
     assert "Connected" in key_harness.window.state_label.text()
@@ -276,7 +271,6 @@ def test_encrypted_key_prompts_and_then_connects(key_harness, monkeypatch) -> No
 def test_the_passphrase_never_reaches_the_messages_pane(key_harness, monkeypatch) -> None:
     answer_prompt(monkeypatch, ("hunter2", True), ("right", True))
     key_harness.window._on_connect_clicked()
-    key_harness.drain()
     assert "hunter2" not in key_harness.window.messages.toPlainText()
 
 
@@ -323,7 +317,6 @@ def test_the_window_runs_the_focused_tab(harness: Harness) -> None:
     window.editor.setPlainText("select * from orders")
 
     window.run_all()
-    harness.drain()
     assert harness.conn.executed[-1] == "select * from orders"
 
 
@@ -428,7 +421,6 @@ def test_run_current_at_end_of_line_runs_that_line(harness: Harness) -> None:
     window.editor.setTextCursor(cursor)
 
     window.run_current()
-    harness.drain()
     assert harness.conn.executed[-1] == "select 1"
 
 
@@ -443,7 +435,6 @@ def test_run_current_on_the_second_line_runs_the_second_statement(harness: Harne
     window.editor.setTextCursor(cursor)
 
     window.run_current()
-    harness.drain()
     assert harness.conn.executed[-1] == "select * from orders"
 
 
@@ -459,7 +450,6 @@ def test_run_current_still_prefers_a_selection(harness: Harness) -> None:
     window.editor.setTextCursor(cursor)
 
     window.run_current()
-    harness.drain()
     assert harness.conn.executed[-1] == "select * from orders"
 
 
@@ -489,7 +479,6 @@ def test_preview_runs_in_a_result_tab(harness: Harness) -> None:
     window.editor.setPlainText("-- my work in progress")
 
     window.object_tree._preview(("RAW", "PUBLIC", "ORDERS"))
-    harness.drain()
 
     assert harness.conn.executed[-1] == "SELECT * FROM RAW.PUBLIC.ORDERS LIMIT 100"
     view = window.result_tabs.currentWidget()
@@ -505,7 +494,6 @@ def test_show_ddl_runs_in_a_result_tab(harness: Harness) -> None:
     from snowdesk.db import browser as browse
 
     harness.window.object_tree._show_ddl(("RAW", "PUBLIC", "ORDERS"), browse.TABLE)
-    harness.drain()
     assert harness.conn.executed[-1] == "SELECT GET_DDL('TABLE', 'RAW.PUBLIC.ORDERS')"
 
 
@@ -550,7 +538,6 @@ def test_losing_the_session_shows_a_reconnect_banner(harness: Harness) -> None:
 
     harness.conn.plan["select"] = FakeStatement(error=_Dropped("Connection reset by peer"))
     window.run_all()
-    harness.drain()
 
     assert window.banner_bar.isVisibleTo(window)
     assert "lost" in window.banner_label.text().lower()
@@ -568,12 +555,10 @@ def test_the_banner_reconnects_in_one_click(harness: Harness) -> None:
     harness.conn.plan["select"] = FakeStatement(error=_Dropped("Connection aborted"))
     window.editor.setPlainText("select 1")
     window.run_all()
-    harness.drain()
     assert not window.lifecycle.is_connected
 
     del harness.conn.plan["select"]
     window.reconnect_button.click()
-    harness.drain()
 
     assert window.lifecycle.is_connected
     assert not window.banner_bar.isVisibleTo(window)
@@ -619,7 +604,6 @@ def test_clearing_history_is_confirmed_and_can_be_refused(harness: Harness, monk
     window = harness.window
     window.editor.setPlainText("select 1")
     window.run_all()
-    harness.drain()
     assert window.history.recent()
 
     monkeypatch.setattr(window, "confirm_clear_history", lambda: False)
@@ -766,7 +750,6 @@ def test_status_dividers_hide_with_their_segment(harness: Harness) -> None:
         connect(harness)
         window.editor.setPlainText("select * from orders")
         window.run_all()
-        harness.drain()
         assert window._status_dividers[window.rows_label].isVisible()
 
         window._clear_result_tabs()
@@ -789,7 +772,6 @@ def test_export_streams_the_whole_result_by_query_id(
     harness.conn.plan["from orders"] = FakeStatement(columns=COLS, rows=[(i,) for i in range(900)])
     window.editor.setPlainText("select * from orders")
     window.run_all()
-    harness.drain()
     assert window.result_tabs.currentWidget().model.rowCount() == 500  # grid holds a page
 
     target = tmp_path / "out.csv"
@@ -814,7 +796,6 @@ def test_exported_rows_are_safe_to_open_in_a_spreadsheet(
     harness.conn.plan["RESULT_SCAN"] = hostile
     window.editor.setPlainText("select * from orders")
     window.run_all()
-    harness.drain()
 
     target = tmp_path / "out.csv"
     monkeypatch.setattr(window, "ask_export_path", lambda: str(target))
@@ -830,7 +811,6 @@ def test_turning_formula_escaping_off_reaches_the_grids_already_open(
     window = harness.window
     window.editor.setPlainText("select * from orders")
     window.run_all()
-    harness.drain()
     view = window.result_tabs.currentWidget()
     assert view._escape_formulas is True
 
@@ -880,7 +860,6 @@ def test_the_detail_pane_toggles_across_result_tabs(harness: Harness) -> None:
     window = harness.window
     window.editor.setPlainText("select * from orders")
     window.run_all()
-    harness.drain()
     view = window.result_tabs.currentWidget()
     assert not view.detail_is_visible()
 
@@ -905,7 +884,6 @@ def run_a_query(harness: Harness, sql: str = "select * from orders") -> ResultVi
     connect(harness)
     harness.window.editor.setPlainText(sql)
     harness.window.run_all()
-    harness.drain()
     return harness.window.result_tabs.currentWidget()
 
 
@@ -937,7 +915,6 @@ def test_profile_asks_for_the_statements_own_id_not_the_last_query(harness: Harn
     plan_profile(harness, [(1, 0, "Result"), (1, 1, "TableScan")])
 
     harness.window.profile_current_query()
-    harness.drain()
 
     assert f"GET_QUERY_OPERATOR_STATS('{view.query_id}')" in harness.conn.executed[-1]
     assert "LAST_QUERY_ID" not in " ".join(harness.conn.executed)
@@ -955,7 +932,6 @@ def test_a_profile_tab_does_not_renumber_the_result_tabs(harness: Harness) -> No
     run_a_query(harness)
     plan_profile(harness, [(1, 0, "Result")])
     harness.window.profile_current_query()
-    harness.drain()
 
     tabs = harness.window.result_tabs
     titles = [tabs.tabText(i) for i in range(tabs.count())]
@@ -968,7 +944,6 @@ def test_an_empty_profile_says_why_instead_of_showing_a_blank_grid(harness: Harn
     plan_profile(harness, [])
 
     harness.window.profile_current_query()
-    harness.drain()
 
     messages = harness.window.messages.toPlainText()
     assert "No operator statistics for 01b0-0001" in messages
@@ -983,7 +958,6 @@ def test_a_failed_profile_is_reported_in_messages(harness: Harness) -> None:
     )
 
     harness.window.profile_current_query()
-    harness.drain()
 
     assert "Could not read the profile for 01b0-0001" in harness.window.messages.toPlainText()
 
@@ -997,19 +971,16 @@ def test_a_statement_with_no_grid_is_still_profilable(harness: Harness) -> None:
     )
     harness.window.editor.setPlainText("create table t (a int)")
     harness.window.run_all()
-    harness.drain()
     assert not isinstance(harness.window.result_tabs.currentWidget(), ResultView)
 
     plan_profile(harness, [(1, 0, "DDL")])
     harness.window.profile_current_query()
-    harness.drain()
     assert "GET_QUERY_OPERATOR_STATS('01b0-0001')" in harness.conn.executed[-1]
 
 
 def test_profiling_with_nothing_to_profile_just_says_so(harness: Harness) -> None:
     connect(harness)
     harness.window.profile_current_query()
-    harness.drain()
     assert "No query to profile yet" in harness.window.statusBar().currentMessage()
     assert not any("GET_QUERY_OPERATOR_STATS" in sql for sql in harness.conn.executed)
 
@@ -1019,12 +990,10 @@ def test_history_can_profile_a_query_whose_tab_is_gone(harness: Harness) -> None
     run_a_query(harness)
     harness.window.editor.setPlainText("select 1")
     harness.window.run_all()
-    harness.drain()
 
     entry = next(e for e in harness.window.history_panel._entries if "orders" in e.sql)
     plan_profile(harness, [(1, 0, "Result")])
     harness.window.history_panel.profile_requested.emit(entry.query_id)
-    harness.drain()
 
     assert f"GET_QUERY_OPERATOR_STATS('{entry.query_id}')" in harness.conn.executed[-1]
 
@@ -1049,7 +1018,6 @@ def test_the_profile_shortcut_is_bound_exactly_once(harness: Harness) -> None:
 def open_transaction(harness: Harness) -> None:
     harness.window.editor.setPlainText("begin; insert into t values (1)")
     harness.window.run_all()
-    harness.drain()
 
 
 @pytest.fixture
@@ -1084,11 +1052,11 @@ def test_commit_mode_is_hidden_until_connected(harness: Harness) -> None:
 def test_choosing_manual_commit_switches_the_session(harness: Harness) -> None:
     connect(harness)
     window = harness.window
-    window.manual_commit_action.trigger()
-    # Until the session confirms it, the check mark stays where the mode is.
-    assert window.autocommit_action.isChecked()
+    with harness.held():
+        window.manual_commit_action.trigger()
+        # Until the session confirms it, the check mark stays where the mode is.
+        assert window.autocommit_action.isChecked()
 
-    harness.drain()
     assert harness.conn.autocommit is False
     assert window.commit_button.text() == "Manual commit ▾"
     assert window.manual_commit_action.isChecked()
@@ -1099,7 +1067,6 @@ def test_an_open_transaction_is_shown_and_can_be_committed(harness: Harness) -> 
     window = harness.window
     window.editor.setPlainText("begin")
     window.run_all()
-    harness.drain()
     assert window.commit_button.text() == "Transaction open ▾"
     assert harness.conn.transaction_id in window.commit_button.toolTip()
     assert window.commit_action.isEnabled()
@@ -1107,11 +1074,9 @@ def test_an_open_transaction_is_shown_and_can_be_committed(harness: Harness) -> 
 
     window.editor.setPlainText("select * from orders")
     window.run_all()
-    harness.drain()
     result_tab = window.result_tabs.currentWidget()
 
     window.commit_action.trigger()
-    harness.drain()
     assert harness.conn.executed[-1] == "COMMIT"
     assert window.commit_button.text() == "Auto-commit ▾"
     assert not window.commit_action.isEnabled()
@@ -1126,10 +1091,10 @@ def test_transaction_actions_wait_for_a_running_query(harness: Harness) -> None:
     open_transaction(harness)
     window = harness.window
     window.editor.setPlainText("select 1")
-    window.run_all()  # queued, not drained: still running
-    assert not window.commit_action.isEnabled()
-    assert not window.manual_commit_action.isEnabled()
-    harness.drain()
+    with harness.held():
+        window.run_all()  # still running
+        assert not window.commit_action.isEnabled()
+        assert not window.manual_commit_action.isEnabled()
     assert window.commit_action.isEnabled()
 
 
@@ -1145,7 +1110,6 @@ def test_the_open_transaction_counts_its_minutes(harness: Harness) -> None:
     assert window._transaction_timer.isActive()
 
     window.commit_action.trigger()
-    harness.drain()
     assert not window._transaction_timer.isActive()
 
 
@@ -1157,14 +1121,12 @@ def test_switching_mode_mid_transaction_asks_first(harness: Harness, ask) -> Non
 
     answer(None)
     window.manual_commit_action.trigger()
-    harness.drain()
     assert asked
     assert harness.conn.autocommit is True
     assert harness.conn.transaction_id is not None
 
     answer(True)
     window.manual_commit_action.trigger()
-    harness.drain()
     assert harness.conn.executed[-2:] == ["COMMIT", "ALTER SESSION SET AUTOCOMMIT = FALSE"]
     assert window.commit_button.text() == "Manual commit ▾"
 
@@ -1181,9 +1143,9 @@ def test_quitting_mid_transaction_can_be_called_off(harness: Harness, ask) -> No
     assert window.isVisible()
 
     answer(True)
-    assert not window.close()  # not until the COMMIT has gone through
-    assert window.isVisible()
-    harness.drain()
+    with harness.held():
+        assert not window.close()  # not until the COMMIT has gone through
+        assert window.isVisible()
     assert harness.conn.executed[-1] == "COMMIT"
     assert not window.isVisible()
     assert len(asked) == 2
@@ -1201,7 +1163,6 @@ def test_a_failed_commit_keeps_the_window_open(harness: Harness, ask) -> None:
 
     answer(True)
     window.close()
-    harness.drain()
     assert window.isVisible()
     assert window.lifecycle.is_connected
     assert "left open" in window.messages.toPlainText()
@@ -1214,7 +1175,6 @@ def test_a_lost_session_says_the_transaction_went_with_it(harness: Harness) -> N
     harness.conn.status_error = FakeProgrammingError("Session no longer exists", errno=390104)
     harness.window.editor.setPlainText("select 1")
     harness.window.run_all()
-    harness.drain()
     assert "not committed" in harness.window.banner_label.text()
     assert not harness.window.commit_button.isVisibleTo(harness.window)
 
@@ -1230,7 +1190,6 @@ def test_a_failed_browse_is_logged_in_full(harness: Harness) -> None:
         )
     )
     harness.window.browser.load(("RAW",))
-    harness.drain()
     log = harness.window.messages.toPlainText()
     assert "Could not load RAW: [2003] (SQLSTATE 02000) SQL compilation error:" in log
     assert "Query ID: 01b0-0042" in log

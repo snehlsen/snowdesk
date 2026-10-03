@@ -5,10 +5,11 @@ from __future__ import annotations
 import pytest
 
 from snowdesk.db.errors import is_bad_private_key_passphrase, needs_private_key_passphrase
+from snowdesk.db.lanes import Lanes
 from snowdesk.db.session import ConnectParams, SnowflakeSession
 from snowdesk.db.worker import ConnectJob, SnowflakeWorker
 from snowdesk.model import ConnectFailure
-from tests.fakes import FakeConnection, FakeProgrammingError, drain
+from tests.fakes import FakeConnection, FakeProgrammingError
 
 # The exact exceptions cryptography raises through the connector.
 MISSING = TypeError("Password was not given but private key is encrypted")
@@ -77,7 +78,9 @@ def test_the_worker_says_why_a_connect_failed(qapp, exc: BaseException, kind) ->
     def connect_fn(_params: ConnectParams) -> FakeConnection:
         raise exc
 
-    worker = SnowflakeWorker(session=SnowflakeSession(connect_fn=connect_fn))
+    worker = SnowflakeWorker(
+        session=SnowflakeSession(connect_fn=connect_fn), lanes=Lanes.synchronous()
+    )
     failures = collect(worker.connect_failed)
-    drain(worker, ConnectJob(params=ConnectParams(name="dev")))
+    worker.submit(ConnectJob(params=ConnectParams(name="dev")))
     assert [(name, k) for name, k, _error in failures] == [("dev", kind)]
