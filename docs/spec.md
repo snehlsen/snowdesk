@@ -49,7 +49,7 @@ Priority: **P0** is required for v1, **P1** is expected for v1 but can slip, **P
 | C3 | Support `snowflake` (password), `snowflake_jwt` (key-pair), and `externalbrowser` (SSO) authenticators as configured in the file. | P0 |
 | C4 | Cache SSO tokens in the macOS Keychain so the browser flow is not repeated on every connect. | P0 |
 | C5 | Keep the session alive while the app is open. | P0 |
-| C6 | Show connection state (disconnected, connecting, connected, error) and allow reconnect. | P0 |
+| C6 | Show the Session's state (disconnected, connecting, waiting for a passphrase, connected, lost, failed) and allow reconnect. | P0 |
 | C7 | Allow overriding role and warehouse at connect time from the UI. | P1 |
 | C8 | Create or edit connections from within the app. | P2 |
 
@@ -311,7 +311,7 @@ The status bar's last segment shows `Auto-commit`, `Manual commit`, or `● Tran
 
 Commit and Roll back run as their own worker job rather than as a script, so they do not clear the result tabs the user was checking; they are still logged in Messages and recorded in History. The mode is never changed while a transaction is open: the UI asks to commit or roll back first, and the worker re-checks and refuses if one is still open. The choice lasts for the session only.
 
-Disconnect, Reconnect and quitting ask Commit / Roll Back / Cancel when a transaction is open, and queue the answer ahead of the disconnect or shutdown job. A lost connection cannot ask, so its banner says the transaction was not committed.
+Disconnect, Reconnect and quitting ask Commit / Roll Back / Cancel when a transaction is open, and go ahead only once that COMMIT or ROLLBACK has succeeded. If it fails, the session stays connected with its transaction open and Messages says why, so choosing Commit can never end in a silent rollback. A lost session cannot ask, so its banner says the transaction was not committed.
 
 ### 7.7 Object browser queries
 
@@ -358,7 +358,7 @@ The Messages tab shows per-statement status lines (success, rows affected, error
 | Authentication failure | Error banner with the connector message; connection stays disconnected; Retry button. |
 | SQL compile / runtime error | Messages tab shows code, message, query ID; editor underlines the failing statement; remaining statements are skipped. |
 | Query cancelled | Neutral "Cancelled" status, no dialog. |
-| Session expired / network lost | Mark disconnected, keep editor state, offer Reconnect; in-flight jobs fail cleanly. |
+| Session expired / network lost | Mark the session lost as soon as any job notices, whether a statement, an export or a stage transfer; keep editor state, offer Reconnect; in-flight jobs fail cleanly. |
 | Row cap reached | Inline notice in the grid footer offering Export to CSV for the full result. |
 | Unexpected exception in worker | Logged with traceback to `~/Library/Logs/SnowDesk/`, shown as a generic error, worker stays alive. |
 
@@ -372,12 +372,13 @@ snowdesk/
 │   ├── app.py                 # QApplication setup, theme, logging
 │   ├── config.py              # connection discovery, preferences
 │   ├── db/
-│   │   ├── session.py         # SnowflakeSession: connect, reconnect, context
+│   │   ├── session.py         # SnowflakeSession: connect, close, context
 │   │   ├── runner.py          # StatementRunner: split, async run, cancel
 │   │   ├── results.py         # ResultCursor registry, fetch pages, type info
 │   │   ├── browser.py         # SHOW queries, identifier quoting
 │   │   └── worker.py          # QThread + job queue + signals
 │   ├── controllers/
+│   │   ├── session_lifecycle.py  # Session state, passphrases, reconnect, settle (ADR 0001)
 │   │   ├── query.py
 │   │   └── browser.py
 │   ├── storage/

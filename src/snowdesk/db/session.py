@@ -10,7 +10,6 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field, replace
-from enum import StrEnum
 from typing import Any, Protocol
 
 from snowdesk.db.identifiers import quote_literal
@@ -34,13 +33,6 @@ DISABLE_PLATFORM_DETECTION_VAR = "SNOWFLAKE_DISABLE_PLATFORM_DETECTION"
 def disable_platform_detection() -> None:
     """Opt out of the connector's platform fingerprinting, unless overridden."""
     os.environ.setdefault(DISABLE_PLATFORM_DETECTION_VAR, "true")
-
-
-class ConnectionState(StrEnum):
-    DISCONNECTED = "disconnected"
-    CONNECTING = "connecting"
-    CONNECTED = "connected"
-    ERROR = "error"
 
 
 class Connection(Protocol):
@@ -108,7 +100,6 @@ class SnowflakeSession:
         #: The last size looked up, keyed by the role and warehouse it was
         #: looked up for, so a script that changes neither costs no round trip.
         self._warehouse_size: tuple[str | None, str, str | None] | None = None
-        self.state = ConnectionState.DISCONNECTED
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -129,30 +120,17 @@ class SnowflakeSession:
     def connect(self, params: ConnectParams) -> SessionContext:
         """Open the connection, replacing any existing one."""
         self.close()
-        self.state = ConnectionState.CONNECTING
         started = time.monotonic()
-        try:
-            self._conn = self._connect_fn(params)
-        except BaseException:
-            self.state = ConnectionState.ERROR
-            raise
+        self._conn = self._connect_fn(params)
         elapsed = time.monotonic() - started
         if elapsed > self.BROWSER_PROMPT_SECONDS:
             self._slow_auth_count += 1
         self._params = params
-        self.state = ConnectionState.CONNECTED
         return self.read_context()
-
-    def reconnect(self) -> SessionContext:
-        """Re-open using the last-used parameters (C6)."""
-        if self._params is None:
-            raise RuntimeError("No previous connection to reconnect to")
-        return self.connect(self._params)
 
     def close(self) -> None:
         conn, self._conn = self._conn, None
         self._warehouse_size = None
-        self.state = ConnectionState.DISCONNECTED
         if conn is None:
             return
         try:

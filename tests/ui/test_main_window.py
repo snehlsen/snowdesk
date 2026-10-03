@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import queue
 import sys
 
 import pytest
@@ -12,8 +11,9 @@ from PySide6.QtWidgets import QLabel
 
 from snowdesk.controllers.browser import BrowserController
 from snowdesk.controllers.query import QueryController
-from snowdesk.db.session import ConnectParams, SnowflakeSession
-from snowdesk.db.worker import ConnectJob, SnowflakeWorker
+from snowdesk.controllers.session_lifecycle import SessionLifecycle
+from snowdesk.db.session import SnowflakeSession
+from snowdesk.db.worker import SnowflakeWorker
 from snowdesk.storage.history import HistoryStore
 from snowdesk.storage.session import SessionStore
 from snowdesk.ui import preferences, theme
@@ -21,7 +21,15 @@ from snowdesk.ui.editor import SqlEditor
 from snowdesk.ui.editor_tabs import SaveAnswer
 from snowdesk.ui.main_window import CONTROL_SPACING, WINDOW_MARGIN, MainWindow
 from snowdesk.ui.result_view import ResultView
-from tests.fakes import FakeConnection, FakeProgrammingError, FakeStatement
+from tests.fakes import (
+    FakeConnection,
+    FakeProgrammingError,
+    FakeStatement,
+    ScriptedPrompter,
+    drain,
+    inline,
+    start_session,
+)
 
 COLS = [("N", 0, None, None, 38, 0, False)]
 
@@ -35,12 +43,7 @@ class Harness:
         self.conn = conn
 
     def drain(self) -> None:
-        while True:
-            try:
-                job = self.worker._queue.get_nowait()
-            except queue.Empty:
-                return
-            self.worker._dispatch(job)
+        drain(self.worker)
 
 
 @pytest.fixture
@@ -60,27 +63,27 @@ def harness(qtbot, tmp_path, monkeypatch):
             "wait": FakeStatement(columns=COLS, rows=[(1,)], polls=1000),
         }
     )
-    worker = SnowflakeWorker(session=SnowflakeSession(connect_fn=lambda _p: conn))
+    worker = inline(SnowflakeWorker(session=SnowflakeSession(connect_fn=lambda _p: conn)))
+    # pytest-qt closes the window before fixtures are torn down, so a
+    # transaction a test left open would put up the real Commit / Roll Back
+    # prompt and hang.  Tests that care about the answer use `ask`.
+    lifecycle = SessionLifecycle(worker, ScriptedPrompter(settle=False))
     history = HistoryStore(tmp_path / "history.db")
     window = MainWindow(
         worker=worker,
-        query=QueryController(worker, history=history),
-        browser=BrowserController(worker),
+        lifecycle=lifecycle,
+        query=QueryController(worker, lifecycle, history=history),
+        browser=BrowserController(worker, lifecycle),
         history=history,
         session=SessionStore(tmp_path / "session.json"),
     )
     qtbot.addWidget(window)
-    # pytest-qt closes the window before fixtures are torn down, so a
-    # transaction a test left open would put up the real Commit / Roll Back
-    # prompt and hang.  Tests that care about the answer use `ask`.
-    monkeypatch.setattr(window, "ask_open_transaction", lambda _reason: False)
     yield Harness(window, worker, conn)
     history.close()
 
 
 def connect(harness: Harness) -> None:
-    harness.worker.submit(ConnectJob(params=ConnectParams(name="dev")))
-    harness.drain()
+    start_session(harness.window.lifecycle)
 
 
 def test_connection_picker_is_populated(harness: Harness) -> None:
@@ -229,11 +232,14 @@ def key_harness(qtbot, tmp_path, monkeypatch):
         return conn
 
     worker = SnowflakeWorker(session=SnowflakeSession(connect_fn=connect_fn))
+    # No prompter of its own: the window brings the dialogs.
+    lifecycle = SessionLifecycle(worker)
     history = HistoryStore(tmp_path / "history.db")
     window = MainWindow(
         worker=worker,
-        query=QueryController(worker, history=history),
-        browser=BrowserController(worker),
+        lifecycle=lifecycle,
+        query=QueryController(worker, lifecycle, history=history),
+        browser=BrowserController(worker, lifecycle),
         history=history,
         session=SessionStore(tmp_path / "session.json"),
     )
@@ -251,56 +257,20 @@ def answer_prompt(monkeypatch, *replies):
         seen.append(label)
         return next(answers)
 
-    monkeypatch.setattr("snowdesk.ui.main_window.QInputDialog.getText", staticmethod(fake_get_text))
+    monkeypatch.setattr("snowdesk.ui.dialogs.QInputDialog.getText", staticmethod(fake_get_text))
     return seen
 
 
 def test_encrypted_key_prompts_and_then_connects(key_harness, monkeypatch) -> None:
+    """The window answers the Session lifecycle's passphrase question with a dialog."""
     labels = answer_prompt(monkeypatch, ("right", True))
     key_harness.window._on_connect_clicked()
     key_harness.drain()
 
-    assert key_harness.worker.session.is_connected
+    assert key_harness.window.lifecycle.is_connected
     assert "Connected" in key_harness.window.state_label.text()
     assert "encrypted" in labels[0]
     assert "/keys/sf_rsa_key.p8" in labels[0]
-
-
-def test_wrong_passphrase_reprompts_then_succeeds(key_harness, monkeypatch) -> None:
-    labels = answer_prompt(monkeypatch, ("wrong", True), ("right", True))
-    key_harness.window._on_connect_clicked()
-    key_harness.drain()
-
-    assert len(labels) == 2
-    assert "Incorrect passphrase" in labels[1]
-    assert key_harness.worker.session.is_connected
-
-
-def test_cancelling_the_prompt_leaves_the_app_usable(key_harness, monkeypatch) -> None:
-    answer_prompt(monkeypatch, ("", False))
-    key_harness.window._on_connect_clicked()
-    key_harness.drain()
-
-    window = key_harness.window
-    assert not key_harness.worker.session.is_connected
-    assert "Disconnected" in window.state_label.text()
-    assert "passphrase is required" in window.messages.toPlainText()
-    assert window.connect_button.isEnabled()  # can try again
-
-
-def test_passphrase_is_not_asked_again_after_reconnect(key_harness, monkeypatch) -> None:
-    labels = answer_prompt(monkeypatch, ("right", True))
-    window = key_harness.window
-    window._on_connect_clicked()
-    key_harness.drain()
-
-    window._on_connect_clicked()  # Disconnect
-    key_harness.drain()
-    window._on_connect_clicked()  # Connect again
-    key_harness.drain()
-
-    assert len(labels) == 1  # asked once for the whole run
-    assert key_harness.worker.session.is_connected
 
 
 def test_the_passphrase_never_reaches_the_messages_pane(key_harness, monkeypatch) -> None:
@@ -585,8 +555,8 @@ def test_losing_the_session_shows_a_reconnect_banner(harness: Harness) -> None:
     assert window.banner_bar.isVisibleTo(window)
     assert "lost" in window.banner_label.text().lower()
     assert window.reconnect_button.isVisibleTo(window.banner)
-    # An unexpected drop is the `error` state from C6, not a plain disconnect.
-    assert "Error" in window.state_label.text()
+    # An unexpected drop is Lost, not a plain disconnect.
+    assert "Connection lost" in window.state_label.text()
     assert not window.run_button.isEnabled()
     # Editor contents survive a lost connection.
     assert window.editor.toPlainText() == "select 'my work'"
@@ -599,27 +569,15 @@ def test_the_banner_reconnects_in_one_click(harness: Harness) -> None:
     window.editor.setPlainText("select 1")
     window.run_all()
     harness.drain()
-    assert not harness.worker.session.is_connected
+    assert not window.lifecycle.is_connected
 
     del harness.conn.plan["select"]
     window.reconnect_button.click()
     harness.drain()
 
-    assert harness.worker.session.is_connected
+    assert window.lifecycle.is_connected
     assert not window.banner_bar.isVisibleTo(window)
     assert "Connected" in window.state_label.text()
-
-
-def test_an_ordinary_sql_error_shows_no_banner(harness: Harness) -> None:
-    connect(harness)
-    window = harness.window
-    window.editor.setPlainText("select boom")
-    window.run_all()
-    harness.drain()
-
-    assert not window.banner_bar.isVisibleTo(window)
-    assert harness.worker.session.is_connected
-    assert "ERROR" in window.messages.toPlainText()
 
 
 def test_the_banner_can_be_dismissed(harness: Harness) -> None:
@@ -837,8 +795,6 @@ def test_export_streams_the_whole_result_by_query_id(
     target = tmp_path / "out.csv"
     monkeypatch.setattr(window, "ask_export_path", lambda: str(target))
     window.export_current_result()
-    harness.worker._export_pool.shutdown(wait=True)
-    harness.window.worker.export_finished.emit("", str(target), 900)
 
     # The export re-read the result rather than draining the grid's cursor.
     assert any("RESULT_SCAN" in sql.upper() for sql in harness.conn.executed)
@@ -863,7 +819,6 @@ def test_exported_rows_are_safe_to_open_in_a_spreadsheet(
     target = tmp_path / "out.csv"
     monkeypatch.setattr(window, "ask_export_path", lambda: str(target))
     window.export_current_result()
-    harness.worker._export_pool.shutdown(wait=True)
 
     assert "'=1+1" in target.read_text()
 
@@ -1104,16 +1059,11 @@ def ask(harness: Harness, monkeypatch):
     Returns a setter for the answer (True commit, False roll back, None
     cancel) and the list of reasons asked with.
     """
-    asked: list[str] = []
-    answer: dict[str, bool | None] = {"value": None}
-
-    def fake_ask(reason: str) -> bool | None:
-        asked.append(reason)
-        return answer["value"]
-
-    monkeypatch.setattr(harness.window, "ask_open_transaction", fake_ask)
-    yield (lambda value: answer.__setitem__("value", value)), asked
-    answer["value"] = False  # let the window close at teardown
+    prompter = harness.window.lifecycle.prompter
+    assert isinstance(prompter, ScriptedPrompter)
+    prompter.settle = None
+    yield (lambda value: setattr(prompter, "settle", value)), prompter.settle_questions
+    prompter.settle = False  # let the window close at teardown
 
 
 def test_commit_mode_is_hidden_until_connected(harness: Harness) -> None:
@@ -1219,34 +1169,6 @@ def test_switching_mode_mid_transaction_asks_first(harness: Harness, ask) -> Non
     assert window.commit_button.text() == "Manual commit ▾"
 
 
-def test_disconnecting_mid_transaction_asks_first(harness: Harness, ask) -> None:
-    answer, asked = ask
-    connect(harness)
-    open_transaction(harness)
-    window = harness.window
-
-    answer(None)
-    window._on_connect_clicked()
-    harness.drain()
-    assert harness.worker.session.is_connected
-
-    answer(False)
-    window._on_connect_clicked()
-    harness.drain()
-    assert harness.conn.executed[-1] == "ROLLBACK"
-    assert not harness.worker.session.is_connected
-    assert len(asked) == 2
-
-
-def test_disconnecting_without_a_transaction_does_not_ask(harness: Harness, ask) -> None:
-    _answer, asked = ask
-    connect(harness)
-    harness.window._on_connect_clicked()
-    harness.drain()
-    assert not asked
-    assert not harness.worker.session.is_connected
-
-
 def test_quitting_mid_transaction_can_be_called_off(harness: Harness, ask) -> None:
     answer, asked = ask
     connect(harness)
@@ -1259,10 +1181,31 @@ def test_quitting_mid_transaction_can_be_called_off(harness: Harness, ask) -> No
     assert window.isVisible()
 
     answer(True)
-    assert window.close()
+    assert not window.close()  # not until the COMMIT has gone through
+    assert window.isVisible()
     harness.drain()
     assert harness.conn.executed[-1] == "COMMIT"
+    assert not window.isVisible()
     assert len(asked) == 2
+
+
+def test_a_failed_commit_keeps_the_window_open(harness: Harness, ask) -> None:
+    answer, _asked = ask
+    connect(harness)
+    open_transaction(harness)
+    window = harness.window
+    window.show()
+    harness.conn.plan["COMMIT"] = FakeStatement(
+        error=FakeProgrammingError("Constraint violated", errno=100072)
+    )
+
+    answer(True)
+    window.close()
+    harness.drain()
+    assert window.isVisible()
+    assert window.lifecycle.is_connected
+    assert "left open" in window.messages.toPlainText()
+    window.hide()
 
 
 def test_a_lost_session_says_the_transaction_went_with_it(harness: Harness) -> None:

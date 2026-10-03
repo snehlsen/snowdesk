@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import gzip
-import queue
 import sys
 from pathlib import Path
 
@@ -13,8 +12,9 @@ from PySide6.QtGui import QDropEvent
 
 from snowdesk.controllers.browser import BrowserController
 from snowdesk.controllers.query import QueryController
-from snowdesk.db.session import ConnectParams, SnowflakeSession
-from snowdesk.db.worker import ConnectJob, SnowflakeWorker
+from snowdesk.controllers.session_lifecycle import SessionLifecycle
+from snowdesk.db.session import SnowflakeSession
+from snowdesk.db.worker import SnowflakeWorker
 from snowdesk.model import StageKind
 from snowdesk.storage.history import HistoryStore
 from snowdesk.storage.session import SessionStore
@@ -29,17 +29,15 @@ from snowdesk.ui.stage_tree import (
     STAGE_ROLE,
     StagePanel,
 )
-from tests.fakes import FakeConnection, FakeProgrammingError, FakeStages
-
-
-class Immediately:
-    """Stands in for the transfer thread pool: runs each job as it is submitted."""
-
-    def submit(self, fn, *args):
-        fn(*args)
-
-    def shutdown(self, wait: bool = True) -> None:
-        pass
+from tests.fakes import (
+    FakeConnection,
+    FakeProgrammingError,
+    FakeStages,
+    ScriptedPrompter,
+    drain,
+    inline,
+    start_session,
+)
 
 
 class Harness:
@@ -55,12 +53,7 @@ class Harness:
         return self.window.stage_panel
 
     def drain(self) -> None:
-        while True:
-            try:
-                job = self.worker._queue.get_nowait()
-            except queue.Empty:
-                return
-            self.worker._dispatch(job)
+        drain(self.worker)
 
     def show_stages(self) -> None:
         self.window.sidebar.setCurrentWidget(self.panel)
@@ -126,23 +119,22 @@ def harness(qtbot, tmp_path, monkeypatch):
             "landing/readme.txt": b"hello",
         },
     )
-    worker = SnowflakeWorker(session=SnowflakeSession(connect_fn=lambda _p: conn))
-    worker._transfer_pool = Immediately()  # type: ignore[assignment]
+    worker = inline(SnowflakeWorker(session=SnowflakeSession(connect_fn=lambda _p: conn)))
+    lifecycle = SessionLifecycle(worker, ScriptedPrompter(settle=False))
     history = HistoryStore(tmp_path / "history.db")
     window = MainWindow(
         worker=worker,
-        query=QueryController(worker, history=history),
-        browser=BrowserController(worker),
+        lifecycle=lifecycle,
+        query=QueryController(worker, lifecycle, history=history),
+        browser=BrowserController(worker, lifecycle),
         history=history,
         session=SessionStore(tmp_path / "session.json"),
     )
     qtbot.addWidget(window)
-    monkeypatch.setattr(window, "ask_open_transaction", lambda _reason: False)
     monkeypatch.setattr(window, "ask_quit_during_transfer", lambda: True)
     assert window.sidebar.currentIndex() == 0  # Objects, with nothing remembered
     h = Harness(window, worker, conn)
-    worker.submit(ConnectJob(params=ConnectParams(name="dev")))
-    h.drain()
+    start_session(lifecycle)
     yield h
     history.close()
 
@@ -475,10 +467,12 @@ def test_show_table_stage_while_the_stage_list_is_loading(harness: Harness) -> N
 def test_the_sidebar_remembers_its_page(harness: Harness, qtbot, tmp_path) -> None:
     harness.show_stages()
     worker = harness.worker
+    lifecycle = harness.window.lifecycle
     again = MainWindow(
         worker=worker,
-        query=QueryController(worker),
-        browser=BrowserController(worker),
+        lifecycle=lifecycle,
+        query=QueryController(worker, lifecycle),
+        browser=BrowserController(worker, lifecycle),
         history=harness.window.history,
         session=SessionStore(tmp_path / "session2.json"),
     )

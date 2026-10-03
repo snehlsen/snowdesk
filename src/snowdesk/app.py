@@ -15,6 +15,7 @@ from PySide6.QtWidgets import QApplication
 from snowdesk import __version__, config
 from snowdesk.controllers.browser import BrowserController
 from snowdesk.controllers.query import QueryController
+from snowdesk.controllers.session_lifecycle import SessionLifecycle
 from snowdesk.controllers.stages import StageController
 from snowdesk.db.worker import SnowflakeWorker
 from snowdesk.storage.history import HistoryStore
@@ -120,11 +121,13 @@ class Application:
         # not run a Qt event loop; signals are still delivered to the UI thread.
         self.thread.started.connect(self.worker.run_loop)
 
-        self.query = QueryController(self.worker, history=self.history)
-        self.browser = BrowserController(self.worker)
-        self.stages = StageController(self.worker, history=self.history)
+        self.lifecycle = SessionLifecycle(self.worker)
+        self.query = QueryController(self.worker, self.lifecycle, history=self.history)
+        self.browser = BrowserController(self.worker, self.lifecycle)
+        self.stages = StageController(self.worker, self.lifecycle, history=self.history)
         self.window = MainWindow(
             worker=self.worker,
+            lifecycle=self.lifecycle,
             query=self.query,
             browser=self.browser,
             history=self.history,

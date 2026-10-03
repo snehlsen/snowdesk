@@ -15,6 +15,7 @@ import logging
 from PySide6.QtCore import QObject, Signal
 
 from snowdesk.config import DEFAULT_ROW_CAP
+from snowdesk.controllers.session_lifecycle import SessionLifecycle
 from snowdesk.db import stages as stage_ops
 from snowdesk.db.worker import ListStageJob, SnowflakeWorker, StagesJob
 from snowdesk.model import (
@@ -51,18 +52,18 @@ class StageController(QObject):
     def __init__(
         self,
         worker: SnowflakeWorker,
+        lifecycle: SessionLifecycle,
         history: HistoryStore | None = None,
         row_cap: int = DEFAULT_ROW_CAP,
     ) -> None:
         super().__init__()
         self.worker = worker
+        self.lifecycle = lifecycle
         self.history = history
         self.row_cap = row_cap
         self._ids = itertools.count(1)
         #: The transfer being planned, confirmed or run, if any.
         self._active: str | None = None
-        self._connection_name = ""
-        worker.connected.connect(self._on_connected)
         worker.stages_ready.connect(self.stages_ready)
         worker.stages_failed.connect(self.stages_failed)
         worker.stage_listed.connect(self.listed)
@@ -78,9 +79,6 @@ class StageController(QObject):
     def is_busy(self) -> bool:
         return self._active is not None
 
-    def _on_connected(self, name: str, _ctx: object) -> None:
-        self._connection_name = name
-
     # -- listing -----------------------------------------------------------
 
     def load_stages(self) -> None:
@@ -95,7 +93,7 @@ class StageController(QObject):
         if self._active is not None:
             self.rejected.emit("A transfer is already running.")
             return None
-        if not self.worker.session.is_connected:
+        if not self.lifecycle.is_connected:
             self.rejected.emit("Not connected.")
             return None
         self._active = f"t{next(self._ids)}"
@@ -175,7 +173,7 @@ class StageController(QObject):
         if self.history is None:
             return
         try:
-            self.history.record(outcome, self._connection_name)
+            self.history.record(outcome, self.lifecycle.connection_name)
         except Exception:
             log.warning("Could not write history entry", exc_info=True)
 
