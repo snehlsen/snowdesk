@@ -10,7 +10,7 @@ See [docs/spec.md](docs/spec.md) for the full specification.
 
 Download `SnowDesk-<version>-arm64.dmg` from the
 [latest release](https://github.com/snehlsen/snowdesk/releases/latest), open it,
-and drag SnowDesk to Applications. It needs an Apple Silicon Mac with macOS 13
+and drag SnowDesk to Applications. It needs an Apple Silicon Mac with macOS 15
 or later. Releases are signed with a Developer ID and notarized by Apple, so it
 opens like any other downloaded app.
 
