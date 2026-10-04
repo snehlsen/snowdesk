@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from snowdesk import __version__, config
+from snowdesk import config
 from snowdesk.controllers.browser import BrowserController
 from snowdesk.controllers.query import QueryController
 from snowdesk.controllers.session_lifecycle import Phase, SessionLifecycle, SessionStatus
@@ -62,6 +62,7 @@ from snowdesk.model import (
 from snowdesk.storage.history import HistoryStore
 from snowdesk.storage.workspace import WorkspaceStore
 from snowdesk.ui import preferences, theme
+from snowdesk.ui.about import AboutDialog
 from snowdesk.ui.dialogs import DialogPrompter, message_box, warn
 from snowdesk.ui.editor import SqlEditor
 from snowdesk.ui.editor_tabs import EditorTabs
@@ -136,6 +137,8 @@ class MainWindow(QMainWindow):
         #: when the statement produced no grid -- DDL, DML, or an error.
         self._last_query_id = ""
         self._export_dialog: QProgressDialog | None = None
+        #: Kept once opened, so choosing About again raises it (see ui.about).
+        self._about: AboutDialog | None = None
         self._context = SessionContext()
         self._connections: dict[str, config.ConnectionInfo] = {}
         self._escape_formulas = True
@@ -629,20 +632,9 @@ class MainWindow(QMainWindow):
             view.set_escape_formulas(escape)
 
     def _show_about(self) -> None:
-        # Qt's static about box would go native; this is the same box, built
-        # by hand so it does not (see snowdesk.ui.dialogs).
-        box = message_box(self, QMessageBox.Icon.NoIcon)
-        box.setWindowTitle("About SnowDesk")
-        icon = QApplication.windowIcon()
-        if not icon.isNull():
-            box.setIconPixmap(icon.pixmap(64, 64))
-        box.setTextFormat(Qt.TextFormat.RichText)
-        box.setText(
-            f"<b>SnowDesk {__version__}</b><br><br>"
-            "A lightweight macOS client for Snowflake.<br>"
-            "Connections come from the same files the <code>snow</code> CLI uses."
-        )
-        box.exec()
+        if self._about is None:
+            self._about = AboutDialog(self)
+        self._about.present()
 
     def _menu(self, name: str) -> QMenu:
         menu = self._menus.get(name)
