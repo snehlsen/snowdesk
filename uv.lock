@@ -943,15 +943,18 @@ wheels = [
 [[package]]
 name = "snowdesk"
 source = { editable = "." }
+default-groups = ["build", "dev"]
 dependencies = [
     { name = "pyside6" },
     { name = "snowflake-connector-python" },
 ]
 
 [package.dev-dependencies]
+build = [
+    { name = "pyinstaller" },
+]
 dev = [
     { name = "mypy" },
-    { name = "pyinstaller" },
     { name = "pytest" },
     { name = "pytest-qt" },
     { name = "ruff" },
@@ -964,9 +967,9 @@ requires-dist = [
 ]
 
 [package.metadata.requires-dev]
+build = [{ name = "pyinstaller", specifier = ">=6.22.3" }]
 dev = [
     { name = "mypy", specifier = ">=1.11" },
-    { name = "pyinstaller", specifier = ">=6.22.3" },
     { name = "pytest", specifier = ">=8.0" },
     { name = "pytest-qt", specifier = ">=4.4" },
     { name = "ruff", specifier = ">=0.6" },

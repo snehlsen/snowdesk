@@ -16,8 +16,11 @@ jobs:
       # day the workflow runs. The trailing comment is the version, for
       # anything that bumps these.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # The same uv as the release build; see release.yml for the checksum.
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
+          version: "0.12.23"
+          checksum: "50487ae565ccd96e499056b4674d438f4c53170202617b4c759defe0c6a1b544"
           enable-cache: true
       # --locked fails if uv.lock is out of date with pyproject.toml,
       # rather than quietly resolving something else.
