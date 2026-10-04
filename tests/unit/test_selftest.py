@@ -41,6 +41,31 @@ def test_arrow_reader_is_importable() -> None:
     assert "loaded" in selftest._check_arrow()
 
 
+def test_tokens_are_cached_in_the_keychain() -> None:
+    """Without keyring the connector caches no SSO token, and says nothing."""
+    assert selftest._check_token_cache() == "keyring.backends.macOS.Keyring"
+
+
+def test_a_connector_that_caches_nothing_fails_the_check(monkeypatch) -> None:
+    from snowflake.connector.token_cache import NoopTokenCache, TokenCache
+
+    monkeypatch.setattr(TokenCache, "make", staticmethod(lambda **_kw: NoopTokenCache()))
+    check = selftest._run("Token cache (Keychain)", selftest._check_token_cache)
+    assert not check.ok
+    assert "NoopTokenCache" in check.detail
+
+
+def test_keyring_without_a_backend_fails_the_check(monkeypatch) -> None:
+    """What a bundle that lost keyring's entry-point metadata looks like."""
+    import keyring
+    from keyring.backends import fail
+
+    monkeypatch.setattr(keyring, "get_keyring", fail.Keyring)
+    check = selftest._run("Token cache (Keychain)", selftest._check_token_cache)
+    assert not check.ok
+    assert "no usable backend" in check.detail
+
+
 # -- the connection check's passphrase prompt -------------------------------
 
 MISSING = TypeError("Password was not given but private key is encrypted")

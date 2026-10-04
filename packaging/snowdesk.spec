@@ -36,7 +36,12 @@ hiddenimports = [
     # See the note above: the compiled Arrow reader's imports are invisible.
     *collect_submodules("snowflake.connector"),
     "snowflake.connector.snow_logging",
-    "keyring",  # used by the connector's SSO token cache
+    # The connector's token cache imports keyring through importlib, so
+    # nothing sees it.  Naming it brings in PyInstaller's own keyring hook,
+    # which collects the backends and the entry-point metadata keyring finds
+    # its macOS backend through.  The selftest's token-cache check is where a
+    # miss shows.
+    "keyring",
 ]
 
 datas = [

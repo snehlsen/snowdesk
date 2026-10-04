@@ -10,7 +10,9 @@ license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
     "PySide6>=6.7",
-    "snowflake-connector-python>=3.12",
+    # The extra brings keyring, without which the connector cannot reach the
+    # Keychain on macOS and caches no SSO, MFA or OAuth token at all (C4).
+    "snowflake-connector-python[secure-local-storage]>=3.12",
 ]
 
 [project.scripts]
