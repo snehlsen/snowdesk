@@ -213,7 +213,7 @@ jobs:
           VERSION: ${{ needs.build.outputs.version }}
         run: |
           cat > notes.md <<'EOF'
-          **Apple Silicon, macOS 13 or later.** Signed with a Developer ID and
+          **Apple Silicon, macOS 15 or later.** Signed with a Developer ID and
           notarized by Apple: open the dmg and drag SnowDesk to Applications.
 
           Check the download against `SHA256SUMS` with `shasum -a 256 -c SHA256SUMS`.

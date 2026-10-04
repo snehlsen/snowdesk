@@ -169,6 +169,42 @@ done < <(find "$APP/Contents" -type f -print0 |
     awk -F '\t' '$2 ~ /x-mach-binary/ { print $1 }')
 [ "${#machos[@]}" -gt 0 ] || die "no Mach-O files found in $APP"
 
+# --- Check every binary runs on the macOS the app claims -------------------
+#
+# Launch Services lets the app start on anything from LSMinimumSystemVersion
+# up, but each library carries its own deployment target, and the wheels'
+# platform tags do not say what is inside them: PySide6 6.10 and later are
+# tagged macosx_13_0 and built for 15.0.  So read the minos of each binary
+# rather than trusting the tag, before spending a signature on the bundle.
+
+MIN_OS=$(plutil -extract LSMinimumSystemVersion raw -o - "$APP/Contents/Info.plist") ||
+    die "Info.plist has no LSMinimumSystemVersion"
+
+# Major and minor as one number, so 13.0 < 13.5 < 14.0 compare as integers.
+os_number() { awk -F. '{ printf "%d\n", $1 * 100 + $2 }'; }
+min_os=$(printf '%s\n' "$MIN_OS" | os_number)
+
+newest=$MIN_OS
+too_new=()
+for f in "${machos[@]}"; do
+    # LC_BUILD_VERSION on anything recent, LC_VERSION_MIN_MACOSX on older.
+    v=$(otool -l "$f" | awk '
+        /cmd LC_BUILD_VERSION/ { b = 1 }
+        b && $1 == "minos" { print $2; b = 0 }
+        /cmd LC_VERSION_MIN_MACOSX/ { m = 1 }
+        m && $1 == "version" { print $2; m = 0 }' | sort -t. -k1,1n -k2,2n | tail -1)
+    [ -n "$v" ] || continue
+    if [ "$(printf '%s\n' "$v" | os_number)" -gt "$min_os" ]; then
+        too_new+=("$v ${f#"$APP"/}")
+        [ "$(printf '%s\n' "$v" | os_number)" -gt "$(printf '%s\n' "$newest" | os_number)" ] && newest=$v
+    fi
+done
+if [ "${#too_new[@]}" -gt 0 ]; then
+    printf '  %s\n' "${too_new[@]}" | sort -t. -k1,1n -k2,2n >&2
+    die "${#too_new[@]} binaries need macOS $newest, but LSMinimumSystemVersion is $MIN_OS"
+fi
+echo "All ${#machos[@]} Mach-O files run on macOS $MIN_OS, the LSMinimumSystemVersion"
+
 loose=()
 for f in "${machos[@]}"; do
     [ "$f" = "$APP/Contents/MacOS/$EXE" ] && continue

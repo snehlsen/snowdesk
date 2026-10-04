@@ -112,7 +112,7 @@ Priority: **P0** is required for v1, **P1** is expected for v1 but can slip, **P
 
 **Security.** The app never stores passwords or private-key passphrases itself; they stay in `connections.toml` (which must be `chmod 600`) or in the Keychain via the connector's own token cache. Query history is stored locally and can be cleared. No telemetry.
 
-**Compatibility.** macOS 13+ on Apple silicon for v1. Intel builds are optional.
+**Compatibility.** macOS 15+ on Apple silicon for v1, the oldest release PySide6's binaries are built for (see `LSMinimumSystemVersion` in `packaging/snowdesk.spec`). Intel builds are optional.
 
 **Robustness.** A dropped network or expired session produces a clear error and a one-click reconnect, never a crash or a hang.
 
