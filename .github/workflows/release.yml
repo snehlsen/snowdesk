@@ -9,6 +9,17 @@ name: Release
 # the notary API key are secrets of the `release` environment, whose deployment
 # rule admits only `v*` tags: a branch or pull request that edits this file
 # still cannot read them.
+#
+# Only the `sign` job is in that environment, and it runs no third-party code
+# beyond GitHub's own checkout and artifact actions, pinned.  Everything that does (uv, PyInstaller and
+# its hooks, every dependency, the bundle itself) runs in a job of its own,
+# and the boundary has to be a job, not a step: GitHub hands a job all of its
+# secrets when the job starts, a process left running by one step lives on
+# into the next, and any step can rewrite PATH for the steps after it through
+# $GITHUB_PATH.  The jobs pass files to each other as artifacts, never by
+# running anything:
+#
+#     build ── unsigned app ──> sign ── dmg ──> selftest ──> publish
 
 on:
   push:
@@ -29,39 +40,82 @@ jobs:
   build:
     needs: checks
     runs-on: macos-14 # arm64, matching target_arch in packaging/snowdesk.spec
-    environment: release
-    # Notarization usually takes minutes, but Apple's queue has no upper bound
-    # of its own.
-    timeout-minutes: 60
-    permissions:
-      contents: write # only this job, and only to create the release
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    env:
+      # A python-build-standalone interpreter, which uv checks against the
+      # hash it ships with, rather than whatever the runner image's Homebrew
+      # has this week.  It also points OpenSSL at /etc/ssl/cert.pem, which
+      # every Mac has, where Homebrew's points at /opt/homebrew.
+      UV_PYTHON: "3.14.8"
+      UV_PYTHON_PREFERENCE: only-managed
     steps:
-      # Pinned to commit SHAs, as in ci.yml.  That matters more here than
-      # anywhere: every action in this job runs beside the signing key.
+      # Pinned to commit SHAs, as in ci.yml.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          # The publish step brings its own token; nothing needs one left in
-          # .git/config for the rest of the job.
           persist-credentials: false
-      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
-        with:
-          enable-cache: true
-      - run: uv sync --locked
 
+      # Read the way sign.sh and the spec read it, so nothing is installed or
+      # imported to find out.
       - name: Check the tag matches the version
         id: version
         run: |
-          version=$(uv run python -c "import snowdesk; print(snowdesk.__version__)")
+          version=$(sed -n 's/^__version__ = "\([^"]*\)"$/\1/p' src/snowdesk/__init__.py)
           if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
             echo "::error::tag ${GITHUB_REF_NAME} does not match __version__ ${version}"
             exit 1
           fi
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
-      # Before any secret is on the runner: PyInstaller runs every package's
-      # hooks, which is third-party code.
+      # uv installs every wheel in the bundle and checks its hash, so uv
+      # itself is pinned and checked too.  The checksum is the .sha256 file
+      # published with that uv release.  No cache: one restored from a run on
+      # main would be trusted as it is.
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          version: "0.12.23"
+          checksum: "50487ae565ccd96e499056b4674d438f4c53170202617b4c759defe0c6a1b544"
+          enable-cache: false
+
+      # Only what goes into the bundle, plus PyInstaller: anything installed
+      # can run code in the interpreter that builds, through a .pth file.
+      # --no-install-project because installing it would build it with
+      # hatchling, which uv.lock does not pin; PyInstaller finds src/ on its
+      # own (pathex in the spec).
+      - run: uv sync --locked --no-default-groups --group build --no-install-project
       - name: Build the app
-        run: uv run pyinstaller packaging/snowdesk.spec --noconfirm
+        run: uv run --no-sync pyinstaller packaging/snowdesk.spec --noconfirm
+
+      # tar, because an artifact zip drops symlinks, and the framework layout
+      # inside the bundle depends on them.
+      - run: tar -C dist -cf "$RUNNER_TEMP/SnowDesk.app.tar" SnowDesk.app
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: unsigned-app
+          path: ${{ runner.temp }}/SnowDesk.app.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  sign:
+    needs: build
+    runs-on: macos-14
+    environment: release
+    # Notarization usually takes minutes, but Apple's queue has no upper bound
+    # of its own.
+    timeout-minutes: 60
+    steps:
+      # For sign.sh, the entitlements and __init__.py.  No uv and no Python in
+      # this job.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: unsigned-app
+          path: ${{ runner.temp }}
+      # macOS's tar refuses entries with .. and writing through symlinks
+      # unless given -P, so the archive cannot reach past dist/.
+      - run: mkdir -p dist && tar -C dist -xf "$RUNNER_TEMP/SnowDesk.app.tar"
 
       # A keychain of its own, with a random password nobody knows, that lives
       # for this job only.  The .p12 is on disk only between decode and import.
@@ -79,10 +133,10 @@ jobs:
           echo "SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
 
           p12="$RUNNER_TEMP/certificate.p12"
+          trap 'rm -f "$p12"' EXIT
           printf '%s' "$CERTIFICATE_P12" | base64 --decode > "$p12"
           security import "$p12" -k "$keychain" -f pkcs12 \
             -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          rm "$p12"
 
           # Lets codesign use the key without the prompt a Mac would show.
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
@@ -92,7 +146,7 @@ jobs:
             $(security list-keychains -d user | tr -d '"')
 
       # --no-selftest: the self-test runs the bundle, and with it every
-      # dependency, so it waits until the keychain is gone.
+      # dependency, so it gets a job of its own.
       - name: Sign, notarize and staple
         env:
           NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
@@ -111,18 +165,52 @@ jobs:
             security delete-keychain "$SIGNING_KEYCHAIN"
           fi
 
-      # --selftest exists because PyInstaller reports success on bundles that
-      # cannot import the connector's native pieces.  It runs on the signed
-      # bundle because library validation only fails when a library loads.
-      - name: Self-test the signed bundle
-        run: dist/SnowDesk.app/Contents/MacOS/snowdesk --selftest
-        env:
-          QT_QPA_PLATFORM: offscreen
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release
+          path: |
+            dist/SnowDesk-*-arm64.dmg
+            dist/SHA256SUMS
+          if-no-files-found: error
 
+  # --selftest exists because PyInstaller reports success on bundles that
+  # cannot import the connector's native pieces.  It runs the app out of the
+  # dmg that will be published, because library validation only fails when a
+  # library loads.
+  selftest:
+    needs: [build, sign]
+    runs-on: macos-14
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release
+          path: release
+      - name: Self-test the signed bundle
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          (cd release && shasum -a 256 -c SHA256SUMS)
+          mnt=$(mktemp -d)
+          hdiutil attach -quiet -nobrowse -readonly -mountpoint "$mnt" \
+            "release/SnowDesk-${VERSION}-arm64.dmg"
+          trap 'hdiutil detach "$mnt" -quiet' EXIT
+          "$mnt/SnowDesk.app/Contents/MacOS/snowdesk" --selftest
+
+  publish:
+    needs: [build, selftest]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # only this job, and only to create the release
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release
+          path: dist
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.version.outputs.version }}
+          VERSION: ${{ needs.build.outputs.version }}
         run: |
           cat > notes.md <<'EOF'
           **Apple Silicon, macOS 13 or later.** Signed with a Developer ID and

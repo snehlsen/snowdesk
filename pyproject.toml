@@ -22,6 +22,10 @@ dev = [
     "pytest-qt>=4.4",
     "ruff>=0.6",
     "mypy>=1.11",
+]
+# Apart from dev so the release build installs PyInstaller and nothing else:
+# every installed package can run code in the interpreter that builds.
+build = [
     "pyinstaller>=6.22.3",
 ]
 
@@ -34,6 +38,9 @@ path = "src/snowdesk/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/snowdesk"]
+
+[tool.uv]
+default-groups = ["dev", "build"]
 
 [tool.ruff]
 line-length = 100

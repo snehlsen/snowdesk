@@ -239,8 +239,8 @@ codesign -d --entitlements - --xml "$APP" 2>/dev/null | plutil -p - | sed 's/^/ 
 
 # Library validation only bites at load time, so the signed bundle has to
 # actually run; the source tree passing says nothing about it.  The release
-# workflow skips it here and runs it after deleting the signing keychain, so
-# that the bundle's third-party code never runs while the key is usable.
+# workflow skips it here and runs it in a job of its own, so that the
+# bundle's third-party code never runs on a runner that holds the key.
 if [ "$selftest" = 1 ]; then
     step "Self-testing the signed bundle"
     QT_QPA_PLATFORM=offscreen "$APP/Contents/MacOS/$EXE" --selftest

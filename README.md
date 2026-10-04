@@ -236,10 +236,12 @@ git push origin v0.2.0
 [`.github/workflows/release.yml`](.github/workflows/release.yml) runs the CI
 checks, fails if the tag and `__version__` disagree, builds the bundle, signs,
 notarizes and staples it with `packaging/sign.sh`, runs `--selftest` on the
-signed bundle, and publishes a GitHub Release with
+app in the signed dmg, and publishes a GitHub Release with
 `SnowDesk-<version>-arm64.dmg` and its `SHA256SUMS`. The Developer ID
 certificate and the notary API key are secrets of the repository's `release`
-environment, which only `v*` tags can deploy to.
+environment, which only `v*` tags can deploy to. Only the signing job is in
+that environment: building and the self-test, which run third-party code, are
+jobs of their own and never share a runner with the key.
 
 ### Application icon
 
