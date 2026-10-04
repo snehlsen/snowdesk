@@ -126,3 +126,28 @@ def test_workspace_keeps_its_original_file_name(
     # Renaming the file would lose every existing user's restored tabs.
     monkeypatch.setattr(config, "SUPPORT_DIR", tmp_path)
     assert config.workspace_path() == tmp_path / "session.json"
+
+
+def test_icon_is_found_in_a_source_checkout() -> None:
+    path = config.icon_path()
+    assert path is not None and path.name == "icon.icns"
+
+
+def test_icon_is_found_in_the_app_bundle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Nothing sets Qt's window icon in the bundle, which is how the About box
+    # shipped without one; the bundle's own copy is the one to load.
+    contents = tmp_path / "SnowDesk.app" / "Contents"
+    (contents / "MacOS").mkdir(parents=True)
+    (contents / "MacOS" / "snowdesk").touch()
+    (contents / "Resources").mkdir()
+    (contents / "Resources" / "icon.icns").touch()
+    monkeypatch.setattr(config.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(config.sys, "executable", str(contents / "MacOS" / "snowdesk"))
+    assert config.icon_path() == (contents / "Resources" / "icon.icns").resolve()
+
+
+def test_a_bundle_without_an_icon_has_none(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "MacOS").mkdir()
+    monkeypatch.setattr(config.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(config.sys, "executable", str(tmp_path / "MacOS" / "snowdesk"))
+    assert config.icon_path() is None

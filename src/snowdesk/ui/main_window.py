@@ -633,9 +633,9 @@ class MainWindow(QMainWindow):
         # by hand so it does not (see snowdesk.ui.dialogs).
         box = message_box(self, QMessageBox.Icon.NoIcon)
         box.setWindowTitle("About SnowDesk")
-        icon = QApplication.windowIcon()
-        if not icon.isNull():
-            box.setIconPixmap(icon.pixmap(64, 64))
+        path = config.icon_path()
+        if path is not None:
+            box.setIconPixmap(QIcon(str(path)).pixmap(64, 64))
         box.setTextFormat(Qt.TextFormat.RichText)
         box.setText(
             f"<b>SnowDesk {__version__}</b><br><br>"

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -215,3 +216,19 @@ def workspace_path() -> Path:
     # The file predates the Workspace name and keeps the old one, so tabs
     # saved by earlier versions are still found and restored.
     return support_dir() / "session.json"
+
+
+def icon_path() -> Path | None:
+    """The app icon, wherever this copy of SnowDesk keeps it.
+
+    Nothing sets Qt's window icon -- the Dock takes the bundle's icon from
+    Info.plist on its own -- so anything that wants to draw the icon loads the
+    file.  PyInstaller puts it in ``Contents/Resources`` beside the
+    ``Contents/MacOS`` executable; a source checkout has it under
+    ``packaging/``.  An installed wheel has neither.
+    """
+    if getattr(sys, "frozen", False):
+        path = Path(sys.executable).resolve().parent.parent / "Resources" / "icon.icns"
+    else:
+        path = Path(__file__).resolve().parents[2] / "packaging" / "icon.icns"
+    return path if path.is_file() else None

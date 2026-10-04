@@ -7,7 +7,7 @@ import sys
 import pytest
 from PySide6.QtCore import QPoint
 from PySide6.QtGui import QAction
-from PySide6.QtWidgets import QLabel
+from PySide6.QtWidgets import QLabel, QMessageBox
 
 from snowdesk.controllers.browser import BrowserController
 from snowdesk.controllers.query import QueryController
@@ -589,6 +589,13 @@ def test_menus_are_in_platform_order(harness: Harness) -> None:
 def test_about_carries_the_menu_role_that_moves_it_to_the_app_menu(harness: Harness) -> None:
     about = next(a for a in harness.window.actions() if a.text() == "About SnowDesk")
     assert about.menuRole() == QAction.MenuRole.AboutRole
+
+
+def test_about_shows_the_app_icon(harness: Harness, monkeypatch) -> None:
+    shown: list[QMessageBox] = []
+    monkeypatch.setattr("snowdesk.ui.dialogs.QMessageBox.exec", lambda box: shown.append(box))
+    next(a for a in harness.window.actions() if a.text() == "About SnowDesk").trigger()
+    assert not shown[0].iconPixmap().isNull()
 
 
 def test_menu_items_that_open_a_dialog_end_in_an_ellipsis(harness: Harness) -> None:
