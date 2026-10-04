@@ -8,3 +8,6 @@ build/
 .mypy_cache/
 .ruff_cache/
 .DS_Store
+# Signing material belongs in the keychain and in GitHub secrets, never here.
+*.p12
+*.p8

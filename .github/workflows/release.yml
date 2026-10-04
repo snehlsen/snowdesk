@@ -2,12 +2,13 @@ name: Release
 
 # Push a tag matching the version in src/snowdesk/__init__.py to publish:
 #
-#     git tag v0.2.0 && git push origin v0.2.0
+#     git tag v0.2.1 && git push origin v0.2.1
 #
-# The build is ad-hoc signed and not notarized (REMAINING.md 1.3), so macOS
-# quarantines the downloaded .dmg and Gatekeeper blocks the first launch; the
-# release notes say how to get past that.  Signing and notarization slot in
-# between "Build the app" and "Build the dmg" once there is a Developer ID.
+# The bundle is signed with a Developer ID, notarized and stapled by
+# packaging/sign.sh, the same script that signs on a Mac.  The certificate and
+# the notary API key are secrets of the `release` environment, whose deployment
+# rule admits only `v*` tags: a branch or pull request that edits this file
+# still cannot read them.
 
 on:
   push:
@@ -28,11 +29,20 @@ jobs:
   build:
     needs: checks
     runs-on: macos-14 # arm64, matching target_arch in packaging/snowdesk.spec
+    environment: release
+    # Notarization usually takes minutes, but Apple's queue has no upper bound
+    # of its own.
+    timeout-minutes: 60
     permissions:
       contents: write # only this job, and only to create the release
     steps:
-      # Pinned to commit SHAs, as in ci.yml.
+      # Pinned to commit SHAs, as in ci.yml.  That matters more here than
+      # anywhere: every action in this job runs beside the signing key.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # The publish step brings its own token; nothing needs one left in
+          # .git/config for the rest of the job.
+          persist-credentials: false
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           enable-cache: true
@@ -48,50 +58,79 @@ jobs:
           fi
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
+      # Before any secret is on the runner: PyInstaller runs every package's
+      # hooks, which is third-party code.
       - name: Build the app
         run: uv run pyinstaller packaging/snowdesk.spec --noconfirm
 
+      # A keychain of its own, with a random password nobody knows, that lives
+      # for this job only.  The .p12 is on disk only between decode and import.
+      - name: Import the signing certificate
+        env:
+          CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          password=$(openssl rand -hex 32)
+          security create-keychain -p "$password" "$keychain"
+          # The default locks after five idle minutes, mid-notarization.
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          echo "SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+
+          p12="$RUNNER_TEMP/certificate.p12"
+          printf '%s' "$CERTIFICATE_P12" | base64 --decode > "$p12"
+          security import "$p12" -k "$keychain" -f pkcs12 \
+            -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          rm "$p12"
+
+          # Lets codesign use the key without the prompt a Mac would show.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+            -k "$password" "$keychain" > /dev/null
+          # On the search list, which is where codesign and sign.sh look.
+          security list-keychains -d user -s "$keychain" \
+            $(security list-keychains -d user | tr -d '"')
+
+      # --no-selftest: the self-test runs the bundle, and with it every
+      # dependency, so it waits until the keychain is gone.
+      - name: Sign, notarize and staple
+        env:
+          NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+          SNOWDESK_NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          SNOWDESK_NOTARY_ISSUER: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: |
+          export SNOWDESK_NOTARY_KEY="$RUNNER_TEMP/notary.p8"
+          trap 'rm -f "$SNOWDESK_NOTARY_KEY"' EXIT
+          (umask 077 && printf '%s\n' "$NOTARY_KEY_P8" > "$SNOWDESK_NOTARY_KEY")
+          packaging/sign.sh --no-build --no-selftest
+
+      - name: Delete the signing keychain
+        if: always()
+        run: |
+          if [ -n "${SIGNING_KEYCHAIN:-}" ]; then
+            security delete-keychain "$SIGNING_KEYCHAIN"
+          fi
+
       # --selftest exists because PyInstaller reports success on bundles that
-      # cannot import the connector's native pieces; this is where that shows.
-      - name: Self-test the bundle
+      # cannot import the connector's native pieces.  It runs on the signed
+      # bundle because library validation only fails when a library loads.
+      - name: Self-test the signed bundle
         run: dist/SnowDesk.app/Contents/MacOS/snowdesk --selftest
         env:
           QT_QPA_PLATFORM: offscreen
 
-      - name: Build the dmg
-        id: dmg
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          dmg="SnowDesk-${VERSION}-arm64.dmg"
-          mkdir -p dmg-stage
-          # ditto, not cp -R: it keeps the bundle's symlinks and extended
-          # attributes, which the framework layout and signature depend on.
-          ditto dist/SnowDesk.app dmg-stage/SnowDesk.app
-          ln -s /Applications dmg-stage/Applications
-          # hdiutil warns that it is deprecated on newer macOS, but the
-          # `diskutil image` replacement does not exist on macos-14.
-          hdiutil create -volname SnowDesk -srcfolder dmg-stage -fs HFS+ -format UDZO "$dmg"
-          shasum -a 256 "$dmg" > SHA256SUMS
-          echo "path=${dmg}" >> "$GITHUB_OUTPUT"
-
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
-          DMG: ${{ steps.dmg.outputs.path }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           cat > notes.md <<'EOF'
-          **Apple Silicon only.** This build is not signed with a Developer ID
-          or notarized, so macOS blocks it the first time. After dragging
-          SnowDesk to Applications, either open it once and then allow it under
-          System Settings ▸ Privacy & Security ▸ *Open Anyway*, or run:
-
-          ```
-          xattr -dr com.apple.quarantine /Applications/SnowDesk.app
-          ```
+          **Apple Silicon, macOS 13 or later.** Signed with a Developer ID and
+          notarized by Apple: open the dmg and drag SnowDesk to Applications.
 
           Check the download against `SHA256SUMS` with `shasum -a 256 -c SHA256SUMS`.
           EOF
-          gh release create "$GITHUB_REF_NAME" "$DMG" SHA256SUMS \
-            --verify-tag --title "SnowDesk ${GITHUB_REF_NAME}" \
+          gh release create "$GITHUB_REF_NAME" \
+            "dist/SnowDesk-${VERSION}-arm64.dmg" dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --title "SnowDesk ${GITHUB_REF_NAME}" \
             --notes-file notes.md --generate-notes
