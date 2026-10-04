@@ -6,7 +6,15 @@ A lightweight macOS client for Snowflake: query editor, results grid, and schema
 browser, using the connection config you already have for the `snow` CLI.
 See [docs/spec.md](docs/spec.md) for the full specification.
 
-## Running
+## Installing
+
+Download `SnowDesk-<version>-arm64.dmg` from the
+[latest release](https://github.com/snehlsen/snowdesk/releases/latest), open it,
+and drag SnowDesk to Applications. It needs an Apple Silicon Mac with macOS 13
+or later. Releases are signed with a Developer ID and notarized by Apple, so it
+opens like any other downloaded app.
+
+## Running from source
 
 ```
 uv sync
@@ -39,9 +47,9 @@ version are tightened the next time the app starts.
 ## Status
 
 All **P0** requirements from the spec are implemented, along with milestones
-M0-M6. M7 is partly done: a dropped session is detected and recoverable, and
-logging is in place; the manual checklist, the first real run of the
-integration tests, and signing and notarization are not.
+M0-M6. M7 is partly done: a dropped session is detected and recoverable,
+logging is in place, and releases are signed and notarized; the manual
+checklist and the first real run of the integration tests are not.
 
 | Area | Done | Not yet |
 |------|------|---------|
@@ -200,10 +208,19 @@ uv run pyinstaller packaging/snowdesk.spec --noconfirm
 open dist/SnowDesk.app
 ```
 
-For personal use, `uv run snowdesk` is enough. See spec section 12 for signing
-and notarization; the build is ad-hoc signed, so Gatekeeper rejects it until it
-is signed with a Developer ID and notarized. A local build stops at
-`dist/SnowDesk.app`; the `.dmg` comes from the release workflow below.
+For personal use, `uv run snowdesk` is enough. A plain PyInstaller build is
+ad-hoc signed: fine on the Mac that built it, but Gatekeeper blocks it on any
+Mac it is downloaded to. To build, sign, notarize and package it the way a
+release is, with a Developer ID Application certificate in the login keychain
+and a `notarytool` keychain profile (the top of the script says how to make
+one):
+
+```
+packaging/sign.sh
+```
+
+That leaves a stapled `dist/SnowDesk-<version>-arm64.dmg` and its
+`SHA256SUMS`. `packaging/sign.sh --help` lists the steps it can skip.
 
 ### Releasing
 
@@ -217,10 +234,12 @@ git push origin v0.2.0
 ```
 
 [`.github/workflows/release.yml`](.github/workflows/release.yml) runs the CI
-checks, fails if the tag and `__version__` disagree, builds the bundle, runs
-`--selftest` on it, and publishes a GitHub Release with
-`SnowDesk-<version>-arm64.dmg` and its `SHA256SUMS`. The release is not signed
-or notarized, and its notes tell people how to open it anyway.
+checks, fails if the tag and `__version__` disagree, builds the bundle, signs,
+notarizes and staples it with `packaging/sign.sh`, runs `--selftest` on the
+signed bundle, and publishes a GitHub Release with
+`SnowDesk-<version>-arm64.dmg` and its `SHA256SUMS`. The Developer ID
+certificate and the notary API key are secrets of the repository's `release`
+environment, which only `v*` tags can deploy to.
 
 ### Application icon
 
