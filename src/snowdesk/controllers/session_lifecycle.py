@@ -4,7 +4,7 @@ See CONTEXT.md for the terms and docs/adr/0001 for why this lives on the UI
 thread.  The worker is still the only thing that touches the session; it
 reports what happened (connected, connect failed, session lost) and this
 module decides what that means: which state the Session is in, whether to ask
-for a passphrase, and when it is safe to end the Session.
+for a passphrase or a password, and when it is safe to end the Session.
 
 Everything here runs on the UI thread, so the window and the controllers read
 :attr:`SessionLifecycle.status` instead of the worker's session.
@@ -21,16 +21,31 @@ from PySide6.QtCore import QObject, Signal
 
 from snowdesk.db.session import ConnectParams
 from snowdesk.db.worker import ConnectJob, DisconnectJob, EndTransactionJob, SnowflakeWorker
-from snowdesk.model import ConnectFailure, QueryError, RunStatus, StatementOutcome, TransactionState
+from snowdesk.model import (
+    ConnectFailure,
+    Credentials,
+    QueryError,
+    RunStatus,
+    StatementOutcome,
+    TransactionState,
+)
 
 
 class Phase(StrEnum):
     DISCONNECTED = "disconnected"
     CONNECTING = "connecting"
     AWAITING_PASSPHRASE = "awaiting passphrase"
+    AWAITING_PASSWORD = "awaiting password"
+    AWAITING_PASSCODE = "awaiting passcode"
     CONNECTED = "connected"
     LOST = "lost"
     FAILED = "failed"
+
+
+#: The phases between asking for a Session and having one (or not).
+OPENING = frozenset(
+    {Phase.CONNECTING, Phase.AWAITING_PASSPHRASE, Phase.AWAITING_PASSWORD, Phase.AWAITING_PASSCODE}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,12 +63,32 @@ class SessionStatus:
     def is_connected(self) -> bool:
         return self.phase is Phase.CONNECTED
 
+    @property
+    def is_opening(self) -> bool:
+        """Connecting, or waiting on the user to get connected."""
+        return self.phase in OPENING
+
 
 class Prompter(Protocol):
     """The questions only the user can answer."""
 
     def ask_passphrase(self, connection: str, rejected: bool) -> str | None:
         """The private key passphrase for ``connection``, or None to give up."""
+        ...
+
+    def ask_password(self, connection: str, rejected: str | None) -> Credentials | None:
+        """The password (and MFA passcode) for ``connection``, or None to give up.
+
+        ``rejected`` is Snowflake's reason for turning down the last attempt,
+        or None the first time round.
+        """
+        ...
+
+    def ask_passcode(self, connection: str, reason: str) -> str | None:
+        """An MFA passcode for ``connection``, whose password is configured.
+
+        ``reason`` is Snowflake's wording for why the sign-in needs one.
+        """
         ...
 
     def ask_settle(self, reason: str) -> bool | None:
@@ -84,6 +119,10 @@ class SessionLifecycle(QObject):
         self._passphrases: dict[str, str] = {}
         #: The passphrase sent with the connect in flight, kept once it works.
         self._trying: str | None = None
+        # Unlike passphrases, a password (and MFA passcode) is never kept: it
+        # is handed to the one connect it was typed for, and every connect
+        # asks again.  A password opens the account itself, not just one key,
+        # so it is not left sitting in memory between sign-ins.
         self._transaction = TransactionState()
         #: What to do once the COMMIT or ROLLBACK queued by :meth:`settle` succeeds.
         self._after_settle: Callable[[], None] | None = None
@@ -129,7 +168,7 @@ class SessionLifecycle(QObject):
         Ignored while a Session is open or being opened: :meth:`end` it, or
         :meth:`reconnect`, so an open Transaction is settled first.
         """
-        if self._status.phase in (Phase.CONNECTING, Phase.AWAITING_PASSPHRASE, Phase.CONNECTED):
+        if self._status.is_opening or self._status.is_connected:
             return
         self._open(connection, passphrase)
 
@@ -183,11 +222,20 @@ class SessionLifecycle(QObject):
 
     # -- internals ---------------------------------------------------------
 
-    def _open(self, connection: str, passphrase: str | None) -> None:
+    def _open(
+        self, connection: str, passphrase: str | None, credentials: Credentials | None = None
+    ) -> None:
         self._trying = passphrase or self._passphrases.get(connection)
         self._move(SessionStatus(Phase.CONNECTING, connection))
         self.worker.submit(
-            ConnectJob(params=ConnectParams(name=connection, private_key_passphrase=self._trying))
+            ConnectJob(
+                params=ConnectParams(
+                    name=connection,
+                    private_key_passphrase=self._trying,
+                    password=credentials.password if credentials else None,
+                    passcode=credentials.passcode if credentials else None,
+                )
+            )
         )
 
     def _close(self) -> None:
@@ -216,6 +264,12 @@ class SessionLifecycle(QObject):
         if kind is ConnectFailure.ERROR:
             self._move(SessionStatus(Phase.FAILED, connection, error.message, error))
             return
+        if kind in (ConnectFailure.PASSWORD_NEEDED, ConnectFailure.PASSWORD_REJECTED):
+            self._ask_password(connection, kind, error)
+            return
+        if kind is ConnectFailure.PASSCODE_NEEDED:
+            self._ask_passcode(connection, error)
+            return
         # The key is encrypted and either no passphrase was given or the one
         # we had is wrong; either way the user can still get connected.
         rejected = kind is ConnectFailure.PASSPHRASE_REJECTED
@@ -231,6 +285,34 @@ class SessionLifecycle(QObject):
             )
             return
         self._open(connection, passphrase)
+
+    def _ask_password(self, connection: str, kind: ConnectFailure, error: QueryError) -> None:
+        """No password is configured, or the one the user typed was turned down."""
+        rejected = error.message if kind is ConnectFailure.PASSWORD_REJECTED else None
+        self._move(SessionStatus(Phase.AWAITING_PASSWORD, connection))
+        assert self.prompter is not None, "a password connection needs a prompter"
+        credentials = self.prompter.ask_password(connection, rejected)
+        if credentials is None or not credentials.password:
+            self._move(SessionStatus(Phase.DISCONNECTED, connection))
+            self.notice.emit(f"Connection to {connection} cancelled: a password is required.")
+            return
+        self._open(connection, None, credentials)
+
+    def _ask_passcode(self, connection: str, error: QueryError) -> None:
+        """The configured password worked; Snowflake wants an MFA passcode too.
+
+        The password stays where it is: only the passcode is sent, and the
+        connector takes the password from the file as before.
+        """
+        self._move(SessionStatus(Phase.AWAITING_PASSCODE, connection))
+        assert self.prompter is not None, "an MFA connection needs a prompter"
+        passcode = self.prompter.ask_passcode(connection, error.message)
+        if not passcode:
+            self._move(SessionStatus(Phase.DISCONNECTED, connection))
+            self.notice.emit(f"Connection to {connection} cancelled: an MFA passcode is required.")
+            return
+        self._move(SessionStatus(Phase.CONNECTING, connection))
+        self.worker.submit(ConnectJob(params=ConnectParams(name=connection, passcode=passcode)))
 
     def _on_session_lost(self, connection: str, message: str) -> None:
         """Any lane may report this, and several may report the same loss."""

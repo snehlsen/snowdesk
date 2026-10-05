@@ -26,7 +26,10 @@ from snowdesk.db import profile
 from snowdesk.db import stages as stage_ops
 from snowdesk.db.errors import (
     is_bad_private_key_passphrase,
+    is_mfa_refused,
+    is_rejected_password,
     is_session_lost,
+    needs_password,
     needs_private_key_passphrase,
     to_query_error,
 )
@@ -445,7 +448,8 @@ class SnowflakeWorker(QObject):
         try:
             ctx = self.session.connect(params)
         except Exception as exc:
-            self.connect_failed.emit(params.name, _connect_failure(exc), to_query_error(exc))
+            kind = _connect_failure(exc, params)
+            self.connect_failed.emit(params.name, kind, to_query_error(exc))
             log.info("Connect to %s failed: %s", params.name, exc)
             return
         self.connected.emit(params.name, ctx, self.session.should_hint_id_token())
@@ -857,11 +861,22 @@ def _list_children(conn: Connection, path: tuple[str, ...]) -> list[ObjectNode]:
     return browse.list_columns(conn, path[0], path[1], path[2])
 
 
-def _connect_failure(exc: BaseException) -> ConnectFailure:
+def _connect_failure(exc: BaseException, params: ConnectParams) -> ConnectFailure:
     if is_bad_private_key_passphrase(exc):
         return ConnectFailure.PASSPHRASE_REJECTED
     if needs_private_key_passphrase(exc):
         return ConnectFailure.PASSPHRASE_NEEDED
+    if needs_password(exc):
+        return ConnectFailure.PASSWORD_NEEDED
+    # Only a password SnowDesk asked for counts as rejected: a wrong one in
+    # connections.toml is the file's to fix, and prompting over it would hide
+    # that the file is wrong.
+    if params.password and is_rejected_password(exc):
+        return ConnectFailure.PASSWORD_REJECTED
+    # The password came from the file and got past Snowflake; only the MFA
+    # step is missing, and a passcode is the one thing the file cannot hold.
+    if is_mfa_refused(exc):
+        return ConnectFailure.PASSCODE_NEEDED
     return ConnectFailure.ERROR
 
 

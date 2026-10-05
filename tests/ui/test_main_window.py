@@ -7,7 +7,7 @@ import sys
 import pytest
 from PySide6.QtCore import QPoint
 from PySide6.QtGui import QAction
-from PySide6.QtWidgets import QLabel
+from PySide6.QtWidgets import QDialog, QLabel
 
 from snowdesk.controllers.browser import BrowserController
 from snowdesk.controllers.query import QueryController
@@ -18,6 +18,7 @@ from snowdesk.db.worker import SnowflakeWorker
 from snowdesk.storage.history import HistoryStore
 from snowdesk.storage.workspace import WorkspaceStore
 from snowdesk.ui import preferences, theme
+from snowdesk.ui.dialogs import PasscodeDialog, PasswordDialog
 from snowdesk.ui.editor import SqlEditor
 from snowdesk.ui.editor_tabs import SaveAnswer
 from snowdesk.ui.main_window import CONTROL_SPACING, WINDOW_MARGIN, MainWindow
@@ -1191,3 +1192,161 @@ def test_a_failed_browse_is_logged_in_full(harness: Harness) -> None:
     log = harness.window.messages.toPlainText()
     assert "Could not load RAW: [2003] (SQLSTATE 02000) SQL compilation error:" in log
     assert "Query ID: 01b0-0042" in log
+
+
+# -- password and MFA connections with no password configured -----------------
+
+
+@pytest.fixture
+def mfa_harness(qtbot, tmp_path, monkeypatch):
+    """An MFA connection with no password in the file; 'right' signs in."""
+    cfg = tmp_path / "snowflake"
+    cfg.mkdir()
+    (cfg / "config.toml").write_text(
+        'default_connection_name = "mfa"\n'
+        "[connections.mfa]\n"
+        'account = "a"\n'
+        'user = "u"\n'
+        'authenticator = "username_password_mfa"\n'
+        "client_request_mfa_token = true\n"
+    )
+    monkeypatch.setenv("SNOWFLAKE_HOME", str(cfg))
+    monkeypatch.delenv("SNOWFLAKE_DEFAULT_CONNECTION_NAME", raising=False)
+
+    conn = FakeConnection()
+    attempts: list = []
+
+    def connect_fn(params):
+        attempts.append(params)
+        if params.password is None:
+            raise FakeProgrammingError("Password is empty", errno=251006)
+        if params.password != "right":
+            raise FakeProgrammingError(
+                "Incorrect username or password was specified.", errno=390100
+            )
+        return conn
+
+    lanes = Lanes.synchronous()
+    worker = SnowflakeWorker(session=SnowflakeSession(connect_fn=connect_fn), lanes=lanes)
+    lifecycle = SessionLifecycle(worker)
+    history = HistoryStore(tmp_path / "history.db")
+    window = MainWindow(
+        worker=worker,
+        lifecycle=lifecycle,
+        query=QueryController(worker, lifecycle, history=history),
+        browser=BrowserController(worker, lifecycle),
+        history=history,
+        workspace=WorkspaceStore(tmp_path / "workspace.json"),
+    )
+    qtbot.addWidget(window)
+    yield Harness(window, worker, lanes, conn), attempts
+    history.close()
+
+
+def answer_password(monkeypatch, *replies):
+    """Queue answers for the password dialog; each is (password, passcode) or None."""
+    shown: list[PasswordDialog] = []
+    answers = iter(replies)
+
+    def fake_exec(dialog):
+        shown.append(dialog)
+        reply = next(answers)
+        if reply is None:
+            return QDialog.DialogCode.Rejected
+        dialog.password_edit.setText(reply[0])
+        dialog.passcode_edit.setText(reply[1])
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(PasswordDialog, "exec", fake_exec)
+    return shown
+
+
+def test_an_mfa_connection_without_a_password_prompts_and_connects(
+    mfa_harness, monkeypatch
+) -> None:
+    harness, attempts = mfa_harness
+    shown = answer_password(monkeypatch, ("right", "123456"))
+    harness.window._on_connect_clicked()
+
+    assert harness.window.lifecycle.is_connected
+    assert shown[0].mfa
+    assert (attempts[-1].password, attempts[-1].passcode) == ("right", "123456")
+    # The dialog let go of what was typed once it had been read.
+    assert shown[0].password_edit.text() == ""
+    assert shown[0].passcode_edit.text() == ""
+
+
+def test_the_password_never_reaches_the_messages_pane(mfa_harness, monkeypatch) -> None:
+    harness, _attempts = mfa_harness
+    answer_password(monkeypatch, ("hunter2", "654321"), ("right", ""))
+    harness.window._on_connect_clicked()
+    assert harness.window.lifecycle.is_connected
+    text = harness.window.messages.toPlainText()
+    assert "hunter2" not in text and "654321" not in text
+
+
+def test_cancelling_the_password_says_why(mfa_harness, monkeypatch) -> None:
+    harness, _attempts = mfa_harness
+    answer_password(monkeypatch, None)
+    harness.window._on_connect_clicked()
+    assert not harness.window.lifecycle.is_connected
+    assert "Password required" in harness.window.statusBar().currentMessage()
+
+
+def test_a_configured_password_prompts_for_the_passcode_only(qtbot, tmp_path, monkeypatch) -> None:
+    cfg = tmp_path / "snowflake"
+    cfg.mkdir()
+    (cfg / "config.toml").write_text(
+        'default_connection_name = "mfa"\n'
+        "[connections.mfa]\n"
+        'account = "a"\n'
+        'user = "u"\n'
+        'authenticator = "username_password_mfa"\n'
+    )
+    monkeypatch.setenv("SNOWFLAKE_HOME", str(cfg))
+    monkeypatch.delenv("SNOWFLAKE_DEFAULT_CONNECTION_NAME", raising=False)
+    conn = FakeConnection()
+    attempts: list = []
+
+    def connect_fn(params):
+        attempts.append(params)
+        if params.passcode != "123456":
+            raise FakeProgrammingError(
+                "Failed to connect to DB: example.snowflakecomputing.com:443. "
+                "Failed to authenticate: MFA with TOTP is required.",
+                errno=394508,
+                sqlstate="08001",
+            )
+        return conn
+
+    worker = SnowflakeWorker(
+        session=SnowflakeSession(connect_fn=connect_fn), lanes=Lanes.synchronous()
+    )
+    lifecycle = SessionLifecycle(worker)
+    history = HistoryStore(tmp_path / "history.db")
+    window = MainWindow(
+        worker=worker,
+        lifecycle=lifecycle,
+        query=QueryController(worker, lifecycle, history=history),
+        browser=BrowserController(worker, lifecycle),
+        history=history,
+        workspace=WorkspaceStore(tmp_path / "workspace.json"),
+    )
+    qtbot.addWidget(window)
+    shown: list = []
+
+    def fake_exec(dialog):
+        shown.append(dialog)
+        dialog.passcode_edit.setText("123456")
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(PasscodeDialog, "exec", fake_exec)
+    monkeypatch.setattr(PasswordDialog, "exec", lambda _d: pytest.fail("asked for the password"))
+    try:
+        window._on_connect_clicked()
+        assert window.lifecycle.is_connected
+        assert len(shown) == 1 and shown[0].passcode_edit.text() == ""
+        assert (attempts[-1].password, attempts[-1].passcode) == (None, "123456")
+        assert "123456" not in window.messages.toPlainText()
+    finally:
+        history.close()

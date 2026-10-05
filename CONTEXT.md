@@ -19,7 +19,7 @@ A Session that ended without being asked to, such as a network drop or an expire
 _Avoid_: dropped connection, disconnect
 
 **Session lifecycle**:
-The life of one Session, from connecting (including any passphrase prompt) through to it being ended or lost.
+The life of one Session, from connecting (including any passphrase, password or MFA passcode prompt) through to it being ended or lost.
 
 **Settle**:
 To commit or roll back an open Transaction before something that cannot happen while it is open: ending its Session (Disconnect, Reconnect, quitting) or switching its Commit mode.

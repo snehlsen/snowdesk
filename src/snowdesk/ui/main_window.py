@@ -86,6 +86,8 @@ _STATE_DOT = {
     Phase.DISCONNECTED: ("○", "#8a8f98", "Disconnected"),
     Phase.CONNECTING: ("◐", "#a15c00", "Connecting…"),
     Phase.AWAITING_PASSPHRASE: ("◐", "#a15c00", "Waiting for passphrase…"),
+    Phase.AWAITING_PASSWORD: ("◐", "#a15c00", "Waiting for password…"),
+    Phase.AWAITING_PASSCODE: ("◐", "#a15c00", "Waiting for MFA passcode…"),
     Phase.CONNECTED: ("●", "#1a7f37", "Connected"),
     Phase.LOST: ("●", "#e5534b", "Connection lost"),
     Phase.FAILED: ("●", "#e5534b", "Error"),
@@ -160,7 +162,7 @@ class MainWindow(QMainWindow):
         self._connect_signals()
 
         if lifecycle.prompter is None:
-            lifecycle.prompter = DialogPrompter(self, self._key_file)
+            lifecycle.prompter = DialogPrompter(self, lambda name: self._connections.get(name))
         self._populate_connections()
         self._apply_saved_preferences()
         self._on_session_changed(lifecycle.status)
@@ -737,10 +739,6 @@ class MainWindow(QMainWindow):
         if name:
             self.lifecycle.start(name)
 
-    def _key_file(self, connection: str) -> str | None:
-        info = self._connections.get(connection)
-        return info.private_key_file if info else None
-
     def _on_session_changed(self, status: SessionStatus) -> None:
         """Render the Session, and act on the transition that just happened."""
         was, self._shown = self._shown, status
@@ -748,10 +746,7 @@ class MainWindow(QMainWindow):
         self.state_label.setText(f'<span style="color:{color}">{glyph}</span> {text}')
         connected = status.is_connected
         self.connect_button.setText("Disconnect" if connected else "Connect")
-        self.connect_button.setEnabled(
-            bool(self._connections)
-            and status.phase not in (Phase.CONNECTING, Phase.AWAITING_PASSPHRASE)
-        )
+        self.connect_button.setEnabled(bool(self._connections) and not status.is_opening)
         self.run_button.setEnabled(connected and not self.query.is_running)
         self._render_transaction()
 
@@ -783,6 +778,10 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Disconnected", 6000)
         elif status.phase is Phase.DISCONNECTED and was.phase is Phase.AWAITING_PASSPHRASE:
             self.statusBar().showMessage("Passphrase required to connect", 6000)
+        elif status.phase is Phase.DISCONNECTED and was.phase is Phase.AWAITING_PASSWORD:
+            self.statusBar().showMessage("Password required to connect", 6000)
+        elif status.phase is Phase.DISCONNECTED and was.phase is Phase.AWAITING_PASSCODE:
+            self.statusBar().showMessage("MFA passcode required to connect", 6000)
 
     def _set_context(self, ctx: SessionContext) -> None:
         self._context = ctx
