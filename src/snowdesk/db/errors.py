@@ -71,6 +71,57 @@ def is_bad_private_key_passphrase(exc: BaseException) -> bool:
     return any(marker in text for marker in _BAD_PASSPHRASE_MARKERS)
 
 
+#: The connector's ``ER_NO_PASSWORD``: a password authenticator (``snowflake``,
+#: ``username_password_mfa``) found no password in the configuration.  Raised
+#: before anything is sent, so asking for one and trying again costs nothing.
+_NO_PASSWORD_ERRNO = 251006
+
+#: Snowflake's answer to a wrong user or password.
+_WRONG_PASSWORD_ERRNO = 390100
+_WRONG_PASSWORD_MARKER = "incorrect username or password"
+#: The MFA refusals: ``390120`` to ``390132`` are the ``EXT_AUTHN_*`` family
+#: (a wrong passcode, a denied or timed-out push), and ``394508`` is "MFA with
+#: TOTP is required".
+_MFA_REFUSED_ERRNOS = frozenset({*range(390120, 390133), 394508})
+#: The same refusals by wording, for codes this list has not caught up with.
+#: Phrases only a sign-in failure uses: every failed login comes back as
+#: SQLSTATE 08001 and "Failed to connect to DB", and the connector reports a
+#: failed Duo push under the network errno 250001, so neither the code nor
+#: the state can tell an MFA refusal from a dropped network.
+_MFA_REFUSED_MARKERS = ("passcode", "totp", "mfa authentication failed", "duo security")
+
+
+def needs_password(exc: BaseException) -> bool:
+    """True when connecting failed only because no password was configured."""
+    return getattr(exc, "errno", None) == _NO_PASSWORD_ERRNO
+
+
+def _message(exc: BaseException) -> str:
+    return str(getattr(exc, "raw_msg", None) or exc).lower()
+
+
+def is_wrong_password(exc: BaseException) -> bool:
+    """True when Snowflake turned down the user or password."""
+    if getattr(exc, "errno", None) == _WRONG_PASSWORD_ERRNO:
+        return True
+    return _WRONG_PASSWORD_MARKER in _message(exc)
+
+
+def is_mfa_refused(exc: BaseException) -> bool:
+    """True when the password was fine but the MFA step was not."""
+    errno = getattr(exc, "errno", None)
+    if isinstance(errno, int) and errno in _MFA_REFUSED_ERRNOS:
+        return True
+    if is_wrong_password(exc):
+        return False
+    return any(marker in _message(exc) for marker in _MFA_REFUSED_MARKERS)
+
+
+def is_rejected_password(exc: BaseException) -> bool:
+    """True when Snowflake turned down the password or the MFA passcode."""
+    return is_wrong_password(exc) or is_mfa_refused(exc)
+
+
 #: Snowflake error codes that mean the session is gone rather than the
 #: statement being wrong.
 _SESSION_LOST_ERRNOS = frozenset(

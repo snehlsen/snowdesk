@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from snowdesk.controllers.session_lifecycle import SessionLifecycle
+    from snowdesk.model import Credentials
 
 
 class FakeProgrammingError(Exception):
@@ -476,17 +477,39 @@ class FakeStages:
 class ScriptedPrompter:
     """Answers the Session lifecycle's questions from a script, and records them."""
 
-    def __init__(self, passphrases: tuple[str | None, ...] = (), settle: bool | None = None):
+    def __init__(
+        self,
+        passphrases: tuple[str | None, ...] = (),
+        settle: bool | None = None,
+        passwords: tuple[Credentials | None, ...] = (),
+        passcodes: tuple[str | None, ...] = (),
+    ):
         #: Answers to the passphrase prompt, in order; None (or running out) gives up.
         self.passphrases = list(passphrases)
+        #: Answers to the password prompt, likewise.
+        self.passwords = list(passwords)
+        #: Answers to the passcode-only prompt, likewise.
+        self.passcodes = list(passcodes)
+        #: (connection, Snowflake's reason) for each passcode-only question.
+        self.passcode_questions: list[tuple[str, str]] = []
         #: The answer to every Settle question: Commit, Roll back, or None to cancel.
         self.settle = settle
         self.passphrase_questions: list[tuple[str, bool]] = []
+        #: (connection, Snowflake's reason for the last rejection or None).
+        self.password_questions: list[tuple[str, str | None]] = []
         self.settle_questions: list[str] = []
 
     def ask_passphrase(self, connection: str, rejected: bool) -> str | None:
         self.passphrase_questions.append((connection, rejected))
         return self.passphrases.pop(0) if self.passphrases else None
+
+    def ask_password(self, connection: str, rejected: str | None) -> Credentials | None:
+        self.password_questions.append((connection, rejected))
+        return self.passwords.pop(0) if self.passwords else None
+
+    def ask_passcode(self, connection: str, reason: str) -> str | None:
+        self.passcode_questions.append((connection, reason))
+        return self.passcodes.pop(0) if self.passcodes else None
 
     def ask_settle(self, reason: str) -> bool | None:
         self.settle_questions.append(reason)

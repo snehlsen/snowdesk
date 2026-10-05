@@ -46,10 +46,10 @@ Priority: **P0** is required for v1, **P1** is expected for v1 but can slip, **P
 |----|-------------|-----|
 | C1 | Read connection names from the connector's `connections.toml` (same file as `snow` CLI) and list them in a picker. | P0 |
 | C2 | Preselect the default connection (`default_connection_name` in `config.toml`, or `SNOWFLAKE_DEFAULT_CONNECTION_NAME`). | P0 |
-| C3 | Support `snowflake` (password), `snowflake_jwt` (key-pair), and `externalbrowser` (SSO) authenticators as configured in the file. | P0 |
+| C3 | Support `snowflake` (password), `username_password_mfa` (password plus MFA), `snowflake_jwt` (key-pair), and `externalbrowser` (SSO) authenticators as configured in the file. | P0 |
 | C4 | Cache SSO tokens in the macOS Keychain so the browser flow is not repeated on every connect. | P0 |
 | C5 | Keep the session alive while the app is open. | P0 |
-| C6 | Show the Session's state (disconnected, connecting, waiting for a passphrase, connected, lost, failed) and allow reconnect. | P0 |
+| C6 | Show the Session's state (disconnected, connecting, waiting for a passphrase, password or MFA passcode, connected, lost, failed) and allow reconnect. | P0 |
 | C7 | Allow overriding role and warehouse at connect time from the UI. | P1 |
 | C8 | Create or edit connections from within the app. | P2 |
 
@@ -110,7 +110,7 @@ Priority: **P0** is required for v1, **P1** is expected for v1 but can slip, **P
 
 **Memory.** With the default row cap, the app should stay under roughly 1 GB for typical result widths. Rows are stored as tuples, not dicts or DataFrames.
 
-**Security.** The app never stores passwords or private-key passphrases itself; they stay in `connections.toml` (which must be `chmod 600`) or in the Keychain via the connector's own token cache. Query history is stored locally and can be cleared. No telemetry.
+**Security.** The app never stores passwords or private-key passphrases itself; they stay in `connections.toml` (which must be `chmod 600`) or in the Keychain via the connector's own token cache. When a key is encrypted, the app asks for its passphrase at connect time and holds it in memory for the run only, dropping it as soon as it is rejected. When a password (or `username_password_mfa`) Connection has no password configured, the app asks for the password and MFA passcode on every connect and keeps neither beyond that one sign-in. When the password is configured but Snowflake still wants an MFA passcode, the app asks for the passcode alone, on every connect, and never keeps it. Query history is stored locally and can be cleared. No telemetry.
 
 **Compatibility.** macOS 15+ on Apple silicon for v1, the oldest release PySide6's binaries are built for (see `LSMinimumSystemVersion` in `packaging/snowdesk.spec`). Intel builds are optional.
 

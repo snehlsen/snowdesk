@@ -160,7 +160,28 @@ class ConnectFailure(StrEnum):
     PASSPHRASE_NEEDED = "passphrase needed"
     #: The private key is encrypted and the passphrase given was wrong.
     PASSPHRASE_REJECTED = "passphrase rejected"
+    #: The Connection signs in with a password and none is configured.
+    PASSWORD_NEEDED = "password needed"
+    #: Snowflake turned down the password or MFA passcode SnowDesk asked for.
+    PASSWORD_REJECTED = "password rejected"
+    #: The configured password was accepted but Snowflake wants an MFA passcode
+    #: (or turned down the one SnowDesk asked for).
+    PASSCODE_NEEDED = "passcode needed"
     ERROR = "error"
+
+
+@dataclass(frozen=True, slots=True)
+class Credentials:
+    """What the user typed into the password prompt.
+
+    ``repr=False`` keeps both out of logs and tracebacks; neither is ever
+    written to disk (spec 5, Security).
+    """
+
+    password: str = field(repr=False)
+    #: A one-time MFA passcode.  ``None`` lets Snowflake fall back to a cached
+    #: MFA token or a push to the user's phone.
+    passcode: str | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True)

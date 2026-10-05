@@ -60,6 +60,12 @@ class ConnectParams:
     #: time.  ``repr=False`` keeps it out of logs and tracebacks; it is never
     #: written to disk (spec 5, Security).
     private_key_passphrase: str | None = field(default=None, repr=False)
+    #: Password for a password or MFA Connection that has none configured,
+    #: asked for at connect time.  Kept out of ``repr`` and off disk, like the
+    #: passphrase.
+    password: str | None = field(default=None, repr=False)
+    #: One-time MFA passcode, sent with this one connect and never kept.
+    passcode: str | None = field(default=None, repr=False)
 
 
 def _default_connect(params: ConnectParams) -> Connection:
@@ -73,6 +79,8 @@ def _default_connect(params: ConnectParams) -> Connection:
             "role": params.role,
             "warehouse": params.warehouse,
             "private_key_file_pwd": params.private_key_passphrase,
+            "password": params.password,
+            "passcode": params.passcode,
         }.items()
         if value
     }
@@ -125,7 +133,8 @@ class SnowflakeSession:
         elapsed = time.monotonic() - started
         if elapsed > self.BROWSER_PROMPT_SECONDS:
             self._slow_auth_count += 1
-        self._params = params
+        # The connector has what it needs; keep neither secret past the connect.
+        self._params = replace(params, password=None, passcode=None)
         return self.read_context()
 
     def close(self) -> None:

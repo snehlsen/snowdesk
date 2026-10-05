@@ -18,7 +18,7 @@ from snowdesk.db.lanes import Lanes
 from snowdesk.db.session import ConnectParams, SnowflakeSession
 from snowdesk.db.splitter import split_sql
 from snowdesk.db.worker import RunScriptJob, SnowflakeWorker
-from snowdesk.model import ObjectNode, StageKind, StageRef
+from snowdesk.model import Credentials, ObjectNode, StageKind, StageRef
 from tests.fakes import (
     FakeConnection,
     FakeProgrammingError,
@@ -190,6 +190,163 @@ def test_a_rejected_passphrase_is_forgotten(qapp, conn) -> None:
     start_session(app.lifecycle)
     assert app.prompter.passphrase_questions[-1] == ("dev", True)
     assert app.lifecycle.is_connected
+
+
+# -- password and MFA connections with no password configured -----------------
+
+
+EMPTY_PASSWORD = FakeProgrammingError("Password is empty", errno=251006)
+WRONG_PASSWORD = FakeProgrammingError("Incorrect username or password was specified.", errno=390100)
+
+
+def password_account(attempts: list[ConnectParams], conn: FakeConnection):
+    """A connect function for an account that only 'right' signs in to."""
+
+    def connect_fn(params: ConnectParams) -> FakeConnection:
+        attempts.append(params)
+        if params.password is None:
+            raise EMPTY_PASSWORD
+        if params.password != "right":
+            raise WRONG_PASSWORD
+        return conn
+
+    return connect_fn
+
+
+def test_a_missing_password_asks_for_it_then_connects(qapp, conn) -> None:
+    attempts: list[ConnectParams] = []
+    app = App(
+        password_account(attempts, conn),
+        ScriptedPrompter(passwords=(Credentials("right", "123456"),)),
+    )
+    start_session(app.lifecycle)
+    assert app.prompter.password_questions == [("dev", None)]
+    assert Phase.AWAITING_PASSWORD in [c.phase for c in app.changes]
+    assert app.lifecycle.is_connected
+    assert (attempts[-1].password, attempts[-1].passcode) == ("right", "123456")
+    assert app.prompter.passphrase_questions == []
+
+
+def test_a_wrong_password_asks_again_with_snowflakes_reason(qapp, conn) -> None:
+    attempts: list[ConnectParams] = []
+    app = App(
+        password_account(attempts, conn),
+        ScriptedPrompter(passwords=(Credentials("nope"), Credentials("right"))),
+    )
+    start_session(app.lifecycle)
+    assert app.prompter.password_questions == [
+        ("dev", None),
+        ("dev", "Incorrect username or password was specified."),
+    ]
+    assert app.lifecycle.is_connected
+
+
+def test_cancelling_the_password_leaves_it_disconnected_and_retryable(qapp, conn) -> None:
+    attempts: list[ConnectParams] = []
+    app = App(password_account(attempts, conn), ScriptedPrompter(passwords=(None,)))
+    start_session(app.lifecycle)
+    assert app.phase is Phase.DISCONNECTED
+    assert any("password is required" in n for n in app.notices)
+
+    app.prompter.passwords = [Credentials("right")]
+    start_session(app.lifecycle)
+    assert app.lifecycle.is_connected
+
+
+def test_every_connect_asks_for_the_password_and_passcode(qapp, conn) -> None:
+    """Nothing typed into the prompt outlives the connect it was typed for."""
+    attempts: list[ConnectParams] = []
+    app = App(
+        password_account(attempts, conn),
+        ScriptedPrompter(
+            passwords=(
+                Credentials("right", "111111"),
+                Credentials("right", "222222"),
+                Credentials("right", "333333"),
+            )
+        ),
+    )
+    start_session(app.lifecycle)
+    app.lifecycle.end()
+    start_session(app.lifecycle)
+    app.lifecycle.reconnect()
+    assert app.prompter.password_questions == [("dev", None)] * 3
+    assert [a.passcode for a in attempts if a.password] == ["111111", "222222", "333333"]
+    # Each connect went out without a password first, so none was held over.
+    assert [a.password for a in attempts] == [None, "right"] * 3
+    assert app.lifecycle.is_connected
+
+
+# -- MFA connections with the password in the config file --------------------
+
+
+TOTP_NEEDED = FakeProgrammingError(
+    "Failed to connect to DB: example.snowflakecomputing.com:443. "
+    "Failed to authenticate: MFA with TOTP is required.",
+    errno=394508,
+    sqlstate="08001",
+)
+BAD_PASSCODE = FakeProgrammingError(
+    "Failed to connect to DB: example.snowflakecomputing.com:443. "
+    "Incorrect passcode was specified.",
+    errno=390127,
+    sqlstate="08001",
+)
+
+
+def configured_password(attempts: list[ConnectParams], conn: FakeConnection):
+    """The password is in the file; Snowflake still wants passcode '123456'."""
+
+    def connect_fn(params: ConnectParams) -> FakeConnection:
+        attempts.append(params)
+        if params.passcode is None:
+            raise TOTP_NEEDED
+        if params.passcode != "123456":
+            raise BAD_PASSCODE
+        return conn
+
+    return connect_fn
+
+
+def test_a_configured_password_asks_only_for_the_passcode(qapp, conn) -> None:
+    attempts: list[ConnectParams] = []
+    app = App(configured_password(attempts, conn), ScriptedPrompter(passcodes=("123456",)))
+    start_session(app.lifecycle)
+    assert app.prompter.passcode_questions == [("dev", TOTP_NEEDED.msg)]
+    assert app.prompter.password_questions == []
+    assert Phase.AWAITING_PASSCODE in [c.phase for c in app.changes]
+    assert app.lifecycle.is_connected
+    # The file's password is left to the connector: SnowDesk never sends one.
+    assert [(a.password, a.passcode) for a in attempts] == [(None, None), (None, "123456")]
+
+
+def test_a_wrong_passcode_asks_again_with_snowflakes_reason(qapp, conn) -> None:
+    attempts: list[ConnectParams] = []
+    app = App(configured_password(attempts, conn), ScriptedPrompter(passcodes=("000000", "123456")))
+    start_session(app.lifecycle)
+    assert [reason for _c, reason in app.prompter.passcode_questions] == [
+        TOTP_NEEDED.msg,
+        BAD_PASSCODE.msg,
+    ]
+    assert app.lifecycle.is_connected
+
+
+def test_cancelling_the_passcode_leaves_it_disconnected(qapp, conn) -> None:
+    attempts: list[ConnectParams] = []
+    app = App(configured_password(attempts, conn), ScriptedPrompter(passcodes=(None,)))
+    start_session(app.lifecycle)
+    assert app.phase is Phase.DISCONNECTED
+    assert any("MFA passcode is required" in n for n in app.notices)
+
+
+def test_every_connect_asks_for_a_fresh_passcode(qapp, conn) -> None:
+    attempts: list[ConnectParams] = []
+    app = App(configured_password(attempts, conn), ScriptedPrompter(passcodes=("123456", "123456")))
+    start_session(app.lifecycle)
+    app.lifecycle.end()
+    start_session(app.lifecycle)
+    assert len(app.prompter.passcode_questions) == 2
+    assert attempts[-2].passcode is None  # nothing held over from the first connect
 
 
 # -- losing the Session (spec 9) ----------------------------------------------
