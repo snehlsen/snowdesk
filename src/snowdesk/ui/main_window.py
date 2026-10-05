@@ -46,18 +46,12 @@ from snowdesk.controllers.session_lifecycle import Phase, SessionLifecycle, Sess
 from snowdesk.controllers.stages import StageController
 from snowdesk.db import profile
 from snowdesk.db.identifiers import qualify
-from snowdesk.db.worker import (
-    EndTransactionJob,
-    ProfileJob,
-    SetAutocommitJob,
-    SnowflakeWorker,
-)
+from snowdesk.db.worker import ProfileJob, SnowflakeWorker
 from snowdesk.model import (
     ColumnInfo,
     RunStatus,
     SessionContext,
     StatementOutcome,
-    TransactionState,
 )
 from snowdesk.storage.history import HistoryStore
 from snowdesk.storage.workspace import WorkspaceStore
@@ -150,9 +144,6 @@ class MainWindow(QMainWindow):
         self._in_close_event = False
         #: The user already chose Stop and Quit for the running transfer.
         self._quit_during_transfer = False
-        self._transaction = TransactionState()
-        #: When the open transaction was first seen, for its elapsed time.
-        self._transaction_since: datetime | None = None
 
         self._build_toolbar()
         self._build_banner()
@@ -650,6 +641,8 @@ class MainWindow(QMainWindow):
     def _connect_signals(self) -> None:
         self.lifecycle.changed.connect(self._on_session_changed)
         self.lifecycle.notice.connect(self._log_message)
+        self.lifecycle.transaction_changed.connect(lambda _state: self._render_transaction())
+        self.lifecycle.transaction_ended.connect(self._on_transaction_ended)
 
         w = self.worker
         w.context_changed.connect(self._set_context)
@@ -665,9 +658,6 @@ class MainWindow(QMainWindow):
         w.export_finished.connect(self._on_export_finished)
         w.export_failed.connect(self._on_export_failed)
         w.export_cancelled.connect(self._on_export_cancelled)
-        w.transaction_changed.connect(self._on_transaction_changed)
-        w.transaction_ended.connect(self._on_transaction_ended)
-        w.autocommit_failed.connect(self._on_autocommit_failed)
 
         self.query.run_started.connect(self._on_run_started)
         self.query.run_finished.connect(self._on_run_finished)
@@ -847,19 +837,13 @@ class MainWindow(QMainWindow):
 
     # -- transactions (Q10) --------------------------------------------------
 
-    def _on_transaction_changed(self, state: TransactionState) -> None:
-        if state.transaction_id != self._transaction.transaction_id:
-            self._transaction_since = datetime.now() if state.in_transaction else None
-        self._transaction = state
-        self._render_transaction()
-
     def _render_transaction(self) -> None:
         """Show the session's commit mode, as last read back from it."""
-        state = self._transaction
+        state = self.lifecycle.transaction
         button = self.commit_button
         self._set_status_visible(button, self.lifecycle.is_connected)
         if state.in_transaction:
-            since = self._transaction_since or datetime.now()
+            since = state.opened_at or datetime.now()
             elapsed = _elapsed_minutes(datetime.now() - since)
             text = f"Transaction open · {elapsed}" if elapsed else "Transaction open"
             button.setIcon(self._transaction_dot)
@@ -889,32 +873,28 @@ class MainWindow(QMainWindow):
         self._update_transaction_actions()
 
     def _update_transaction_actions(self) -> None:
-        ready = self.lifecycle.is_connected and not self.query.is_running
-        in_transaction = ready and self._transaction.in_transaction
+        idle = not self.query.is_running
+        ready = self.lifecycle.is_connected and idle
+        can_end = idle and self.lifecycle.can_end_transaction
         self.autocommit_action.setEnabled(ready)
         self.manual_commit_action.setEnabled(ready)
-        self.commit_action.setEnabled(in_transaction)
-        self.rollback_action.setEnabled(in_transaction)
+        self.commit_action.setEnabled(can_end)
+        self.rollback_action.setEnabled(can_end)
 
     def set_autocommit(self, enabled: bool) -> None:
         """Switch the session's commit mode, ending any open transaction first."""
         # The click has already moved the check mark; put it back until the
         # session says the mode really changed.
         self._render_transaction()
-        if self._transaction.autocommit is enabled:
-            return
-        self.lifecycle.settle(
-            "The commit mode can only change once the open transaction has ended.",
-            then=lambda: self.worker.submit(SetAutocommitJob(enabled=enabled)),
-        )
+        self.lifecycle.set_commit_mode(enabled)
 
     def commit_transaction(self) -> None:
-        self.worker.submit(EndTransactionJob(commit=True))
-        self.statusBar().showMessage("Committing…")
+        if self.lifecycle.commit():
+            self.statusBar().showMessage("Committing…")
 
     def rollback_transaction(self) -> None:
-        self.worker.submit(EndTransactionJob(commit=False))
-        self.statusBar().showMessage("Rolling back…")
+        if self.lifecycle.roll_back():
+            self.statusBar().showMessage("Rolling back…")
 
     def _on_transaction_ended(self, outcome: StatementOutcome) -> None:
         sql = outcome.statement.sql
@@ -929,10 +909,6 @@ class MainWindow(QMainWindow):
         if outcome.query_id:
             self._last_query_id = outcome.query_id
             self._set_status_segment(self.qid_label, outcome.query_id)
-
-    def _on_autocommit_failed(self, message: str) -> None:
-        self._log_message(f"Could not change the commit mode: {message}")
-        self.statusBar().showMessage("Commit mode unchanged — see Messages", 6000)
 
     # -- results -----------------------------------------------------------
 
