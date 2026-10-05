@@ -2,9 +2,9 @@
 
 ``snowdesk --selftest`` verifies that a build can actually load everything
 SnowDesk needs at runtime: Qt, the connector and its compiled Arrow reader, the
-crypto stack used for key-pair auth, and the CA bundle.  Copying a file into a
-bundle is not the same as being able to import it, and PyInstaller failures
-show up exactly here.
+crypto stack used for key-pair auth, the Keychain token cache, and the CA
+bundle.  Copying a file into a bundle is not the same as being able to import
+it, and PyInstaller failures show up exactly here.
 
 With ``--connection NAME`` it goes on to open a session and run
 ``SELECT CURRENT_VERSION()``, which is the M0 exit criterion in full.
@@ -98,6 +98,27 @@ def _check_crypto() -> str:
     return "RSA key encrypt/decrypt round-trip"
 
 
+def _check_token_cache() -> str:
+    """Where the connector keeps SSO, MFA and OAuth tokens (C4).
+
+    Without keyring the connector quietly caches nothing, which costs a browser
+    window on every connect rather than an error.  And keyring finds its macOS
+    backend through package metadata, which a bundle can lose while the import
+    still works.  Only the backend is looked up; the Keychain is not touched.
+    """
+    import keyring
+    from keyring.backends import fail
+    from snowflake.connector.token_cache import KeyringTokenCache, TokenCache
+
+    cache = TokenCache.make()
+    if not isinstance(cache, KeyringTokenCache):
+        raise RuntimeError(f"the connector would use {type(cache).__name__}, which caches nothing")
+    backend = keyring.get_keyring()
+    if isinstance(backend, fail.Keyring):
+        raise RuntimeError("keyring found no usable backend")
+    return f"{type(backend).__module__}.{type(backend).__name__}"
+
+
 def _check_tls() -> str:
     import ssl
 
@@ -137,6 +158,7 @@ CHECKS: list[tuple[str, Callable[[], str]]] = [
     ("Arrow result reader", _check_arrow),
     ("Crypto (key-pair auth)", _check_crypto),
     ("Stage transfers (PUT/GET)", _check_transfer),
+    ("Token cache (Keychain)", _check_token_cache),
     ("TLS trust store", _check_tls),
     ("SQLite history", _check_sqlite),
     ("Connection config", _check_config),
