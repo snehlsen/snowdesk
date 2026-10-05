@@ -694,8 +694,6 @@ class MainWindow(QMainWindow):
         self.stage_panel.run_requested.connect(self._run_browser_sql)
         self.stage_panel.log_message.connect(self._log_message)
         self.stage_panel.status_message.connect(lambda msg: self.statusBar().showMessage(msg, 4000))
-        # Transfers record their PUT, GET and REMOVE statements in History too.
-        self.stages.finished.connect(lambda _summary: self.history_panel.reload())
 
     # -- connections -------------------------------------------------------
 
@@ -837,7 +835,6 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(False)
         self.cancel_action.setEnabled(False)
         self._update_transaction_actions()
-        self.history_panel.reload()
         failed = [o for o in outcomes if o.status is RunStatus.ERROR]
         cancelled = [o for o in outcomes if o.status is RunStatus.CANCELLED]
         if failed:
@@ -932,7 +929,6 @@ class MainWindow(QMainWindow):
         if outcome.query_id:
             self._last_query_id = outcome.query_id
             self._set_status_segment(self.qid_label, outcome.query_id)
-        self.history_panel.reload()
 
     def _on_autocommit_failed(self, message: str) -> None:
         self._log_message(f"Could not change the commit mode: {message}")
@@ -1190,7 +1186,6 @@ class MainWindow(QMainWindow):
     def _clear_history(self) -> None:
         if self.confirm_clear_history():
             self.history.clear()
-            self.history_panel.reload()
 
     def confirm_clear_history(self) -> bool:
         """Confirm before destroying history, defaulting to keeping it.

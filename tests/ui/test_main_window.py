@@ -612,6 +612,7 @@ def test_clearing_history_is_confirmed_and_can_be_refused(harness: Harness, monk
     monkeypatch.setattr(window, "confirm_clear_history", lambda: True)
     window._clear_history()
     assert window.history.recent() == []
+    assert window.history_panel.table.rowCount() == 0
 
 
 def test_the_window_title_is_the_file_name_not_its_path(harness: Harness, tmp_path) -> None:

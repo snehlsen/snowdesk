@@ -71,6 +71,8 @@ class HistoryPanel(QWidget):
 
         self._entries: list[HistoryEntry] = []
         self.reload()
+        # The store outlives the panel in tests that build several windows.
+        self.destroyed.connect(store.subscribe(self.reload))
 
     def reload(self, _term: str | None = None) -> None:
         self._entries = self.store.search(self.search.text())

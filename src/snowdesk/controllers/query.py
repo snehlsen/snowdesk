@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import logging
-
 from PySide6.QtCore import QObject, Signal
 
 from snowdesk.config import DEFAULT_PAGE_SIZE, DEFAULT_ROW_CAP
@@ -12,8 +10,6 @@ from snowdesk.db.splitter import split_sql
 from snowdesk.db.worker import CloseResultJob, FetchMoreJob, RunScriptJob, SnowflakeWorker
 from snowdesk.model import RunStatus, Statement, StatementOutcome
 from snowdesk.storage.history import HistoryStore
-
-log = logging.getLogger(__name__)
 
 
 def _trailer_end(text: str, end: int) -> int:
@@ -138,10 +134,7 @@ class QueryController(QObject):
     def _on_statement_finished(self, outcome: StatementOutcome) -> None:
         if self.history is None or outcome.status is RunStatus.SKIPPED:
             return
-        try:
-            self.history.record(outcome, self.lifecycle.connection_name)
-        except Exception:
-            log.warning("Could not write history entry", exc_info=True)
+        self.history.record(outcome, self.lifecycle.connection_name)
 
     def _on_script_finished(self, outcomes: list[StatementOutcome]) -> None:
         self._running = False

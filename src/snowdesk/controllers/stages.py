@@ -10,7 +10,6 @@ running, is in flight at once.
 from __future__ import annotations
 
 import itertools
-import logging
 
 from PySide6.QtCore import QObject, Signal
 
@@ -28,8 +27,6 @@ from snowdesk.model import (
     TransferSummary,
 )
 from snowdesk.storage.history import HistoryStore
-
-log = logging.getLogger(__name__)
 
 
 class StageController(QObject):
@@ -172,10 +169,7 @@ class StageController(QObject):
         """Every PUT, GET and REMOVE goes into History like any statement (H1)."""
         if self.history is None:
             return
-        try:
-            self.history.record(outcome, self.lifecycle.connection_name)
-        except Exception:
-            log.warning("Could not write history entry", exc_info=True)
+        self.history.record(outcome, self.lifecycle.connection_name)
 
     def _on_finished(self, summary: TransferSummary) -> None:
         if summary.transfer_id == self._active:
