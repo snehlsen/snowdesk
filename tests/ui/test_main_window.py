@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from datetime import datetime, timedelta
 
 import pytest
 from PySide6.QtCore import QPoint
@@ -34,16 +35,32 @@ from tests.fakes import (
 COLS = [("N", 0, None, None, 38, 0, False)]
 
 
+class Clock:
+    """The lifecycle's clock, set back so a Transaction looks open for a while."""
+
+    def __init__(self) -> None:
+        self.behind = timedelta()
+
+    def __call__(self) -> datetime:
+        return datetime.now() - self.behind
+
+
 class Harness:
     """A window over a worker whose lanes run synchronously, so tests stay deterministic."""
 
     def __init__(
-        self, window: MainWindow, worker: SnowflakeWorker, lanes: Lanes, conn: FakeConnection
+        self,
+        window: MainWindow,
+        worker: SnowflakeWorker,
+        lanes: Lanes,
+        conn: FakeConnection,
+        clock: Clock | None = None,
     ) -> None:
         self.window = window
         self.worker = worker
         self.lanes = lanes
         self.conn = conn
+        self.clock = clock or Clock()
 
     def held(self):
         """Keep the jobs submitted in the block waiting, as if still running."""
@@ -72,8 +89,11 @@ def harness(qtbot, tmp_path, monkeypatch):
     # pytest-qt closes the window before fixtures are torn down, so a
     # transaction a test left open would put up the real Commit / Roll Back
     # prompt and hang.  Tests that care about the answer use `ask`.
-    lifecycle = SessionLifecycle(worker, ScriptedPrompter(settle=False))
     history = HistoryStore(tmp_path / "history.db")
+    clock = Clock()
+    lifecycle = SessionLifecycle(
+        worker, ScriptedPrompter(settle=False), history=history, clock=clock
+    )
     window = MainWindow(
         worker=worker,
         lifecycle=lifecycle,
@@ -83,7 +103,7 @@ def harness(qtbot, tmp_path, monkeypatch):
         workspace=WorkspaceStore(tmp_path / "workspace.json"),
     )
     qtbot.addWidget(window)
-    yield Harness(window, worker, lanes, conn)
+    yield Harness(window, worker, lanes, conn, clock)
     history.close()
 
 
@@ -612,6 +632,7 @@ def test_clearing_history_is_confirmed_and_can_be_refused(harness: Harness, monk
     monkeypatch.setattr(window, "confirm_clear_history", lambda: True)
     window._clear_history()
     assert window.history.recent() == []
+    assert window.history_panel.table.rowCount() == 0
 
 
 def test_the_window_title_is_the_file_name_not_its_path(harness: Harness, tmp_path) -> None:
@@ -1082,7 +1103,18 @@ def test_an_open_transaction_is_shown_and_can_be_committed(harness: Harness) -> 
     assert "COMMIT: Committed" in window.messages.toPlainText()
     # Committing is not a run: the grid checked before it stays put.
     assert window.result_tabs.indexOf(result_tab) >= 0
-    assert window.history.recent()[0].sql == "COMMIT"
+    assert window.history_panel.entry_at(0).sql == "COMMIT"
+
+
+def test_commit_and_roll_back_wait_for_the_one_in_flight(harness: Harness) -> None:
+    connect(harness)
+    open_transaction(harness)
+    window = harness.window
+    with harness.held():
+        window.commit_action.trigger()
+        assert not window.commit_action.isEnabled()
+        assert not window.rollback_action.isEnabled()
+    assert harness.conn.executed.count("COMMIT") == 1
 
 
 def test_transaction_actions_wait_for_a_running_query(harness: Harness) -> None:
@@ -1098,36 +1130,16 @@ def test_transaction_actions_wait_for_a_running_query(harness: Harness) -> None:
 
 
 def test_the_open_transaction_counts_its_minutes(harness: Harness) -> None:
-    from datetime import datetime, timedelta
-
     connect(harness)
+    harness.clock.behind = timedelta(minutes=4, seconds=10)
     open_transaction(harness)
     window = harness.window
-    window._transaction_since = datetime.now() - timedelta(minutes=4, seconds=10)
-    window._render_transaction()
     assert window.commit_button.text() == "Transaction open · 4m ▾"
-    assert window._transaction_timer.isActive()
+    opened_at = window.lifecycle.transaction.opened_at
+    assert f"open since {opened_at:%H:%M}" in window.commit_button.toolTip()
 
     window.commit_action.trigger()
-    assert not window._transaction_timer.isActive()
-
-
-def test_switching_mode_mid_transaction_asks_first(harness: Harness, ask) -> None:
-    answer, asked = ask
-    connect(harness)
-    open_transaction(harness)
-    window = harness.window
-
-    answer(None)
-    window.manual_commit_action.trigger()
-    assert asked
-    assert harness.conn.autocommit is True
-    assert harness.conn.transaction_id is not None
-
-    answer(True)
-    window.manual_commit_action.trigger()
-    assert harness.conn.executed[-2:] == ["COMMIT", "ALTER SESSION SET AUTOCOMMIT = FALSE"]
-    assert window.commit_button.text() == "Manual commit ▾"
+    assert window.commit_button.text() == "Auto-commit ▾"
 
 
 def test_quitting_mid_transaction_can_be_called_off(harness: Harness, ask) -> None:
