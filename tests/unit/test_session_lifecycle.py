@@ -1,4 +1,5 @@
-"""The Session lifecycle: connecting, passphrases, losing a Session, and Settle.
+"""The Session lifecycle: connecting, passphrases, losing a Session, Settle,
+and the Session's Commit mode and Transaction.
 
 Driven through the real worker and a fake connection, with the worker run
 synchronously (Lanes.synchronous) and a scripted prompter answering for the
@@ -8,6 +9,7 @@ user.
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -18,7 +20,8 @@ from snowdesk.db.lanes import Lanes
 from snowdesk.db.session import ConnectParams, SnowflakeSession
 from snowdesk.db.splitter import split_sql
 from snowdesk.db.worker import RunScriptJob, SnowflakeWorker
-from snowdesk.model import Credentials, ObjectNode, StageKind, StageRef
+from snowdesk.model import Credentials, ObjectNode, StageKind, StageRef, StatementOutcome
+from snowdesk.storage.history import HistoryStore
 from tests.fakes import (
     FakeConnection,
     FakeProgrammingError,
@@ -37,6 +40,16 @@ class Dropped(Exception):
     """Stands in for the connector's transport-level error."""
 
 
+class Clock:
+    """The time the lifecycle sees; tests move it on by hand."""
+
+    def __init__(self) -> None:
+        self.now = datetime(2026, 10, 5, 9, 0)
+
+    def __call__(self) -> datetime:
+        return self.now
+
+
 class App:
     """A Session lifecycle over a real worker and a fake connection."""
 
@@ -50,11 +63,17 @@ class App:
             session=SnowflakeSession(connect_fn=connect_fn), lanes=self.lanes
         )
         self.prompter = prompter
-        self.lifecycle = SessionLifecycle(self.worker, prompter)
+        self.history = HistoryStore(":memory:")
+        self.clock = Clock()
+        self.lifecycle = SessionLifecycle(
+            self.worker, prompter, history=self.history, clock=self.clock
+        )
         self.changes: list[SessionStatus] = []
         self.notices: list[str] = []
+        self.ended: list[StatementOutcome] = []
         self.lifecycle.changed.connect(self.changes.append)
         self.lifecycle.notice.connect(self.notices.append)
+        self.lifecycle.transaction_ended.connect(self.ended.append)
 
     @property
     def phase(self) -> Phase:
@@ -554,6 +573,142 @@ def test_settle_acts_only_once_the_commit_has_gone_through(app: App) -> None:
         assert app.lifecycle.settling and done == []
     assert done == [True]
     assert not app.lifecycle.settling
+
+
+# -- Commit mode and the Transaction ---------------------------------------------
+
+
+def test_switching_the_commit_mode_switches_the_session(app: App, conn: FakeConnection) -> None:
+    start_session(app.lifecycle)
+    assert app.lifecycle.transaction.autocommit is True
+    app.lifecycle.set_commit_mode(False)
+    assert conn.autocommit is False
+    assert app.lifecycle.transaction.autocommit is False
+    assert app.prompter.settle_questions == []
+
+
+def test_a_refused_commit_mode_switch_says_why(app: App, conn: FakeConnection) -> None:
+    start_session(app.lifecycle)
+    conn.plan["AUTOCOMMIT = FALSE"] = FakeStatement(
+        error=FakeProgrammingError("Insufficient privileges", errno=3001)
+    )
+    app.lifecycle.set_commit_mode(False)
+    assert app.lifecycle.transaction.autocommit is True
+    assert any(
+        "Could not change the commit mode" in n and "Insufficient privileges" in n
+        for n in app.notices
+    )
+
+
+def test_switching_the_mode_mid_transaction_settles_first(app: App, conn: FakeConnection) -> None:
+    start_session(app.lifecycle)
+    app.run("begin")
+
+    app.prompter.settle = None
+    app.lifecycle.set_commit_mode(False)
+    assert conn.autocommit is True
+    assert conn.transaction_id is not None
+
+    app.prompter.settle = True
+    app.lifecycle.set_commit_mode(False)
+    assert conn.executed[-2:] == ["COMMIT", "ALTER SESSION SET AUTOCOMMIT = FALSE"]
+    assert app.lifecycle.transaction.autocommit is False
+    assert len(app.prompter.settle_questions) == 2
+
+
+def test_commit_ends_the_transaction_and_goes_into_history(app: App, conn: FakeConnection) -> None:
+    start_session(app.lifecycle)
+    app.run("begin")
+    assert app.lifecycle.can_end_transaction
+
+    assert app.lifecycle.commit()
+    assert conn.executed[-1] == "COMMIT"
+    assert not app.lifecycle.transaction.in_transaction
+    assert not app.lifecycle.can_end_transaction
+    assert [o.statement.sql for o in app.ended] == ["COMMIT"]
+    assert [e.sql for e in app.history.recent()] == ["COMMIT"]
+    assert app.prompter.settle_questions == []
+
+
+def test_there_is_nothing_to_roll_back_without_a_transaction(
+    app: App, conn: FakeConnection
+) -> None:
+    start_session(app.lifecycle)
+    assert not app.lifecycle.roll_back()
+    assert "ROLLBACK" not in conn.executed
+    assert app.ended == []
+
+
+def test_only_one_commit_or_roll_back_is_in_flight(app: App, conn: FakeConnection) -> None:
+    start_session(app.lifecycle)
+    app.run("begin")
+    with app.held():
+        assert app.lifecycle.commit()
+        assert not app.lifecycle.can_end_transaction
+        assert not app.lifecycle.roll_back()
+        assert not app.lifecycle.commit()
+    assert conn.executed.count("COMMIT") == 1
+    assert "ROLLBACK" not in conn.executed
+    assert len(app.ended) == 1
+
+
+def test_the_transaction_knows_when_it_opened(app: App) -> None:
+    start_session(app.lifecycle)
+    assert app.lifecycle.transaction.opened_at is None
+    opened = app.clock.now
+    app.run("begin")
+    assert app.lifecycle.transaction.opened_at == opened
+
+    app.clock.now = opened + timedelta(minutes=5)
+    app.run("insert into t values (1)")
+    assert app.lifecycle.transaction.opened_at == opened, "still the same Transaction"
+
+    app.lifecycle.commit()
+    assert app.lifecycle.transaction.opened_at is None
+
+
+def test_settling_waits_for_the_users_own_commit(app: App, conn: FakeConnection) -> None:
+    start_session(app.lifecycle)
+    app.run("begin")
+    done: list[bool] = []
+    with app.held():
+        app.lifecycle.commit()
+        assert not app.lifecycle.settle("Disconnecting", then=lambda: done.append(True))
+        assert app.lifecycle.settling and done == []
+    assert done == [True]
+    assert app.prompter.settle_questions == []
+    assert conn.executed.count("COMMIT") == 1
+
+
+def test_settling_behind_a_failed_commit_does_not_go_ahead(app: App, conn: FakeConnection) -> None:
+    start_session(app.lifecycle)
+    app.run("begin")
+    conn.plan["COMMIT"] = FakeStatement(
+        error=FakeProgrammingError("Constraint violated", errno=100072)
+    )
+    with app.held():
+        app.lifecycle.commit()
+        app.lifecycle.end()
+    assert app.lifecycle.is_connected
+    assert conn.transaction_id is not None
+    assert any("left open" in n for n in app.notices)
+    assert app.prompter.settle_questions == []
+
+
+def test_a_commit_answered_after_the_session_was_lost_still_counts(app: App) -> None:
+    start_session(app.lifecycle)
+    app.run("begin")
+    done: list[bool] = []
+    with app.held():
+        app.lifecycle.commit()
+        app.lifecycle.settle("Disconnecting", then=lambda: done.append(True))
+        app.worker.session_lost.emit("dev", "Connection reset by peer")
+        assert not app.lifecycle.settling
+    assert app.phase is Phase.LOST
+    assert [o.statement.sql for o in app.ended] == ["COMMIT"]
+    assert [e.sql for e in app.history.recent()] == ["COMMIT"]
+    assert done == [], "nothing queued behind it runs once the Session is gone"
+    assert not app.lifecycle.transaction.in_transaction
 
 
 # -- what follows the Session ---------------------------------------------------

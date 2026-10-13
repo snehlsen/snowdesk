@@ -8,6 +8,7 @@ connector objects (spec 6.2).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
@@ -147,6 +148,9 @@ class TransactionState:
     autocommit: bool | None = None
     #: What ``CURRENT_TRANSACTION()`` returned; ``None`` when none is open.
     transaction_id: str | None = None
+    #: When SnowDesk first saw this Transaction open.  Set by the Session
+    #: lifecycle, never by the worker, which only reports what it read.
+    opened_at: datetime | None = None
 
     @property
     def in_transaction(self) -> bool:

@@ -2,9 +2,11 @@
 
 See CONTEXT.md for the terms and docs/adr/0001 for why this lives on the UI
 thread.  The worker is still the only thing that touches the session; it
-reports what happened (connected, connect failed, session lost) and this
-module decides what that means: which state the Session is in, whether to ask
-for a passphrase or a password, and when it is safe to end the Session.
+reports what happened (connected, connect failed, session lost, the
+Transaction changed, a COMMIT ended) and this module decides what that means:
+which state the Session is in, whether to ask for a passphrase or a password,
+when it is safe to end the Session, and what its Commit mode and open
+Transaction are.
 
 Everything here runs on the UI thread, so the window and the controllers read
 :attr:`SessionLifecycle.status` instead of the worker's session.
@@ -14,13 +16,20 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from datetime import datetime
 from enum import StrEnum
 from typing import Protocol
 
 from PySide6.QtCore import QObject, Signal
 
 from snowdesk.db.session import ConnectParams
-from snowdesk.db.worker import ConnectJob, DisconnectJob, EndTransactionJob, SnowflakeWorker
+from snowdesk.db.worker import (
+    ConnectJob,
+    DisconnectJob,
+    EndTransactionJob,
+    SetAutocommitJob,
+    SnowflakeWorker,
+)
 from snowdesk.model import (
     ConnectFailure,
     Credentials,
@@ -29,6 +38,7 @@ from snowdesk.model import (
     StatementOutcome,
     TransactionState,
 )
+from snowdesk.storage.history import HistoryStore
 
 
 class Phase(StrEnum):
@@ -97,18 +107,33 @@ class Prompter(Protocol):
 
 
 class SessionLifecycle(QObject):
-    """Owns the Session state, passphrase memory, Reconnect, and Settle."""
+    """Owns the Session state, passphrase memory, Reconnect, Settle, and the
+    Session's Commit mode and open Transaction."""
 
     #: The Session state changed; carries the new :class:`SessionStatus`.
     changed = Signal(object)
     #: A line worth keeping in Messages.
     notice = Signal(str)
+    #: The Commit mode or open Transaction changed, or whether it can be
+    #: ended did; carries the :class:`TransactionState`.
+    transaction_changed = Signal(object)
+    #: A COMMIT or ROLLBACK finished, either way, whether the user or Settle
+    #: asked for it; carries its :class:`StatementOutcome`.
+    transaction_ended = Signal(object)
 
-    def __init__(self, worker: SnowflakeWorker, prompter: Prompter | None = None) -> None:
+    def __init__(
+        self,
+        worker: SnowflakeWorker,
+        prompter: Prompter | None = None,
+        history: HistoryStore | None = None,
+        clock: Callable[[], datetime] = datetime.now,
+    ) -> None:
         super().__init__()
         self.worker = worker
         #: Set by whoever can show dialogs; the window, in the app.
         self.prompter = prompter
+        self.history = history
+        self._clock = clock
         self._status = SessionStatus()
         # Key passphrases the user has entered this run, so Disconnect followed
         # by Connect does not ask again.  In memory only, never persisted, and
@@ -124,7 +149,10 @@ class SessionLifecycle(QObject):
         # asks again.  A password opens the account itself, not just one key,
         # so it is not left sitting in memory between sign-ins.
         self._transaction = TransactionState()
-        #: What to do once the COMMIT or ROLLBACK queued by :meth:`settle` succeeds.
+        #: A COMMIT or ROLLBACK is queued and has not answered.  Only one at a
+        #: time, so its answer never needs matching to whoever asked.
+        self._ending = False
+        #: What to do once the COMMIT or ROLLBACK in flight succeeds.
         self._after_settle: Callable[[], None] | None = None
 
         worker.connected.connect(self._on_connected)
@@ -132,6 +160,7 @@ class SessionLifecycle(QObject):
         worker.session_lost.connect(self._on_session_lost)
         worker.transaction_changed.connect(self._on_transaction_changed)
         worker.transaction_ended.connect(self._on_transaction_ended)
+        worker.autocommit_failed.connect(self._on_autocommit_failed)
 
     # -- state -------------------------------------------------------------
 
@@ -145,8 +174,18 @@ class SessionLifecycle(QObject):
 
     @property
     def settling(self) -> bool:
-        """A COMMIT or ROLLBACK queued by :meth:`settle` has not answered yet."""
+        """:meth:`settle` is waiting on a COMMIT or ROLLBACK to answer."""
         return self._after_settle is not None
+
+    @property
+    def transaction(self) -> TransactionState:
+        """The Commit mode and open Transaction, as the Session last reported them."""
+        return self._transaction
+
+    @property
+    def can_end_transaction(self) -> bool:
+        """A Transaction is open and no COMMIT or ROLLBACK is already in flight."""
+        return self.is_connected and self._transaction.in_transaction and not self._ending
 
     @property
     def connection_name(self) -> str:
@@ -156,9 +195,15 @@ class SessionLifecycle(QObject):
     def _move(self, status: SessionStatus) -> None:
         self._status = status
         if not status.is_connected:
-            self._transaction = TransactionState()
             self._after_settle = None
+            if self._ending or self._transaction != TransactionState():
+                self._ending = False
+                self._set_transaction(TransactionState())
         self.changed.emit(status)
+
+    def _set_transaction(self, state: TransactionState) -> None:
+        self._transaction = state
+        self.transaction_changed.emit(state)
 
     # -- intents -----------------------------------------------------------
 
@@ -203,24 +248,52 @@ class SessionLifecycle(QObject):
         With nothing to settle ``then`` runs straight away and this returns
         True.  Otherwise the user picks Commit or Roll back and ``then`` runs
         only after it succeeds; if it fails the Session is left as it was, so
-        a Disconnect never turns a Commit into a silent rollback.  Returns
-        False when ``then`` has not run yet, or never will because the user
-        cancelled.
+        a Disconnect never turns a Commit into a silent rollback.  A COMMIT or
+        ROLLBACK the user already started is waited for the same way, without
+        asking.  Returns False when ``then`` has not run yet, or never will
+        because the user cancelled.
         """
-        if not (self.is_connected and self._transaction.in_transaction):
+        if not (self.is_connected and (self._ending or self._transaction.in_transaction)):
             then()
             return True
         if self._after_settle is not None:
             return False  # already settling; the first request wins
+        if self._ending:
+            self._after_settle = then
+            return False
         assert self.prompter is not None, "settling needs a prompter"
         commit = self.prompter.ask_settle(reason)
         if commit is None:
             return False
         self._after_settle = then
-        self.worker.submit(EndTransactionJob(commit=commit))
+        self._end_transaction(commit)
         return False
 
+    def commit(self) -> bool:
+        """Commit the open Transaction.  False when there is nothing to commit
+        now, or a COMMIT or ROLLBACK is already in flight."""
+        return self._end_transaction(commit=True) if self.can_end_transaction else False
+
+    def roll_back(self) -> bool:
+        """Roll back the open Transaction; False as for :meth:`commit`."""
+        return self._end_transaction(commit=False) if self.can_end_transaction else False
+
+    def set_commit_mode(self, autocommit: bool) -> None:
+        """Switch between auto-commit and manual commit, settling first."""
+        if not self.is_connected or self._transaction.autocommit is autocommit:
+            return
+        self.settle(
+            "The commit mode can only change once the open transaction has ended.",
+            then=lambda: self.worker.submit(SetAutocommitJob(enabled=autocommit)),
+        )
+
     # -- internals ---------------------------------------------------------
+
+    def _end_transaction(self, commit: bool) -> bool:
+        self._ending = True
+        self.transaction_changed.emit(self._transaction)
+        self.worker.submit(EndTransactionJob(commit=commit))
+        return True
 
     def _open(
         self, connection: str, passphrase: str | None, credentials: Credentials | None = None
@@ -329,11 +402,25 @@ class SessionLifecycle(QObject):
         self.worker.submit(DisconnectJob())
 
     def _on_transaction_changed(self, state: TransactionState) -> None:
-        if self.is_connected:
-            self._transaction = state
+        if not self.is_connected:
+            return
+        if not state.in_transaction:
+            opened_at = None
+        elif state.transaction_id == self._transaction.transaction_id:
+            opened_at = self._transaction.opened_at
+        else:
+            opened_at = self._clock()
+        self._set_transaction(replace(state, opened_at=opened_at))
 
     def _on_transaction_ended(self, outcome: StatementOutcome) -> None:
+        """Also reported after the Session was lost: the outcome is still real."""
+        if self.history is not None:
+            self.history.record(outcome, self._status.connection)
         then, self._after_settle = self._after_settle, None
+        if self._ending:
+            self._ending = False
+            self.transaction_changed.emit(self._transaction)
+        self.transaction_ended.emit(outcome)
         if then is None:
             return
         if outcome.status is not RunStatus.SUCCESS:
@@ -342,5 +429,8 @@ class SessionLifecycle(QObject):
                 "with its transaction."
             )
             return
-        self._transaction = replace(self._transaction, transaction_id=None)
+        self._transaction = replace(self._transaction, transaction_id=None, opened_at=None)
         then()
+
+    def _on_autocommit_failed(self, message: str) -> None:
+        self.notice.emit(f"Could not change the commit mode: {message}")

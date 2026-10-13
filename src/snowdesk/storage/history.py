@@ -13,15 +13,18 @@ than at whatever the umask happens to allow.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
 from snowdesk import config
 from snowdesk.model import RunStatus, StatementOutcome
+
+log = logging.getLogger(__name__)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS history (
@@ -59,7 +62,12 @@ class HistoryEntry:
 
 class HistoryStore:
     """Thread-safe SQLite store. Writes are small and local, so they are safe
-    to make from either the UI thread or the worker."""
+    to make from either the UI thread or the worker.
+
+    Whoever shows History subscribes to hear when it changed, rather than
+    every writer remembering to reload the view.  Subscribers are called
+    on the thread that wrote, which in the app is always the UI thread.
+    """
 
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
@@ -74,6 +82,7 @@ class HistoryStore:
         with self._lock:
             self._conn.executescript(_SCHEMA)
             self._conn.commit()
+        self._subscribers: list[Callable[[], None]] = []
 
     def close(self) -> None:
         with self._lock:
@@ -82,31 +91,53 @@ class HistoryStore:
     # -- writes ------------------------------------------------------------
 
     def record(self, outcome: StatementOutcome, connection: str) -> int:
-        """Persist one executed statement. Skipped statements are not recorded."""
+        """Persist one executed statement. Skipped statements are not recorded.
+
+        A failed write is logged and returns -1: losing a History entry must
+        never stop a run, a Commit or a transfer.
+        """
         if outcome.status is RunStatus.SKIPPED:
             return -1
-        with self._lock:
-            cur = self._conn.execute(
-                "INSERT INTO history (ts, connection, sql, status, duration_s, row_count,"
-                " query_id, message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    time.time(),
-                    connection,
-                    outcome.statement.sql,
-                    outcome.status.value,
-                    outcome.duration_s,
-                    outcome.row_count,
-                    outcome.query_id,
-                    outcome.message,
-                ),
-            )
-            self._conn.commit()
-            return int(cur.lastrowid or -1)
+        try:
+            with self._lock:
+                cur = self._conn.execute(
+                    "INSERT INTO history (ts, connection, sql, status, duration_s, row_count,"
+                    " query_id, message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        time.time(),
+                        connection,
+                        outcome.statement.sql,
+                        outcome.status.value,
+                        outcome.duration_s,
+                        outcome.row_count,
+                        outcome.query_id,
+                        outcome.message,
+                    ),
+                )
+                self._conn.commit()
+                row_id = int(cur.lastrowid or -1)
+        except Exception:
+            log.warning("Could not write history entry", exc_info=True)
+            return -1
+        self._changed()
+        return row_id
 
     def clear(self) -> None:
         with self._lock:
             self._conn.execute("DELETE FROM history")
             self._conn.commit()
+        self._changed()
+
+    # -- subscribers -------------------------------------------------------
+
+    def subscribe(self, callback: Callable[[], None]) -> Callable[[], None]:
+        """Call ``callback`` after every write; returns the way to stop."""
+        self._subscribers.append(callback)
+        return lambda: self._subscribers.remove(callback)
+
+    def _changed(self) -> None:
+        for callback in list(self._subscribers):
+            callback()
 
     # -- reads -------------------------------------------------------------
 

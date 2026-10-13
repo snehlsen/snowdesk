@@ -90,3 +90,26 @@ def test_recent_is_newest_first(tmp_path: Path) -> None:
         store.record(outcome(f"select {i}"), "dev")
     assert store.recent()[0].sql == "select 2"
     store.close()
+
+
+def test_subscribers_hear_every_write(tmp_path: Path) -> None:
+    store = HistoryStore(tmp_path / "h.db")
+    heard: list[str] = []
+    stop = store.subscribe(lambda: heard.append("changed"))
+    store.record(outcome("select 1"), "dev")
+    store.record(outcome("select 1", RunStatus.SKIPPED), "dev")
+    store.clear()
+    assert heard == ["changed", "changed"]
+    stop()
+    store.record(outcome("select 2"), "dev")
+    assert heard == ["changed", "changed"]
+    store.close()
+
+
+def test_a_failed_write_is_logged_not_raised(tmp_path: Path) -> None:
+    store = HistoryStore(tmp_path / "h.db")
+    heard: list[str] = []
+    store.subscribe(lambda: heard.append("changed"))
+    store.close()
+    assert store.record(outcome("select 1"), "dev") == -1
+    assert heard == []

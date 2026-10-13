@@ -121,7 +121,7 @@ class Application:
         # not run a Qt event loop; signals are still delivered to the UI thread.
         self.thread.started.connect(self.worker.run_loop)
 
-        self.lifecycle = SessionLifecycle(self.worker)
+        self.lifecycle = SessionLifecycle(self.worker, history=self.history)
         self.query = QueryController(self.worker, self.lifecycle, history=self.history)
         self.browser = BrowserController(self.worker, self.lifecycle)
         self.stages = StageController(self.worker, self.lifecycle, history=self.history)
