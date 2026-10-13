@@ -85,6 +85,9 @@ source = ["snowdesk"]
 branch = true
 
 [tool.coverage.report]
+# A floor a little under the current total (86.9%), so a change that drops
+# coverage noticeably fails the build. Raise it as coverage improves.
+fail_under = 85
 show_missing = true
 skip_covered = true
 exclude_also = [
