@@ -158,9 +158,10 @@ def test_failing_statement_stops_the_run_and_is_underlined(harness: Harness) -> 
     assert "ERROR" in messages
     assert "[2003]" in messages
     assert "Skipped" in messages
-    assert window.editor._error_range is not None
-    start, end = window.editor._error_range
-    assert window.editor.toPlainText()[start:end] == "select boom"
+    # What the editor paints, not just the range it was handed.
+    selections = window.editor.extraSelections()
+    highlighted = [s.cursor.selectedText() for s in selections if s.cursor.hasSelection()]
+    assert highlighted == ["select boom"]
 
 
 def test_cancel_reports_cancelled_without_an_error(harness: Harness) -> None:
