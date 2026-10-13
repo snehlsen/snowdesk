@@ -185,6 +185,7 @@ finds, then reports the result to Snowflake at login. Setting
 
 ```
 uv run pytest            # unit + UI tests
+uv run pytest --cov --cov-report=term --cov-report=html   # with coverage, into htmlcov/
 uv run ruff check .
 uv run ruff format .
 uv run mypy
