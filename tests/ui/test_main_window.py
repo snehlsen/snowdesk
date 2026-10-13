@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 
 import pytest
 from PySide6.QtCore import QPoint
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QTextCursor
 from PySide6.QtWidgets import QDialog, QLabel
 
 from snowdesk.controllers.browser import BrowserController
@@ -159,6 +159,31 @@ def test_failing_statement_stops_the_run_and_is_underlined(harness: Harness) -> 
     assert "[2003]" in messages
     assert "Skipped" in messages
     # What the editor paints, not just the range it was handed.
+    selections = window.editor.extraSelections()
+    highlighted = [s.cursor.selectedText() for s in selections if s.cursor.hasSelection()]
+    assert highlighted == ["select boom"]
+
+
+@pytest.mark.parametrize(
+    "selected",
+    ["select boom", "select 1;\nselect boom;\nselect 3;"],
+    ids=["just-the-failing-statement", "several-statements"],
+)
+def test_failing_statement_in_a_selection_is_underlined_where_it_is(
+    harness: Harness, selected: str
+) -> None:
+    connect(harness)
+    window = harness.window
+    text = "select 0;\nselect 1;\nselect boom;\nselect 3;"
+    window.editor.setPlainText(text)
+    cursor = window.editor.textCursor()
+    cursor.setPosition(text.index(selected))
+    cursor.setPosition(text.index(selected) + len(selected), QTextCursor.MoveMode.KeepAnchor)
+    window.editor.setTextCursor(cursor)
+
+    window.run_current()
+
+    assert "ERROR" in window.messages.toPlainText()
     selections = window.editor.extraSelections()
     highlighted = [s.cursor.selectedText() for s in selections if s.cursor.hasSelection()]
     assert highlighted == ["select boom"]

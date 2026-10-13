@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from PySide6.QtCore import QObject, Signal
 
 from snowdesk.config import DEFAULT_PAGE_SIZE, DEFAULT_ROW_CAP
@@ -98,7 +100,13 @@ class QueryController(QObject):
     def run_selection(self, text: str, start: int, end: int) -> list[Statement]:
         """Run the selected text, or the statement under the cursor (⌘↩)."""
         if end > start:
-            return self._run(split_sql(text[start:end]))
+            # Split offsets are relative to the selection; shift them back onto
+            # the editor text so the failing statement is underlined in place.
+            statements = [
+                replace(s, start=s.start + start, end=s.end + start)
+                for s in split_sql(text[start:end])
+            ]
+            return self._run(statements)
         stmt = statement_at(text, start)
         return self._run([stmt] if stmt else [])
 
