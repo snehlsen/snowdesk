@@ -173,9 +173,10 @@ done < <(find "$APP/Contents" -type f -print0 |
 #
 # Launch Services lets the app start on anything from LSMinimumSystemVersion
 # up, but each library carries its own deployment target, and the wheels'
-# platform tags do not say what is inside them: PySide6 6.10 and later are
-# tagged macosx_13_0 and built for 15.0.  So read the minos of each binary
-# rather than trusting the tag, before spending a signature on the bundle.
+# platform tags do not say what is inside them: PySide6 6.12 is tagged
+# macosx_14_0 and its binding modules are built for 26.0.  So read the minos
+# of each binary rather than trusting the tag, before spending a signature on
+# the bundle.
 
 MIN_OS=$(plutil -extract LSMinimumSystemVersion raw -o - "$APP/Contents/Info.plist") ||
     die "Info.plist has no LSMinimumSystemVersion"

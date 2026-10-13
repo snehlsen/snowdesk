@@ -9,7 +9,7 @@ on:
 
 jobs:
   test:
-    runs-on: macos-14
+    runs-on: macos-26
     steps:
       # Pinned to commit SHAs, not tags: a tag is mutable, so `@v4` is a
       # standing agreement to run whatever that repository points it at on the
