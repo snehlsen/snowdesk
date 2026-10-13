@@ -32,5 +32,8 @@ jobs:
       - run: uv run pytest -q --cov --cov-report=term
         env:
           QT_QPA_PLATFORM: offscreen
-      # The same report as a table on the run's summary page.
-      - run: uv run coverage report --format=markdown >> "$GITHUB_STEP_SUMMARY"
+      # The same report as a table on the run's summary page, kept even when
+      # the tests or the coverage floor fail. The floor is the test step's to
+      # enforce, so this step doesn't fail a second time over it.
+      - if: always()
+        run: uv run coverage report --format=markdown --fail-under=0 >> "$GITHUB_STEP_SUMMARY"
