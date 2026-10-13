@@ -140,9 +140,10 @@ app = BUNDLE(
         "CFBundleShortVersionString": VERSION,
         "CFBundleVersion": VERSION,
         # The newest deployment target (minos) of any binary in the bundle,
-        # which sign.sh checks: PySide6 6.10 and later are built for 15.0
-        # although their wheels are tagged macosx_13_0.
-        "LSMinimumSystemVersion": "15.0",
+        # which sign.sh checks: PySide6 6.12's binding modules are built for
+        # 26.0 although its wheels are tagged macosx_14_0 (the Qt frameworks
+        # themselves are built for 14.4).
+        "LSMinimumSystemVersion": "26.0",
         "NSHighResolutionCapable": True,
         "NSRequiresAquaSystemAppearance": False,
     },
