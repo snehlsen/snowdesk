@@ -24,6 +24,7 @@ dev = [
     "pytest-qt>=4.4",
     "ruff>=0.6",
     "mypy>=1.11",
+    "pytest-cov>=5.0",
 ]
 # Apart from dev so the release build installs PyInstaller and nothing else:
 # every installed package can run code in the interpreter that builds.
@@ -77,3 +78,20 @@ filterwarnings = [
     "ignore:X509.get_subject is deprecated:DeprecationWarning:snowflake.connector",
     "ignore:codecs.open\\(\\) is deprecated:DeprecationWarning:snowflake.connector",
 ]
+
+# Opt-in: `uv run pytest --cov` measures the package, with branches.
+[tool.coverage.run]
+source = ["snowdesk"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+]
+
+[tool.coverage.html]
+directory = "htmlcov"
