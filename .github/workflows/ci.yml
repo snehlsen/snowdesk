@@ -10,6 +10,12 @@ on:
 jobs:
   test:
     runs-on: macos-26
+    env:
+      # The interpreter the release build uses (see release.yml), not the
+      # runner image's Homebrew one: when that moved to 3.15, the connector's
+      # vendored urllib3 failed on the removed ssl.PROTOCOL_TLSv1.
+      UV_PYTHON: "3.14.8"
+      UV_PYTHON_PREFERENCE: only-managed
     steps:
       # Pinned to commit SHAs, not tags: a tag is mutable, so `@v4` is a
       # standing agreement to run whatever that repository points it at on the
