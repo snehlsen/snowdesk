@@ -1,3 +1,3 @@
 """SnowDesk — a lightweight macOS client for Snowflake."""
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
