@@ -112,7 +112,7 @@ Priority: **P0** is required for v1, **P1** is expected for v1 but can slip, **P
 
 **Security.** The app never stores passwords or private-key passphrases itself; they stay in `connections.toml` (which must be `chmod 600`) or in the Keychain via the connector's own token cache. When a key is encrypted, the app asks for its passphrase at connect time and holds it in memory for the run only, dropping it as soon as it is rejected. When a password (or `username_password_mfa`) Connection has no password configured, the app asks for the password and MFA passcode on every connect and keeps neither beyond that one sign-in. When the password is configured but Snowflake still wants an MFA passcode, the app asks for the passcode alone, on every connect, and never keeps it. Query history is stored locally and can be cleared. No telemetry.
 
-**Compatibility.** macOS 15+ on Apple silicon for v1, the oldest release PySide6's binaries are built for (see `LSMinimumSystemVersion` in `packaging/snowdesk.spec`). Intel builds are optional.
+**Compatibility.** macOS 26+ on Apple silicon for v1, the oldest release PySide6's binaries are built for (see `LSMinimumSystemVersion` in `packaging/snowdesk.spec`). Intel builds are optional.
 
 **Robustness.** A dropped network or expired session produces a clear error and a one-click reconnect, never a crash or a hang.
 

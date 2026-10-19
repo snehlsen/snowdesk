@@ -9,7 +9,7 @@ on:
 
 jobs:
   test:
-    runs-on: macos-14
+    runs-on: macos-26
     env:
       # The interpreter the release build uses (see release.yml), not the
       # runner image's Homebrew one: when that moved to 3.15, the connector's
