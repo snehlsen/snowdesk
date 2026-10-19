@@ -34,8 +34,17 @@ def neutralize_formula(text: str) -> str:
     return "'" + text if text.startswith(_FORMULA_LEAD) else text
 
 
-def _escape_tsv(text: str) -> str:
-    return text.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n").replace("\r", "")
+def _quote_tsv(text: str) -> str:
+    """Quote a field the way Excel does when it copies cells.
+
+    Excel, Numbers and Google Sheets all read a double-quoted field on paste,
+    with doubled quotes inside, so a value keeps its tabs and line breaks
+    instead of spilling into the next cell or row.  A quote anywhere but the
+    start is literal to them, which leaves compact JSON unquoted.
+    """
+    if text.startswith('"') or any(c in text for c in "\t\n\r"):
+        return '"' + text.replace('"', '""') + '"'
+    return text
 
 
 def rows_to_tsv(
@@ -56,14 +65,14 @@ def rows_to_tsv(
     out: list[str] = []
     if with_headers and columns is not None:
         idx = column_indexes if column_indexes is not None else range(len(columns))
-        out.append("\t".join(_escape_tsv(columns[i].name) for i in idx))
+        out.append("\t".join(_quote_tsv(columns[i].name) for i in idx))
     for row in rows:
         idx = column_indexes if column_indexes is not None else range(len(row))
         cells = []
         for i in idx:
             col = columns[i] if columns is not None and i < len(columns) else None
-            text = _escape_tsv(format_cell(row[i], col))
-            cells.append(neutralize_formula(text) if escape_formulas else text)
+            text = format_cell(row[i], col)
+            cells.append(_quote_tsv(neutralize_formula(text) if escape_formulas else text))
         out.append("\t".join(cells))
     return "\n".join(out)
 

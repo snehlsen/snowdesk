@@ -172,6 +172,13 @@ def test_json_is_pretty_printed(qtbot) -> None:
     assert view.current_cell_text() == '{\n  "sku": "A1",\n  "qty": 2\n}'
 
 
+def test_json_in_a_varchar_is_pretty_printed(qtbot) -> None:
+    view = make_view(qtbot, [(1, '{"cluster_by_keys":"LINEAR(x)"}', "{}")])
+    view.set_detail_visible(True)
+    view.table.setCurrentIndex(view.model.index(0, 1))
+    assert view.current_cell_text() == '{\n  "cluster_by_keys": "LINEAR(x)"\n}'
+
+
 def test_other_values_are_shown_as_they_are(qtbot) -> None:
     view = make_view(qtbot, [(1, "a long name", "{}")])
     view.set_detail_visible(True)
