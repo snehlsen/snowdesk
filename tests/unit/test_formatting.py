@@ -5,7 +5,10 @@ from decimal import Decimal
 
 from snowdesk.model import ColumnInfo, columns_from_description
 from snowdesk.util.formatting import (
+    LINE_BREAK_MARK,
     NULL_TEXT,
+    detail_cell,
+    display_cell,
     format_cell,
     format_duration,
     format_row_count,
@@ -57,6 +60,47 @@ def test_variant_renders_compact_json() -> None:
 
 def test_variant_that_is_not_json_is_left_alone() -> None:
     assert format_cell("not json", VARIANT) == "not json"
+
+
+CLUSTERING_INFO = '{\n  "cluster_by_keys" : "LINEAR(x)",\n  "total_partition_count" : 12\n}'
+
+
+def test_format_cell_keeps_a_varchar_as_it_is() -> None:
+    assert format_cell(CLUSTERING_INFO, TEXT) == CLUSTERING_INFO
+
+
+def test_grid_compacts_json_held_in_a_varchar() -> None:
+    """SYSTEM$CLUSTERING_INFORMATION returns pretty-printed JSON as VARCHAR."""
+    assert display_cell(CLUSTERING_INFO, TEXT) == (
+        '{"cluster_by_keys":"LINEAR(x)","total_partition_count":12}'
+    )
+    assert display_cell("  [1,\n 2]", TEXT) == "[1,2]"
+
+
+def test_grid_marks_line_breaks_in_other_text() -> None:
+    mark = LINE_BREAK_MARK
+    assert display_cell("one\ntwo\r\nthree\rfour", TEXT) == f"one{mark}two{mark}three{mark}four"
+    assert display_cell("[INFO] not\njson", TEXT) == f"[INFO] not{mark}json"
+
+
+def test_grid_leaves_scalars_that_parse_as_json_alone() -> None:
+    """Only objects and arrays are sniffed: '42' and '"x"' stay text."""
+    assert display_cell("42", TEXT) == "42"
+    assert display_cell('"x"', TEXT) == '"x"'
+    assert display_cell("", TEXT) == ""
+
+
+def test_grid_still_names_null() -> None:
+    assert display_cell(None, TEXT) == NULL_TEXT
+
+
+def test_detail_pretty_prints_json_held_in_a_varchar() -> None:
+    assert detail_cell('{"a":1}', TEXT) == '{\n  "a": 1\n}'
+
+
+def test_detail_shows_other_text_with_its_line_breaks() -> None:
+    assert detail_cell("one\ntwo", TEXT) == "one\ntwo"
+    assert detail_cell("{ not json", TEXT) == "{ not json"
 
 
 def test_binary_renders_as_hex() -> None:

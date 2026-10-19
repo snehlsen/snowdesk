@@ -26,6 +26,16 @@ def test_variant_renders_as_compact_json(qtbot) -> None:
     assert m.data(m.index(0, 1)) == '{"sku":"A1"}'
 
 
+def test_text_is_shown_on_one_line(qtbot) -> None:
+    m = ResultModel(
+        [ColumnInfo("INFO", "TEXT")], [('{\n  "depth" : 1\n}',), ("a\nb",)], exhausted=True
+    )
+    assert m.data(m.index(0, 0)) == '{"depth":1}'
+    assert m.data(m.index(1, 0)) == "a\u21b5b"
+    # The tooltip has room for the real thing.
+    assert m.data(m.index(1, 0), Qt.ItemDataRole.ToolTipRole) == "a\nb"
+
+
 def test_null_is_styled(qtbot) -> None:
     m = model(rows=[(None, "")])
     index = m.index(0, 0)
@@ -83,6 +93,31 @@ def test_view_copies_selection_as_tsv(qtbot) -> None:
 
     view.table.selectColumn(0)
     assert view.selected_tsv() == "1\n2"
+
+
+def test_copying_one_cell_copies_its_value(qtbot) -> None:
+    text = '{\n  "depth" : 1\n}'
+    m = ResultModel(
+        [ColumnInfo("ID", "FIXED", 38, 0), ColumnInfo("INFO", "TEXT")], [(1, text)], True
+    )
+    view = ResultView("r1", m)
+    qtbot.addWidget(view)
+    view.table.setCurrentIndex(m.index(0, 1))
+    assert view.selected_text() == text
+    # With headers, or with more than one cell, it is a table again.
+    assert view.selected_text(with_headers=True) == 'INFO\n"{\n  ""depth"" : 1\n}"'
+    view.table.selectRow(0)
+    assert view.selected_text() == '1\t"{\n  ""depth"" : 1\n}"'
+
+
+def test_copying_one_cell_still_neutralizes_formulas(qtbot) -> None:
+    m = ResultModel([ColumnInfo("F", "TEXT")], [("=1+1",)], True)
+    view = ResultView("r1", m)
+    qtbot.addWidget(view)
+    view.table.setCurrentIndex(m.index(0, 0))
+    assert view.selected_text() == "'=1+1"
+    view.set_escape_formulas(False)
+    assert view.selected_text() == "=1+1"
 
 
 def test_view_shows_a_footer_when_capped(qtbot) -> None:

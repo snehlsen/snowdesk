@@ -2,6 +2,10 @@
 
 NULL is rendered distinctly from the empty string, timestamps keep their time
 zone, and VARIANT/OBJECT/ARRAY collapse to compact JSON.
+
+:func:`format_cell` is the value as text, line breaks and all; the grid shows
+:func:`display_cell`, which fits that on one line, and the detail panel shows
+:func:`detail_cell`, which spreads JSON out over as many as it needs.
 """
 
 from __future__ import annotations
@@ -9,6 +13,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 from decimal import Decimal
+from functools import lru_cache
 from typing import Any
 
 from snowdesk.model import ColumnInfo
@@ -16,6 +21,11 @@ from snowdesk.model import ColumnInfo
 #: Sentinel text shown for SQL NULL.  The view additionally styles NULL cells
 #: (italic, dimmed) so it cannot be confused with the literal string 'NULL'.
 NULL_TEXT = "NULL"
+
+#: Stands in for a line break in the grid, which has room for one line: Qt
+#: would otherwise show the first line and elide the rest, so a pretty-printed
+#: document reads as ``{...``.
+LINE_BREAK_MARK = "\u21b5"
 
 
 def _compact_json(value: Any) -> str:
@@ -44,6 +54,33 @@ def pretty_json(value: Any) -> str:
         return json.dumps(parsed, indent=2, default=str, ensure_ascii=False)
     except (TypeError, ValueError):
         return str(value)
+
+
+def _looks_like_json(text: str) -> bool:
+    return text.lstrip().startswith(("{", "["))
+
+
+@lru_cache(maxsize=256)
+def _compact_json_text(text: str) -> str | None:
+    """``text`` as compact JSON if it is a JSON object or array, else None.
+
+    Cached because the grid asks for a cell's text on every paint, and a
+    function like SYSTEM$CLUSTERING_INFORMATION returns a sizeable document.
+    """
+    if not _looks_like_json(text):
+        return None
+    try:
+        return _compact_json(json.loads(text))
+    except (ValueError, TypeError):
+        return None
+
+
+def _one_line(text: str) -> str:
+    return (
+        text.replace("\r\n", LINE_BREAK_MARK)
+        .replace("\n", LINE_BREAK_MARK)
+        .replace("\r", LINE_BREAK_MARK)
+    )
 
 
 def _format_datetime(value: dt.datetime) -> str:
@@ -77,6 +114,36 @@ def format_cell(value: Any, column: ColumnInfo | None = None) -> str:
     if isinstance(value, (dict, list)):
         return _compact_json(value)
     return str(value)
+
+
+def display_cell(value: Any, column: ColumnInfo | None = None) -> str:
+    """Render one cell for the grid, which shows a single line of it.
+
+    A VARCHAR holding a JSON object or array, the way the SYSTEM$ functions
+    return theirs, is compacted like a VARIANT; any other line break becomes
+    :data:`LINE_BREAK_MARK`.
+    """
+    text = format_cell(value, column)
+    if isinstance(value, str) and not (column is not None and column.is_json):
+        compact = _compact_json_text(text)
+        if compact is not None:
+            return compact
+    return _one_line(text)
+
+
+def detail_cell(value: Any, column: ColumnInfo | None = None) -> str:
+    """Render one cell in full for the detail panel.
+
+    JSON is pretty-printed, whether it arrived as a VARIANT or as a VARCHAR
+    that holds a JSON object or array; everything else is the value as is.
+    """
+    if value is None:
+        return NULL_TEXT
+    if (column is not None and column.is_json) or (
+        isinstance(value, str) and _compact_json_text(value) is not None
+    ):
+        return pretty_json(value)
+    return format_cell(value, column)
 
 
 def format_row_count(loaded: int, total: int | None, exhausted: bool) -> str:

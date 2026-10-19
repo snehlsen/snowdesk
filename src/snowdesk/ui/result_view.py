@@ -42,8 +42,14 @@ from PySide6.QtWidgets import (
 
 from snowdesk.config import DEFAULT_ROW_CAP
 from snowdesk.model import ColumnInfo
-from snowdesk.util.export import rows_to_tsv
-from snowdesk.util.formatting import NULL_TEXT, format_cell, format_row_count, pretty_json
+from snowdesk.util.export import neutralize_formula, rows_to_tsv
+from snowdesk.util.formatting import (
+    NULL_TEXT,
+    detail_cell,
+    display_cell,
+    format_cell,
+    format_row_count,
+)
 
 MAX_COLUMN_WIDTH = 420
 NULL_COLOR = QColor("#8a8f98")
@@ -122,10 +128,10 @@ class ResultModel(QAbstractTableModel):
         value = self._rows[index.row()][index.column()]
         column = self._columns[index.column()]
         if role == Qt.ItemDataRole.DisplayRole:
-            return format_cell(value, column)
+            return display_cell(value, column)
         if role == Qt.ItemDataRole.ToolTipRole:
             text = format_cell(value, column)
-            return text if len(text) > 60 else None
+            return text if len(text) > 60 or "\n" in text else None
         if role == Qt.ItemDataRole.ForegroundRole and value is None:
             return NULL_COLOR  # R3: NULL is visually distinct from ''
         if role == Qt.ItemDataRole.FontRole and value is None:
@@ -482,18 +488,14 @@ class ResultView(QWidget):
         """The focused cell in full: JSON pretty-printed, everything else raw.
 
         Raw on purpose: this panel is for reading the value, not for handing it
-        to a spreadsheet, so it shows exactly what the database returned.
+        to a spreadsheet, so it shows what the database returned, line breaks
+        included.  JSON in a VARCHAR is pretty-printed like a VARIANT's.
         """
         index = self.table.currentIndex()
         if not index.isValid():
             return ""
         value = self.model.data(index, Qt.ItemDataRole.UserRole)
-        if value is None:
-            return NULL_TEXT
-        column = self.model.columns[index.column()]
-        if column.is_json:
-            return pretty_json(value)
-        return format_cell(value, column)
+        return detail_cell(value, self.model.columns[index.column()])
 
     def selected_tsv(self, with_headers: bool = False) -> str:
         """Selected cells as TSV; the whole visible result when nothing is selected."""
@@ -518,9 +520,26 @@ class ResultView(QWidget):
             escape_formulas=self._escape_formulas,
         )
 
+    def selected_text(self, with_headers: bool = False) -> str:
+        """What Copy puts on the clipboard.
+
+        One cell is copied as its value, line breaks and all, since it is as
+        likely to go into an editor as into a spreadsheet, and TSV quoting
+        would only get in the way.  Anything more is TSV.
+        """
+        selection = self.table.selectionModel()
+        indexes = selection.selectedIndexes() if selection else []
+        if with_headers or len(indexes) != 1:
+            return self.selected_tsv(with_headers=with_headers)
+        index = indexes[0]
+        text = format_cell(
+            self.model.rows[index.row()][index.column()], self.model.columns[index.column()]
+        )
+        return neutralize_formula(text) if self._escape_formulas else text
+
     def copy_selection(self, with_headers: bool = False) -> None:
-        """Copy selected cells as TSV (R5)."""
-        QGuiApplication.clipboard().setText(self.selected_tsv(with_headers=with_headers))
+        """Copy selected cells as TSV, or a single cell as its value (R5)."""
+        QGuiApplication.clipboard().setText(self.selected_text(with_headers=with_headers))
 
     # -- incremental arrival ----------------------------------------------
 
